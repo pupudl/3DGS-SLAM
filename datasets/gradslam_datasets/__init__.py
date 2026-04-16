@@ -12,4 +12,5 @@ from .tum import TUMDataset
 from .scannetpp import ScannetPPDataset
 from .nerfcapture import NeRFCaptureDataset
 from .kitti import KittiDataset
+from .kitti360 import Kitti360Dataset
 from .euroc import EurocDataset

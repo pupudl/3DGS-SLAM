@@ -32,7 +32,7 @@ from utils.recon_helpers import setup_camera
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 from utils.slam_helpers import transformed_params2rendervar, l1_loss_v1, transformed_params2depthplussilhouette, matrix_to_quaternion, transform_to_frame
 from utils.common_utils import save_params
-from datasets.gradslam_datasets import (load_dataset_config, KittiDataset, EurocDataset, GradSLAMDataset)
+from datasets.gradslam_datasets import (load_dataset_config, KittiDataset, Kitti360Dataset, EurocDataset, GradSLAMDataset)
 from pytorch_msssim import ms_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 loss_fn_alex = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=True).cuda()
@@ -431,6 +431,8 @@ def fill_holes(source_cloud, target_cloud):
 def get_dataset(config_dict, basedir, sequence, **kwargs):
     if config_dict["dataset_name"].lower() in ["kitti"]:
         return KittiDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["kitti360"]:
+        return Kitti360Dataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["euroc"]:
         return EurocDataset(config_dict, basedir, sequence, **kwargs)
     else:
@@ -441,15 +443,19 @@ if __name__ == "__main__":
 
     # tools/loop_closure/pose_graph_part_optim.py
 
-    base_folder = 'results/kitti01-1'           # 你的 loop_closure.py 结果根目录(workdir)
-    scene_name = '01'
-    dataset_type = 'kitti'
+    base_folder = 'results/kitti360-0000-all'      # KITTI-360 结果根目录(workdir)
+    scene_name = '2013_05_28_drive_0000_sync'
+    dataset_type = 'kitti360'
 
     kitti_base_folder = '/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences'
     if dataset_type == 'kitti':
         kitti_base_folder = '/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences'
         image_folder_path = os.path.join(kitti_base_folder, scene_name, 'image_2')
         depth_folder_path = os.path.join(kitti_base_folder, scene_name, 'depth_sceneflow')
+    elif dataset_type == 'kitti360':
+        from configs.kitti360.lsgslam import config
+        dataset_config = config["data"]
+        gradslam_data_cfg = load_dataset_config(dataset_config["gradslam_data_cfg"])
     elif dataset_type == 'euroc':
         from configs.euroc.lsgslam import config
         dataset_config = config["data"]
@@ -784,8 +790,8 @@ if __name__ == "__main__":
 
         if dataset_type == 'kitti':
             gt_imgs, depths = load_imgs(image_folder_path, depth_folder_path, start_idx, end_idx + 1, stride)
-        elif dataset_type == 'euroc':
-            euroc_dataset = get_dataset(
+        elif dataset_type in ['kitti360', 'euroc']:
+            part_dataset = get_dataset(
                 config_dict=gradslam_data_cfg,
                 basedir=dataset_config["basedir"],
                 sequence=os.path.basename(dataset_config["sequence"]),
@@ -797,7 +803,7 @@ if __name__ == "__main__":
                 device='cuda',
                 relative_pose=True,
             )
-            gt_imgs, depths = load_imgs_from_path_list(euroc_dataset.color_paths, euroc_dataset.depth_paths)
+            gt_imgs, depths = load_imgs_from_path_list(part_dataset.color_paths, part_dataset.depth_paths)
 
         intrinsics = params['intrinsics'].cpu().numpy()
         assert intrinsics.shape == (3, 3)

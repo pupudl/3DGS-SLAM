@@ -25,7 +25,7 @@ import open3d as o3d
 
 from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, ReplicaDataset, ReplicaV2Dataset, AzureKinectDataset,
                                         ScannetDataset, Ai2thorDataset, Record3DDataset, RealsenseDataset, TUMDataset,
-                                        ScannetPPDataset, NeRFCaptureDataset, KittiDataset, EurocDataset, GradSLAMDataset)
+                                        ScannetPPDataset, NeRFCaptureDataset, KittiDataset, Kitti360Dataset, EurocDataset, GradSLAMDataset)
 from utils.common_utils import seed_everything, save_params_ckpt, save_params
 from utils.eval_helpers import report_loss, report_progress, eval, plot_progress
 from utils.keyframe_selection import keyframe_selection_overlap
@@ -71,6 +71,8 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
         return NeRFCaptureDataset(basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["kitti"]:
         return KittiDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["kitti360"]:
+        return Kitti360Dataset(config_dict, basedir, sequence, **kwargs)
     elif config_dict["dataset_name"].lower() in ["euroc"]:
         return EurocDataset(config_dict, basedir, sequence, **kwargs)
     else:

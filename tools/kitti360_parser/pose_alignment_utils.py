@@ -11,7 +11,6 @@ Design goal: follow the original project pipeline as closely as possible.
 
 from __future__ import annotations
 
-import os
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -180,30 +179,6 @@ def align_poses_to_first_frame(
     return convert_pose_convention(aligned_c2w, "c2w", pose_convention)
 
 
-def estimate_rotation_alignment(
-    src_xyz: np.ndarray,
-    dst_xyz: np.ndarray,
-    ignore_first: bool = True,
-) -> np.ndarray:
-    if src_xyz.shape != dst_xyz.shape:
-        raise ValueError(f"Point sets must have the same shape, got {src_xyz.shape} vs {dst_xyz.shape}")
-    if src_xyz.ndim != 2 or src_xyz.shape[1] != 3:
-        raise ValueError(f"Point sets must have shape (N, 3), got {src_xyz.shape}")
-
-    start_idx = 1 if ignore_first and src_xyz.shape[0] > 1 else 0
-    X = src_xyz[start_idx:]
-    Y = dst_xyz[start_idx:]
-    if X.shape[0] == 0:
-        return np.eye(3, dtype=np.float64)
-
-    U, _, Vt = np.linalg.svd(X.T @ Y)
-    R = Vt.T @ U.T
-    if np.linalg.det(R) < 0:
-        Vt[-1] *= -1.0
-        R = Vt.T @ U.T
-    return R
-
-
 def conjugate_c2w_poses_by_rotation(
     poses: Sequence[np.ndarray],
     rotation: np.ndarray,
@@ -213,46 +188,6 @@ def conjugate_c2w_poses_by_rotation(
     C_inv = np.eye(4, dtype=np.float64)
     C_inv[:3, :3] = rotation.T
     return [C @ pose @ C_inv for pose in poses]
-
-
-def align_local_pose_axes_to_reference(
-    src_poses: Sequence[np.ndarray],
-    dst_poses: Sequence[np.ndarray],
-    src_pose_convention: str,
-    dst_pose_convention: str,
-    output_pose_convention: Optional[str] = None,
-    num_frames: Optional[int] = None,
-) -> Tuple[List[np.ndarray], Dict[str, object]]:
-    if output_pose_convention is None:
-        output_pose_convention = src_pose_convention
-
-    src_local_c2w = align_c2w_poses_to_first_frame(
-        convert_pose_convention(src_poses, src_pose_convention, "c2w")
-    )
-    dst_local_c2w = align_c2w_poses_to_first_frame(
-        convert_pose_convention(dst_poses, dst_pose_convention, "c2w")
-    )
-
-    if num_frames is not None:
-        use_n = max(1, min(len(src_local_c2w), len(dst_local_c2w), num_frames))
-    else:
-        use_n = min(len(src_local_c2w), len(dst_local_c2w))
-
-    src_xyz = np.array([pose[:3, 3] for pose in src_local_c2w[:use_n]], dtype=np.float64)
-    dst_xyz = np.array([pose[:3, 3] for pose in dst_local_c2w[:use_n]], dtype=np.float64)
-    rotation = estimate_rotation_alignment(src_xyz, dst_xyz, ignore_first=True)
-
-    aligned_local_c2w = conjugate_c2w_poses_by_rotation(src_local_c2w, rotation)
-    aligned_xyz = np.array([pose[:3, 3] for pose in aligned_local_c2w[:use_n]], dtype=np.float64)
-    align_err = np.linalg.norm(aligned_xyz - dst_xyz, axis=1) if use_n > 0 else np.zeros((0,), dtype=np.float64)
-
-    info: Dict[str, object] = {
-        "rotation": rotation,
-        "frames_used": use_n,
-        "mean_translation_error_m": float(np.mean(align_err)) if align_err.size else 0.0,
-        "max_translation_error_m": float(np.max(align_err)) if align_err.size else 0.0,
-    }
-    return convert_pose_convention(aligned_local_c2w, "c2w", output_pose_convention), info
 
 
 def summarize_axis_span(xyz: np.ndarray) -> Dict[str, float]:
@@ -288,73 +223,6 @@ def to_plot_trajectory(
         "axis_span": summarize_axis_span(xyz),
         "reason": reason,
     }
-
-
-def _quat_wxyz_to_rotmat(q: np.ndarray) -> np.ndarray:
-    q = np.asarray(q, dtype=np.float64).reshape(4)
-    norm = np.linalg.norm(q)
-    if norm == 0:
-        raise ValueError("Quaternion has zero norm.")
-    r, x, y, z = q / norm
-    R = np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - r * z), 2 * (x * z + r * y)],
-            [2 * (x * y + r * z), 1 - 2 * (x * x + z * z), 2 * (y * z - r * x)],
-            [2 * (x * z - r * y), 2 * (y * z + r * x), 1 - 2 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
-    )
-    return R
-
-
-def _load_original_pipeline_npz(path: str) -> List[np.ndarray]:
-    params = dict(np.load(path, allow_pickle=True))
-    if "gt_w2c_all_frames" in params:
-        return [np.array(pose, dtype=np.float64) for pose in params["gt_w2c_all_frames"]]
-    if "cam_unnorm_rots" not in params or "cam_trans" not in params:
-        raise ValueError(
-            "Original pipeline npz must contain `gt_w2c_all_frames` or (`cam_unnorm_rots`, `cam_trans`)."
-        )
-    cam_rots = np.array(params["cam_unnorm_rots"], dtype=np.float64)
-    cam_trans = np.array(params["cam_trans"], dtype=np.float64)
-    num_frames = cam_rots.shape[-1]
-    poses: List[np.ndarray] = []
-    for idx in range(num_frames):
-        quat = cam_rots[..., idx].reshape(-1)
-        trans = cam_trans[..., idx].reshape(-1)
-        pose = np.eye(4, dtype=np.float64)
-        pose[:3, :3] = _quat_wxyz_to_rotmat(quat)
-        pose[:3, 3] = trans[:3]
-        poses.append(pose)
-    return poses
-
-
-def load_original_pipeline_poses(
-    path: str,
-    pose_convention: str = ORIGINAL_PIPELINE_POSE_CONVENTION,
-    sensor_frame: str = ORIGINAL_PIPELINE_SENSOR_FRAME,
-) -> List[np.ndarray]:
-    """
-    Load original pipeline poses.
-
-    Supported inputs:
-    - `.npz`: saved pipeline params, loaded as `w2c` cam0
-    - `.txt` / `.csv`: KITTI-style 12-value pose file
-    """
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".npz":
-        poses = _load_original_pipeline_npz(path)
-        src_convention = "w2c"
-    elif ext in {".txt", ".csv"}:
-        poses = read_kitti_pose_file(path)
-        src_convention = pose_convention
-    else:
-        raise ValueError(f"Unsupported original pipeline pose file: {path}")
-
-    poses = convert_pose_convention(poses, src_convention, pose_convention)
-    if sensor_frame != ORIGINAL_PIPELINE_SENSOR_FRAME:
-        raise ValueError("Original pipeline poses are only defined in cam0 unless explicit calibration conversion is used.")
-    return poses
 
 
 def load_lidar_icp_poses(

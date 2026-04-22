@@ -1,7 +1,7 @@
 #!/bin/bash
 
 code_path='/home/qiuyu/data/Projects/LSG-SLAM'
-config_path=$code_path'/configs/kitti360/lsgslam.py'
+config_path="${CONFIG_PATH:-$code_path/configs/kitti360/lsgslam.py}"
 
 # scene_name, start_idx, end_idx, stride, image_width, image_height, yaml
 # end_idx 支持:

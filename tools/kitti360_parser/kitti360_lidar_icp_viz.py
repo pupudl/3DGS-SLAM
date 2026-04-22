@@ -31,15 +31,12 @@ from tools.kitti360_parser.pose_alignment_utils import (
     ORIGINAL_PIPELINE_PLOT_AXES,
     ORIGINAL_PIPELINE_SENSOR_FRAME,
     align_c2w_poses_to_first_frame,
-    align_local_pose_axes_to_reference,
     align_poses_to_first_frame,
     frame_ids_from_gt_map,
     load_lidar_icp_poses,
-    load_velo_to_cam,
     read_cam0_to_world_map,
     read_frame_ids,
     to_plot_trajectory,
-    write_pose_file,
 )
 
 
@@ -115,7 +112,6 @@ def save_plots(
     lines_meta: List[str],
     gt_cam0_to_world_path: Optional[str],
     est_velo_w2c=None,
-    T_velo_to_cam=None,
 ) -> None:
     plt = maybe_import_matplotlib()
     if plt is None:
@@ -130,93 +126,31 @@ def save_plots(
     est_traj_local = to_plot_trajectory(est_cam_w2c_local, pose_convention=ORIGINAL_PIPELINE_POSE_CONVENTION)
     print_plot_debug("LiDAR ICP cam0 local-world", est_traj_local)
 
-    if est_velo_w2c is not None and T_velo_to_cam is not None:
+    if est_velo_w2c is not None:
         velo_traj = to_plot_trajectory(est_velo_w2c, pose_convention=ORIGINAL_PIPELINE_POSE_CONVENTION)
         print_plot_debug("LiDAR ICP velo absolute-world", velo_traj)
-        pred_cam_w2c = [
-            T_velo_to_cam @ pose for pose in est_velo_w2c
-        ]
-        pred_cam_xyz = to_plot_trajectory(pred_cam_w2c, pose_convention=ORIGINAL_PIPELINE_POSE_CONVENTION)["xyz"]
-        est_cam_xyz = est_traj_abs["xyz"]
-        trans_err = ((pred_cam_xyz - est_cam_xyz) ** 2).sum(axis=1) ** 0.5
-        print(
-            "cam0<-velo 一致性检查 (w2c): "
-            f"trans(mean/max)={float(trans_err.mean()):.6e}/{float(trans_err.max()):.6e} m"
-        )
 
     axis_0, axis_1 = ORIGINAL_PIPELINE_PLOT_AXES
-    gt_xyz_abs = None
     gt_xyz_local = None
-    est_xyz_local_axis_aligned = None
 
     if gt_cam0_to_world_path is not None and os.path.isfile(gt_cam0_to_world_path):
         gt_map = read_cam0_to_world_map(gt_cam0_to_world_path)
         gt_cam_c2w = frame_ids_from_gt_map(frame_ids, gt_map)
         if len(gt_cam_c2w) == len(est_cam_w2c):
-            gt_traj_abs = to_plot_trajectory(gt_cam_c2w, pose_convention="c2w")
-            print_plot_debug("GT cam0 absolute-world", gt_traj_abs)
             gt_cam_c2w_local = align_c2w_poses_to_first_frame(gt_cam_c2w)
             gt_traj_local = to_plot_trajectory(gt_cam_c2w_local, pose_convention="c2w")
             print_plot_debug("GT cam0 local-world", gt_traj_local)
-            gt_xyz_abs = gt_traj_abs["xyz"]
             gt_xyz_local = gt_traj_local["xyz"]
-
-            est_cam_w2c_local_axis_aligned, align_info = align_local_pose_axes_to_reference(
-                src_poses=est_cam_w2c,
-                dst_poses=gt_cam_c2w,
-                src_pose_convention="w2c",
-                dst_pose_convention="c2w",
-                output_pose_convention="w2c",
-                num_frames=len(est_cam_w2c),
-            )
-            est_traj_local_axis_aligned = to_plot_trajectory(
-                est_cam_w2c_local_axis_aligned,
-                pose_convention="w2c",
-            )
-            est_xyz_local_axis_aligned = est_traj_local_axis_aligned["xyz"]
-            print_plot_debug("LiDAR ICP local-world axis-aligned", est_traj_local_axis_aligned)
+            main_err = np.linalg.norm(est_traj_local["xyz"] - gt_xyz_local, axis=1)
             print(
-                "局部坐标轴对齐误差: "
-                f"mean={align_info['mean_translation_error_m']:.4f} m, "
-                f"max={align_info['max_translation_error_m']:.4f} m, "
-                f"frames_used={align_info['frames_used']}"
+                "主对比图直接绘图误差: "
+                f"mean={float(main_err.mean()):.4f} m, "
+                f"max={float(main_err.max()):.4f} m"
             )
-
-            aligned_w2c_path = os.path.join(debug_dir, "traj_lidar_icp_cam0_w2c_local_frame_aligned.txt")
-            aligned_c2w_path = os.path.join(debug_dir, "traj_lidar_icp_cam0_c2w_local_frame_aligned.txt")
-            align_meta_path = os.path.join(debug_dir, "traj_lidar_icp_local_frame_alignment.txt")
-            write_pose_file(aligned_w2c_path, est_cam_w2c_local_axis_aligned)
-            write_pose_file(aligned_c2w_path, [np.linalg.inv(T) for T in est_cam_w2c_local_axis_aligned])
-            with open(align_meta_path, "w") as f:
-                f.write("alignment_type local_frame_axis_alignment\n")
-                f.write("pose_convention w2c\n")
-                f.write("sensor_frame cam0\n")
-                f.write(f"frames_used {align_info['frames_used']}\n")
-                f.write(f"mean_translation_error_m {align_info['mean_translation_error_m']:.6f}\n")
-                f.write(f"max_translation_error_m {align_info['max_translation_error_m']:.6f}\n")
-                rot = align_info["rotation"]
-                for row in rot:
-                    f.write("rotation " + " ".join(f"{v:.12g}" for v in row) + "\n")
-            print(f"写入局部轴对齐 w2c: {aligned_w2c_path}")
-            print(f"写入局部轴对齐 c2w: {aligned_c2w_path}")
-            print(f"写入局部轴对齐 meta: {align_meta_path}")
-
-            first_err = ((est_traj_abs["xyz"][0] - gt_traj_abs["xyz"][0]) ** 2).sum() ** 0.5
-            print(f"首帧平移误差: {float(first_err):.6f} m")
         else:
             print("警告：GT 数量与 ICP 轨迹数量不一致，GT 只用于日志，不叠加绘图。")
 
     compare_local_png = os.path.join(debug_dir, "traj_compare.png")
-    compare_abs_png = os.path.join(debug_dir, "traj_compare_absolute_world.png")
-    local_title_suffix = (
-        f"{ORIGINAL_PIPELINE_SENSOR_FRAME} {axis_0}-{axis_1}, "
-        "original-pipeline local world: align first frame, then w2c -> c2w -> plot x-z"
-    )
-    abs_title_suffix = (
-        f"{ORIGINAL_PIPELINE_SENSOR_FRAME} {axis_0}-{axis_1}, "
-        "KITTI-360 absolute world: w2c -> c2w -> plot x-z"
-    )
-
     save_compare_plot(
         plt=plt,
         out_path=compare_local_png,
@@ -225,42 +159,11 @@ def save_plots(
         gt_xyz=gt_xyz_local,
         axis_0=axis_0,
         axis_1=axis_1,
-        title_suffix=local_title_suffix,
-        gt_label="gt_local_first_frame",
-        est_label="odo_lidar_icp_local_first_frame",
+        title_suffix="local cam0 trajectory, direct x-z plot",
+        gt_label="GT",
+        est_label="Odo",
     )
-    save_compare_plot(
-        plt=plt,
-        out_path=compare_abs_png,
-        seq=seq,
-        est_xyz=est_traj_abs["xyz"],
-        gt_xyz=gt_xyz_abs,
-        axis_0=axis_0,
-        axis_1=axis_1,
-        title_suffix=abs_title_suffix,
-        gt_label="gt_absolute_world",
-        est_label="odo_lidar_icp_absolute_world",
-    )
-
-    if est_xyz_local_axis_aligned is not None:
-        compare_axis_aligned_png = os.path.join(debug_dir, "traj_compare_local_frame_aligned.png")
-        axis_aligned_title_suffix = (
-            f"{ORIGINAL_PIPELINE_SENSOR_FRAME} {axis_0}-{axis_1}, "
-            "local frame axis aligned: fixed rotation-conjugation on local poses"
-        )
-        save_compare_plot(
-            plt=plt,
-            out_path=compare_axis_aligned_png,
-            seq=seq,
-            est_xyz=est_xyz_local_axis_aligned,
-            gt_xyz=gt_xyz_local,
-            axis_0=axis_0,
-            axis_1=axis_1,
-            title_suffix=axis_aligned_title_suffix,
-            gt_label="gt_local_first_frame",
-            est_label="odo_lidar_icp_local_frame_aligned",
-        )
-        print(f"写入局部轴对齐对比图: {compare_axis_aligned_png}")
+    print(f"写入主对比图: {compare_local_png}")
 
     steps = []
     fitnesses = []
@@ -292,8 +195,6 @@ def save_plots(
         plt.close(fig)
         print(f"写入 ICP 质量图: {quality_png}")
 
-    print(f"写入原流程同款局部对比图: {compare_local_png}")
-    print(f"写入绝对世界对比图: {compare_abs_png}")
 
 
 def main() -> None:
@@ -313,7 +214,7 @@ def main() -> None:
     parser.add_argument(
         "--traj_cam",
         default=None,
-        help="默认 <output_dir>/traj_lidar_icp_cam0_w2c.txt",
+        help="默认优先 <output_dir>/traj_lidar_icp_cam0_local_fixed_w2c.txt，否则回退到 traj_lidar_icp_cam0_w2c.txt",
     )
     parser.add_argument(
         "--traj_velo",
@@ -328,7 +229,7 @@ def main() -> None:
     parser.add_argument(
         "--calib_cam_to_velo",
         default=None,
-        help="默认 <kitti360_root>/calibration/calib_cam_to_velo.txt",
+        help="保留参数兼容；当前主图默认不在可视化阶段做额外旋转",
     )
     parser.add_argument(
         "--frame_ids",
@@ -346,23 +247,22 @@ def main() -> None:
     out_dir = args.output_dir or os.path.join(args.kitti360_root, "data_3d_raw", args.sequence)
     main_dir = os.path.join(out_dir, "main")
     debug_dir = os.path.join(out_dir, "debug")
-    traj_cam = args.traj_cam or os.path.join(main_dir, "traj_lidar_icp_cam0_w2c.txt")
+    default_local_fixed_traj_cam = os.path.join(main_dir, "traj_lidar_icp_cam0_local_fixed_w2c.txt")
+    default_raw_traj_cam = os.path.join(main_dir, "traj_lidar_icp_cam0_w2c.txt")
+    traj_cam = args.traj_cam or (
+        default_local_fixed_traj_cam if os.path.isfile(default_local_fixed_traj_cam) else default_raw_traj_cam
+    )
     traj_velo = args.traj_velo or os.path.join(debug_dir, "traj_lidar_icp_velo_w2c.txt")
     meta = args.meta or os.path.join(main_dir, "traj_lidar_icp_meta.txt")
     frame_ids_path = args.frame_ids or os.path.join(main_dir, "traj_lidar_icp_frame_ids.txt")
     gt_path = args.gt_cam0_to_world or os.path.join(
         args.kitti360_root, "data_poses", args.sequence, "cam0_to_world.txt"
     )
-    calib_path = args.calib_cam_to_velo or os.path.join(
-        args.kitti360_root, "calibration", "calib_cam_to_velo.txt"
-    )
-
     if not os.path.isfile(traj_cam):
         raise SystemExit(f"找不到轨迹文件: {traj_cam}")
     if not os.path.isfile(meta):
         raise SystemExit(f"找不到 meta 文件: {meta}")
 
-    T_velo_to_cam = load_velo_to_cam(calib_path) if os.path.isfile(calib_path) else None
     est_cam_w2c = load_lidar_icp_poses(
         path=traj_cam,
         pose_convention="w2c",
@@ -394,6 +294,7 @@ def main() -> None:
         f"sensor={ORIGINAL_PIPELINE_SENSOR_FRAME}, pose={ORIGINAL_PIPELINE_POSE_CONVENTION}, "
         f"plot_plane={ORIGINAL_PIPELINE_PLOT_AXES[0]}-{ORIGINAL_PIPELINE_PLOT_AXES[1]}"
     )
+    print(f"主轨迹文件: {traj_cam}")
 
     save_plots(
         out_dir=out_dir,
@@ -403,7 +304,6 @@ def main() -> None:
         lines_meta=lines_meta,
         gt_cam0_to_world_path=gt_path if os.path.isfile(gt_path) else None,
         est_velo_w2c=est_velo_w2c,
-        T_velo_to_cam=T_velo_to_cam,
     )
 
 

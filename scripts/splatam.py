@@ -44,6 +44,11 @@ from sp_lg.disk import DISK
 from sp_lg.utils import load_image, match_pair
 from sp_lg import viz2d
 from feature_matching import *
+from utils.kitti360_lidar_icp_bridge import (
+    get_dataset_frame_id,
+    lidar_icp_init_camera_pose,
+    setup_kitti360_lidar_icp_state,
+)
 
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
@@ -573,6 +578,24 @@ def initialize_camera_pose(params, curr_time_idx, forward_prop, gt_w2c):
         # # Update the camera parameters
         # params['cam_unnorm_rots'][..., curr_time_idx] = rel_w2c_rot_quat
         # params['cam_trans'][..., curr_time_idx] = rel_w2c_tran
+
+    return params
+
+
+def set_camera_pose_from_w2c(params, curr_time_idx, pose_w2c, device):
+    with torch.no_grad():
+        rel_w2c_rot = (
+            torch.from_numpy(pose_w2c[:3, :3])
+            .unsqueeze(0)
+            .detach()
+            .to(device)
+        )
+        rel_w2c_rot_quat = matrix_to_quaternion(rel_w2c_rot)
+        rel_w2c_tran = (
+            torch.from_numpy(pose_w2c[:3, 3]).detach().to(device)
+        )
+        params["cam_unnorm_rots"][..., curr_time_idx] = rel_w2c_rot_quat
+        params["cam_trans"][..., curr_time_idx] = rel_w2c_tran
     
     return params
 
@@ -746,6 +769,10 @@ def rgbd_slam(config: dict):
         ignore_bad=dataset_config["ignore_bad"],
         use_train_split=dataset_config["use_train_split"],
     )
+
+    lidar_icp_state = None
+    if config.get("pose_init_method", "pnp_icp") == "pnp_lidar_icp":
+        lidar_icp_state = setup_kitti360_lidar_icp_state(config, dataset)
 
     # print(isinstance(dataset, KittiDataset))
     # print(isinstance(dataset, EurocDataset))
@@ -950,9 +977,11 @@ def rgbd_slam(config: dict):
                 pnp_num_inliers = 0
                 est_T_curr_last = np.eye(4)
 
+        frame_id = get_dataset_frame_id(dataset, time_idx)
+
         # Initialize Mapping Data for selected frame
         curr_data = {'cam': cam, 'im': color, 'depth': depth, 'depth_original': depth_original, 'id': iter_time_idx, 'intrinsics': intrinsics, 
-                     'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c, "feats": curr_feats, "descs": curr_desc_all}
+                     'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c, "feats": curr_feats, "descs": curr_desc_all, "frame_id": frame_id}
 
         grad_mask = None
         if config["use_grad_mask"]:
@@ -976,7 +1005,7 @@ def rgbd_slam(config: dict):
             tracking_color = tracking_color.permute(2, 0, 1) / 255
             tracking_depth = tracking_depth.permute(2, 0, 1)
             tracking_curr_data = {'cam': tracking_cam, 'im': tracking_color, 'depth': tracking_depth, 'id': iter_time_idx,
-                                  'intrinsics': tracking_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
+                                  'intrinsics': tracking_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c, "frame_id": frame_id}
         else:
             tracking_curr_data = curr_data
 
@@ -1017,7 +1046,15 @@ def rgbd_slam(config: dict):
 
         # Initialize the camera pose for the current frame
         if time_idx > 0:
-            if not config['use_warp_loss'] or pnp_num_inliers < 10:
+            pose_init_method = config.get("pose_init_method", "pnp_icp")
+            if pose_init_method == "pnp_only":
+                if config["use_warp_loss"] and pnp_prior_pose_w2c is not None:
+                    print('use pnp prior pose only')
+                    params = set_camera_pose_from_w2c(params, time_idx, pnp_prior_pose_w2c, device)
+                else:
+                    print('use motion model prior pose')
+                    params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'], gt_w2c=gt_w2c)
+            elif not config['use_warp_loss'] or pnp_num_inliers < 10:
                 print('use motion model prior pose')
                 params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'], gt_w2c=gt_w2c)
                 # est_T_curr_last = init_pose
@@ -1026,24 +1063,29 @@ def rgbd_slam(config: dict):
                 # if isinstance(dataset, KittiDataset):
                 #     inlier_threshold = 150
 
-                if (config.get('enable_pnp_init', False) or not isinstance(dataset, KittiDataset)) and pnp_num_inliers > 50:
+                if pose_init_method == "pnp_lidar_icp":
+                    init_pose = est_T_curr_last
+                    icp_corr_threshold = config['tracking']['icp_corr_threshold']
+                    if pnp_num_inliers < 50:
+                        icp_corr_threshold = np.max([3.0, icp_corr_threshold])
+
+                    params, init_pose, fitness, inlier_rmse = lidar_icp_init_camera_pose(
+                        params,
+                        time_idx,
+                        curr_data["frame_id"],
+                        last_data["frame_id"],
+                        init_pose,
+                        icp_corr_threshold,
+                        lidar_icp_state,
+                        device,
+                        build_rotation,
+                        matrix_to_quaternion,
+                    )
+                    print("lidar icp fitness/rmse = ", fitness, inlier_rmse)
+                elif pnp_num_inliers > 100 and not isinstance(dataset, KittiDataset):
                 # if pnp_num_inliers > inlier_threshold:
                     print('use pnp prior pose')
-                    with torch.no_grad():
-                        # use prior pose from pnp
-                        rel_w2c_rot = (
-                            torch.from_numpy(pnp_prior_pose_w2c[:3, :3])
-                            .unsqueeze(0)
-                            .detach()
-                            .to(device)
-                        )
-                        rel_w2c_rot_quat = matrix_to_quaternion(rel_w2c_rot)
-                        rel_w2c_tran = (
-                            torch.from_numpy(pnp_prior_pose_w2c[:3, 3]).detach().to(device)
-                        )
-                        # Update the camera parameters
-                        params["cam_unnorm_rots"][..., time_idx] = rel_w2c_rot_quat
-                        params["cam_trans"][..., time_idx] = rel_w2c_tran
+                    params = set_camera_pose_from_w2c(params, time_idx, pnp_prior_pose_w2c, device)
                 else:
                     init_pose = est_T_curr_last
                     icp_corr_threshold = config['tracking']['icp_corr_threshold']

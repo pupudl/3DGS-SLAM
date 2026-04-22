@@ -1,6 +1,76 @@
 # 3DGS + SLAM
 只做关键代码管理，未上传权重等内容（见.gitignore）
 
+## KITTI-360 0000 三个实验
+
+第一次跑前先预处理：
+
+```bash
+cd /home/qiuyu/data/Projects/LSG-SLAM
+conda activate lsgslam
+CUDA_VISIBLE_DEVICES=4 python3 tools/kitti360_parser/operate_kitti360_data.py
+```
+
+### 1. PnP-only
+
+```bash
+cd /home/qiuyu/data/Projects/LSG-SLAM
+CUDA_VISIBLE_DEVICES=4 \
+CONFIG_PATH=/home/qiuyu/data/Projects/LSG-SLAM/configs/kitti360/lsgslam_pnp_only.py \
+bash bash_scripts/run_kitti360_sequence.bash
+```
+
+### 2. PnP + RGB-D ICP
+
+```bash
+cd /home/qiuyu/data/Projects/LSG-SLAM
+CUDA_VISIBLE_DEVICES=4 \
+CONFIG_PATH=/home/qiuyu/data/Projects/LSG-SLAM/configs/kitti360/lsgslam_pnp_icp.py \
+bash bash_scripts/run_kitti360_sequence.bash
+```
+
+### 3. PnP + LiDAR ICP
+
+```bash
+cd /home/qiuyu/data/Projects/LSG-SLAM
+CUDA_VISIBLE_DEVICES=4 \
+CONFIG_PATH=/home/qiuyu/data/Projects/LSG-SLAM/configs/kitti360/lsgslam_pnp_lidar_icp.py \
+bash bash_scripts/run_kitti360_sequence.bash
+```
+
+### 回环后端 Pose Graph 优化
+
+`scripts/loop_closure.py` 跑完所有回环候选后，会在对应实验目录下生成一个 `*_loops` 目录，例如：
+
+`results/kitti360-0000-pnp-only/2013_05_28_drive_0000_sync_0_10513_2_loops`
+
+确认最后一个回环候选也完成后，运行后端 pose graph 和地图变形 / refine：
+
+```bash
+cd /home/qiuyu/data/Projects/LSG-SLAM
+conda activate lsgslam
+
+CUDA_VISIBLE_DEVICES=4 python3 tools/loop_closure/pose_graph_part_optim.py \
+  --base_folder results/kitti360-0000-pnp-only \
+  --scene_name 2013_05_28_drive_0000_sync \
+  --dataset_type kitti360 \
+  --config_path configs/kitti360/lsgslam_pnp_only.py
+```
+
+常用可选参数：
+
+- `--structure_refine_iters 5000`：每个分段地图 refine 的迭代次数，默认 `5000`
+- `--save_rendering_every 1`：每隔多少帧保存一次渲染图，默认每帧保存
+- `--overlap --overlap_bound 20`：分段 refine 时使用相邻片段重叠帧
+- `--ba`：refine 时同时优化相机位姿
+- `--use_densify`：refine 时启用 Gaussian densification
+
+主要输出：
+
+- `results/kitti360-0000-pnp-only/PoseGraphResult/traj_compare.png`
+- `results/kitti360-0000-pnp-only/PoseGraphResult/odo_with_loop.mp4`
+- `results/kitti360-0000-pnp-only/RenderingResult/`
+
 ## KITTI-360 LiDAR ICP 使用
 
 以下脚本位于 `tools/kitti360_parser/`：
@@ -49,14 +119,7 @@ python3 tools/kitti360_parser/kitti360_lidar_icp_odom.py \
   --sequence 2013_05_28_drive_0000_sync
 ```
 
-### 2) GPU 版里程计
-
-```bash
-python3 tools/kitti360_parser/kitti360_lidar_icp_odom_gpu.py \
-  --sequence 2013_05_28_drive_0000_sync
-```
-
-### 3) 单独可视化
+### 2) 单独可视化
 
 ```bash
 python3 tools/kitti360_parser/kitti360_lidar_icp_viz.py \

@@ -10,12 +10,9 @@ Alignment policy:
 Outputs:
 1. `main/`
    - `traj_lidar_icp_cam0_w2c.txt`
+   - `traj_lidar_icp_cam0_local_fixed_w2c.txt`
    - `traj_lidar_icp_frame_ids.txt`
    - `traj_lidar_icp_meta.txt`
-2. `debug/`
-   - `traj_lidar_icp_velo_w2c.txt`
-   - `traj_lidar_icp_cam0_c2w.txt`
-   - `traj_lidar_icp_velo_c2w.txt`
 """
 
 from __future__ import annotations
@@ -44,6 +41,8 @@ except ImportError:
 from tools.kitti360_parser.pose_alignment_utils import (
     ORIGINAL_PIPELINE_POSE_CONVENTION,
     ORIGINAL_PIPELINE_SENSOR_FRAME,
+    align_c2w_poses_to_first_frame,
+    conjugate_c2w_poses_by_rotation,
     convert_pose_convention,
     convert_sensor_frame,
     load_velo_to_cam,
@@ -71,9 +70,16 @@ def lidar_to_open3d(
 ) -> o3d.geometry.PointCloud:
     if xyz.size == 0:
         return o3d.geometry.PointCloud()
-    x = xyz[:, 0]
-    mask = (x > min_forward_m) & (x < max_forward_m)
-    xyz = xyz[mask]
+    # Keep LiDAR-specific cropping optional so the default behavior stays close
+    # to the original splatam ICP implementation.
+    if min_forward_m > 0.0 or max_forward_m > 0.0:
+        x = xyz[:, 0]
+        mask = np.ones(x.shape[0], dtype=bool)
+        if min_forward_m > 0.0:
+            mask &= x > min_forward_m
+        if max_forward_m > 0.0:
+            mask &= x < max_forward_m
+        xyz = xyz[mask]
     if xyz.shape[0] > max_points:
         idx = np.random.choice(xyz.shape[0], size=max_points, replace=False)
         xyz = xyz[idx]
@@ -179,12 +185,11 @@ def save_lidar_icp_outputs(
 ) -> None:
     """
     Main saved result uses `cam0 w2c`, matching the original pipeline.
-    We also keep explicit c2w outputs for visualization/debugging.
+    We keep the main raw `cam0 w2c` output plus a local-fixed `cam0 w2c`
+    output that is ready for direct x-z plotting and fusion with the main pipeline.
     """
     main_dir = os.path.join(out_dir, "main")
-    debug_dir = os.path.join(out_dir, "debug")
     os.makedirs(main_dir, exist_ok=True)
-    os.makedirs(debug_dir, exist_ok=True)
 
     poses_cam_c2w = convert_sensor_frame(
         poses_velo_c2w,
@@ -195,18 +200,23 @@ def save_lidar_icp_outputs(
     )
     poses_cam_w2c = convert_pose_convention(poses_cam_c2w, "c2w", ORIGINAL_PIPELINE_POSE_CONVENTION)
     poses_velo_w2c = convert_pose_convention(poses_velo_c2w, "c2w", ORIGINAL_PIPELINE_POSE_CONVENTION)
+    poses_cam_local_fixed_c2w = conjugate_c2w_poses_by_rotation(
+        align_c2w_poses_to_first_frame(poses_cam_c2w),
+        T_velo_to_cam[:3, :3],
+    )
+    poses_cam_local_fixed_w2c = convert_pose_convention(
+        poses_cam_local_fixed_c2w,
+        "c2w",
+        ORIGINAL_PIPELINE_POSE_CONVENTION,
+    )
 
     out_cam_w2c = os.path.join(main_dir, "traj_lidar_icp_cam0_w2c.txt")
+    out_cam_local_fixed_w2c = os.path.join(main_dir, "traj_lidar_icp_cam0_local_fixed_w2c.txt")
     out_frame_ids = os.path.join(main_dir, "traj_lidar_icp_frame_ids.txt")
     meta_path = os.path.join(main_dir, "traj_lidar_icp_meta.txt")
-    out_velo_w2c = os.path.join(debug_dir, "traj_lidar_icp_velo_w2c.txt")
-    out_cam_c2w = os.path.join(debug_dir, "traj_lidar_icp_cam0_c2w.txt")
-    out_velo_c2w = os.path.join(debug_dir, "traj_lidar_icp_velo_c2w.txt")
 
     write_pose_file(out_cam_w2c, poses_cam_w2c)
-    write_pose_file(out_velo_w2c, poses_velo_w2c)
-    write_pose_file(out_cam_c2w, poses_cam_c2w)
-    write_pose_file(out_velo_c2w, poses_velo_c2w)
+    write_pose_file(out_cam_local_fixed_w2c, poses_cam_local_fixed_w2c)
 
     cam_plot = to_plot_trajectory(poses_cam_w2c, pose_convention=ORIGINAL_PIPELINE_POSE_CONVENTION)
     cam_span = summarize_axis_span(cam_plot["xyz"])
@@ -218,9 +228,8 @@ def save_lidar_icp_outputs(
         f.write(f"main_pose_convention {ORIGINAL_PIPELINE_POSE_CONVENTION}\n")
         f.write(f"main_sensor_frame {ORIGINAL_PIPELINE_SENSOR_FRAME}\n")
         f.write("main_output_dir main\n")
-        f.write("debug_output_dir debug\n")
         f.write("main_output_file main/traj_lidar_icp_cam0_w2c.txt\n")
-        f.write("debug_output_file debug/traj_lidar_icp_cam0_c2w.txt\n")
+        f.write("fusion_output_file main/traj_lidar_icp_cam0_local_fixed_w2c.txt\n")
         f.write(f"plot_plane_like_original {cam_plot['plot_axes'][0]}-{cam_plot['plot_axes'][1]}\n")
         f.write(f"plot_plane_reason {cam_plot['reason']}\n")
         f.write(
@@ -240,11 +249,9 @@ def save_lidar_icp_outputs(
 
     print(f"结果目录: {out_dir}")
     print(f"写入 main/cam0 {ORIGINAL_PIPELINE_POSE_CONVENTION}: {out_cam_w2c}")
+    print(f"写入 main/cam0 local-fixed {ORIGINAL_PIPELINE_POSE_CONVENTION}: {out_cam_local_fixed_w2c}")
     print(f"写入 main/frame ids: {out_frame_ids}")
     print(f"写入 main/meta: {meta_path}")
-    print(f"写入 debug/velo {ORIGINAL_PIPELINE_POSE_CONVENTION}: {out_velo_w2c}")
-    print(f"写入 debug/cam0 c2w: {out_cam_c2w}")
-    print(f"写入 debug/velo c2w: {out_velo_c2w}")
 
 
 def main() -> None:
@@ -270,11 +277,15 @@ def main() -> None:
     parser.add_argument("--max_frames", type=int, default=-1, help="仅处理前 N 帧（-1 为全部）")
     parser.add_argument("--stride", type=int, default=1, help="每隔 stride 帧取一次")
     parser.add_argument("--corr_threshold", type=float, default=1.0, help="ICP 最粗对应距离（米）")
-    parser.add_argument("--voxel_size", type=float, default=0.2, help="体素下采样边长（米）")
-    parser.add_argument("--min_forward_m", type=float, default=3.0, help="保留前向 x>该值")
-    parser.add_argument("--max_forward_m", type=float, default=80.0)
-    parser.add_argument("--max_points", type=int, default=80000, help="每帧随机保留最多点数")
-    parser.add_argument("--warm_start", action="store_true", help="用上一帧相对变换作 ICP 初值")
+    parser.add_argument("--voxel_size", type=float, default=0.1, help="体素下采样边长（米），默认与 splatam ICP 一致")
+    parser.add_argument("--min_forward_m", type=float, default=0.0, help="可选 LiDAR 前向裁剪；<=0 表示关闭")
+    parser.add_argument("--max_forward_m", type=float, default=0.0, help="可选 LiDAR 前向裁剪；<=0 表示关闭")
+    parser.add_argument("--max_points", type=int, default=2000000000, help="每帧随机保留最多点数；默认基本等价于不裁点")
+    parser.add_argument(
+        "--no_warm_start",
+        action="store_true",
+        help="关闭上一帧相对变换初值；默认行为更贴近原流程",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verbose_icp", action="store_true", help="每步打印 ICP 细节")
     parser.add_argument(
@@ -292,7 +303,10 @@ def main() -> None:
     out_dir = args.output_dir or os.path.join(k360_root, "data_3d_raw", seq)
     velo_dir = resolve_velo_dir(k360_root, seq)
     depth_dir = os.path.join(seq_2d, "depth_sceneflow")
+
+    #每一帧相机（cam0）的真实位姿,每一帧都有：T_w_cam0,表示：相机在世界坐标系中的位置和方向
     gt_cam0_to_world_path = os.path.join(k360_root, "data_poses", seq, "cam0_to_world.txt")
+    #用来把ICP结果从 LiDAR 转到相机
     calib_path = args.calib_cam_to_velo or os.path.join(k360_root, "calibration", "calib_cam_to_velo.txt")
 
     os.makedirs(out_dir, exist_ok=True)
@@ -312,6 +326,12 @@ def main() -> None:
         "输出约定: "
         f"main={ORIGINAL_PIPELINE_SENSOR_FRAME}/{ORIGINAL_PIPELINE_POSE_CONVENTION}, "
         "viz=convert_to_c2w_then_plot_x-z"
+    )
+    print(
+        "ICP 默认参数: "
+        f"voxel_size={args.voxel_size}, corr_threshold={args.corr_threshold}, "
+        f"warm_start={'off' if args.no_warm_start else 'on'}, "
+        f"forward_crop={'off' if args.min_forward_m <= 0.0 and args.max_forward_m <= 0.0 else 'on'}"
     )
 
     T_velo_to_cam = load_velo_to_cam(calib_path)
@@ -379,7 +399,7 @@ def main() -> None:
         pcd_prev = lidar_to_open3d(xyz_prev, args.min_forward_m, args.max_forward_m, args.max_points)
         pcd_curr = lidar_to_open3d(xyz_curr, args.min_forward_m, args.max_forward_m, args.max_points)
 
-        init = T_prev_curr if args.warm_start else np.eye(4, dtype=np.float64)
+        init = np.eye(4, dtype=np.float64) if args.no_warm_start else T_prev_curr
         T_prev_to_curr, fitness, rmse = icp(
             target=pcd_curr,
             source=pcd_prev,

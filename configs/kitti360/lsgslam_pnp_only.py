@@ -2,28 +2,28 @@ import os
 from os.path import join as p_join
 from datetime import datetime
 
-scenes = ["01"]
+scenes = ["2013_05_28_drive_0000_sync"]
 
 primary_device="cuda:0"
 seed = 0
-scene_name = '01'
+scene_name = '2013_05_28_drive_0000_sync'
 
 map_every = 1
 keyframe_every = 1
 mapping_window_size = 24
 
-tracking_iters = 200
+tracking_iters = 100
 mapping_iters = 100
 
-kitti_yaml = './configs/kitti/kitti01_improved.yaml'
-image_width = 1241
+kitti360_yaml = './configs/kitti360/kitti360.yaml'
+image_width = 1408
 image_height = 376
 
 start_idx = 0
-end_idx = 350
-stride = 1
+end_idx = 10513
+stride = 2
 
-group_name = "kitti01-1"
+group_name = "kitti360-0000-pnp-only"
 run_name = f"{scene_name}_{start_idx}_{end_idx}_{stride}"
 
 config = dict(
@@ -51,6 +51,7 @@ config = dict(
     opt_local_map=False,
     use_wandb=False,
     pixel_gs_depth_gamma=0.37,
+    pose_init_method="pnp_only",
     wandb=dict(
         entity="",
         project="",
@@ -60,8 +61,8 @@ config = dict(
         eval_save_qual=True,
     ),
     data=dict(
-        basedir="/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences",
-        gradslam_data_cfg=kitti_yaml,
+        basedir="/home/qiuyu/data/Projects/LSG-SLAM/data/kitti360/data_2d_raw",
+        gradslam_data_cfg=kitti360_yaml,
         sequence=scene_name,
         desired_image_height=image_height,
         desired_image_width=image_width,
@@ -81,7 +82,7 @@ config = dict(
         icp_corr_threshold=0.5,
         loss_weights=dict(
             im=1.0,
-            depth=0.5,
+            depth=0.2,
         ),
         lrs=dict(
             means3D=0.0,
@@ -90,7 +91,7 @@ config = dict(
             logit_opacities=0.0,
             log_scales=0.0,
             cam_unnorm_rots=0.0004,
-            cam_trans=0.004,
+            cam_trans=0.002,
         ),
     ),
     mapping=dict(

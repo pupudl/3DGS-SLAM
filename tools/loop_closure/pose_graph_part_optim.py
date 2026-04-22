@@ -22,6 +22,7 @@ import imageio.v2 as imageio
 import torchvision.transforms as transforms
 import rich
 from PIL import Image
+from importlib.machinery import SourceFileLoader
 current_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../")
 sys.path.append(current_dir)
 from natsort import natsorted
@@ -439,40 +440,141 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
         raise ValueError(f"Unknown dataset name {config_dict['dataset_name']}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run loop-closure pose graph optimization and per-part map refinement."
+    )
+    parser.add_argument(
+        "--base_folder",
+        default="results/kitti360-0000-all",
+        help="Result workdir containing odometry chunks and one '*_loops' folder.",
+    )
+    parser.add_argument(
+        "--scene_name",
+        default="2013_05_28_drive_0000_sync",
+        help="Scene/sequence name used to filter result chunk folders.",
+    )
+    parser.add_argument(
+        "--dataset_type",
+        default="kitti360",
+        choices=["kitti", "kitti360", "euroc"],
+        help="Dataset loader to use for image/depth loading during map refinement.",
+    )
+    parser.add_argument(
+        "--config_path",
+        default=None,
+        help="Experiment config Python file. Required for kitti360/euroc unless using their defaults.",
+    )
+    parser.add_argument(
+        "--kitti_base_folder",
+        default="/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences",
+        help="KITTI sequences root, only used when --dataset_type kitti.",
+    )
+    parser.add_argument(
+        "--structure_refine_iters",
+        type=int,
+        default=5000,
+        help="Number of map/color refinement iterations per odometry chunk.",
+    )
+    parser.add_argument(
+        "--sil_thres",
+        type=float,
+        default=0.99,
+        help="Silhouette threshold used for masked rendering metrics.",
+    )
+    parser.add_argument(
+        "--save_rendering_every",
+        type=int,
+        default=1,
+        help="Save every N rendered frames during final evaluation.",
+    )
+    parser.add_argument(
+        "--gaussians_distribution",
+        default="anisotropic",
+        choices=["isotropic", "anisotropic"],
+        help="Gaussian scale distribution used in map refinement.",
+    )
+    parser.add_argument(
+        "--overlap",
+        action="store_true",
+        help="Use overlapping frames between adjacent chunks during map refinement.",
+    )
+    parser.add_argument(
+        "--overlap_bound",
+        type=int,
+        default=20,
+        help="Number of raw frames to overlap when --overlap is enabled.",
+    )
+    parser.add_argument(
+        "--ba",
+        action="store_true",
+        help="Also optimize per-frame camera poses during map refinement.",
+    )
+    parser.add_argument(
+        "--use_densify",
+        action="store_true",
+        help="Enable Gaussian densification during map refinement.",
+    )
+    return parser.parse_args()
+
+
+def _default_config_path(dataset_type):
+    if dataset_type == "kitti360":
+        return os.path.join(current_dir, "configs", "kitti360", "lsgslam.py")
+    if dataset_type == "euroc":
+        return os.path.join(current_dir, "configs", "euroc", "lsgslam.py")
+    return None
+
+
+def _load_experiment_config(config_path):
+    config_path = os.path.abspath(config_path)
+    module_name = os.path.splitext(os.path.basename(config_path))[0]
+    experiment = SourceFileLoader(module_name, config_path).load_module()
+    return experiment.config
+
+
+def _load_dataset_settings(args):
+    if args.dataset_type == "kitti":
+        image_folder_path = os.path.join(args.kitti_base_folder, args.scene_name, "image_2")
+        depth_folder_path = os.path.join(args.kitti_base_folder, args.scene_name, "depth_sceneflow")
+        return None, None, image_folder_path, depth_folder_path
+
+    config_path = args.config_path or _default_config_path(args.dataset_type)
+    config = _load_experiment_config(config_path)
+    dataset_config = dict(config["data"])
+    dataset_config["sequence"] = args.scene_name
+
+    if args.dataset_type == "euroc":
+        dataset_config["basedir"] = f"euroc/{args.scene_name}/mav0/cam0"
+
+    gradslam_cfg_path = dataset_config["gradslam_data_cfg"]
+    if not os.path.isabs(gradslam_cfg_path):
+        gradslam_cfg_path = os.path.join(current_dir, gradslam_cfg_path)
+    gradslam_data_cfg = load_dataset_config(gradslam_cfg_path)
+    return dataset_config, gradslam_data_cfg, None, None
+
+
 if __name__ == "__main__":
 
     # tools/loop_closure/pose_graph_part_optim.py
 
-    base_folder = 'results/kitti360-0000-all'      # KITTI-360 结果根目录(workdir)
-    scene_name = '2013_05_28_drive_0000_sync'
-    dataset_type = 'kitti360'
+    args = parse_args()
 
-    kitti_base_folder = '/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences'
-    if dataset_type == 'kitti':
-        kitti_base_folder = '/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences'
-        image_folder_path = os.path.join(kitti_base_folder, scene_name, 'image_2')
-        depth_folder_path = os.path.join(kitti_base_folder, scene_name, 'depth_sceneflow')
-    elif dataset_type == 'kitti360':
-        from configs.kitti360.lsgslam import config
-        dataset_config = config["data"]
-        gradslam_data_cfg = load_dataset_config(dataset_config["gradslam_data_cfg"])
-    elif dataset_type == 'euroc':
-        from configs.euroc.lsgslam import config
-        dataset_config = config["data"]
-        dataset_config['basedir'] = f"euroc/{scene_name}/mav0/cam0"
-        dataset_config['sequence'] = scene_name
-        gradslam_data_cfg = load_dataset_config(dataset_config["gradslam_data_cfg"])
+    base_folder = args.base_folder
+    scene_name = args.scene_name
+    dataset_type = args.dataset_type
+    dataset_config, gradslam_data_cfg, image_folder_path, depth_folder_path = _load_dataset_settings(args)
 
-    ba = False
+    ba = args.ba
     if ba:
         optimize_keys = ['means3D', 'rgb_colors', 'unnorm_rotations', 'logit_opacities', 'log_scales', 'cam_trans', 'cam_unnorm_rots']
     else:
         optimize_keys = ['means3D', 'rgb_colors', 'unnorm_rotations', 'logit_opacities', 'log_scales']
 
-    overlap = False
-    overlap_bound = 20
+    overlap = args.overlap
+    overlap_bound = args.overlap_bound
 
-    structure_refine_total_iters = 5000 # 2000, 5000
+    structure_refine_total_iters = args.structure_refine_iters # 2000, 5000
     structure_refine_lrs=dict(
         means3D=0.0008, # 0.0001 in euroc, 0.0008 in kitti
         rgb_colors=0.0025,
@@ -503,8 +605,8 @@ if __name__ == "__main__":
         cam_trans=0.000,
     )
 
-    sil_thres = 0.99 
-    save_rendering_every = 1
+    sil_thres = args.sil_thres
+    save_rendering_every = args.save_rendering_every
 
     use_min_scale_loss = True
     min_scale_loss_warmup_iters = 200
@@ -515,9 +617,9 @@ if __name__ == "__main__":
     depth_filter_near = 0.1
     depth_filter_far = 30.0
 
-    gaussians_distribution = 'anisotropic' # isotropic or anisotropic
+    gaussians_distribution = args.gaussians_distribution # isotropic or anisotropic
 
-    use_densify = False
+    use_densify = args.use_densify
     split_explore_weight = 1.0
     densify_dict=dict( # Needs to be updated based on the number of mapping iterations
         start_after=0.02*structure_refine_total_iters, 

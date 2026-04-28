@@ -32,7 +32,7 @@ import shutil
 
 
 # sequences = [str(i).zfill(2) for i in range(11, 22)]
-sequences = ['00']
+sequences = ['02']
 print(sequences)
 
 image_folder = "/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences" # path to kitti dataset

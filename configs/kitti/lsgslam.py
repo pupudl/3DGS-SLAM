@@ -6,7 +6,7 @@ scenes = ["01"]
 
 primary_device="cuda:0"
 seed = 0
-scene_name = '01'
+scene_name = '00'
 
 map_every = 1
 keyframe_every = 1
@@ -19,11 +19,11 @@ kitti_yaml = './configs/kitti/kitti00-02.yaml'
 image_width = 1241
 image_height = 376
 
-start_idx = 0
-end_idx = 1100
+start_idx = 200
+end_idx = 250
 stride = 2
 
-group_name = "kitti01-1"
+group_name = "kitti00-new"
 # ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 # run_name = f"{scene_name}_{seed}"
 # run_name = f"{scene_name}"

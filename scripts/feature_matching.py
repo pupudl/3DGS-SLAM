@@ -324,13 +324,11 @@ def estimate_pnp(mkpts_cur, mkpts_last, curr_data, last_data, dataset):
             iterationsCount=200,
         )
     except:
-        return None, np.eye(4), 0
+        return None
 
     print(success)
     # print(rotation_vector)
     # print(translation_vector)
-    if not success or inliers is None:
-        return None, np.eye(4), 0
     print(inliers.shape)
     # exit()
     num_inliers = inliers.shape[0]

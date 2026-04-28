@@ -27,7 +27,7 @@ from matplotlib import pyplot as plt
 import cv2
 
 
-sequences = ['2013_05_28_drive_0000_sync']
+sequences = ['2013_05_28_drive_0002_sync']
 print(sequences)
 
 project_root = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../")

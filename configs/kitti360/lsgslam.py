@@ -51,7 +51,6 @@ config = dict(
     opt_local_map=False,
     use_wandb=False,
     pixel_gs_depth_gamma=0.37,
-    pose_init_method="pnp_icp",
     wandb=dict(
         entity="",
         project="",

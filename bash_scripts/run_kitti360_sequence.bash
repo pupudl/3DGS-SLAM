@@ -11,7 +11,7 @@ scene_names=(
 "2013_05_28_drive_0000_sync,0,-1,2,1408,376,./configs/kitti360/kitti360.yaml"
 )
 
-step=200
+step=50
 
 for j in 0;
 do 

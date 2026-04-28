@@ -31,7 +31,7 @@ scene_names=(
 
 step=50
 
-for j in 1;
+for j in 0;
 # for((j=1;j<=10;j+=1));
 do 
     array=(${scene_names[j]//,/ })  

@@ -183,4 +183,6 @@ third_party/TransVPR/*.pth
 /kitti*/
 /euroc*/
 /experiments/*/outputs/
+/experiments/*/results/
+/checkpoints/
 /experiments/*/scripts/__pycache__/

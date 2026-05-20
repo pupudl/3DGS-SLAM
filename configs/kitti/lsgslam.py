@@ -23,6 +23,9 @@ start_idx = 200
 end_idx = 250
 stride = 2
 
+pose_init_method = "pnp_fused_icp"
+#pose_init_method = "pnp_icp"
+
 group_name = "kitti00-new"
 # ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 # run_name = f"{scene_name}_{seed}"
@@ -49,6 +52,7 @@ config = dict(
     checkpoint_time_idx=0,
     save_checkpoints=False, # Save Checkpoints
     checkpoint_interval=100, # Checkpoint Interval
+    pose_init_method=pose_init_method,
     use_warp_loss=True,
     weight_warp=10,
     # weight_warp=100,
@@ -85,6 +89,9 @@ config = dict(
         use_l1=True,
         ignore_outlier_depth_loss=False,
         icp_corr_threshold=0.5,
+        fused_lidar_max_points=120000,
+        lidar_min_forward_m=0.0,
+        lidar_max_forward_m=0.0,
         loss_weights=dict(
             im=1.0,
             depth=0.2,

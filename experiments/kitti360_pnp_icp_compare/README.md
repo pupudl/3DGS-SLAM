@@ -114,3 +114,9 @@ data/kitti/sequences/00/velodyne/*.bin
 ```bash
 bash experiments/kitti360_pnp_icp_compare/bash_scripts/run_kitti00_pnp_lidar_icp.bash
 ```
+
+## 共享依赖说明
+
+这个实验目录会复用部分 root-level 公共模块与数据。详细依赖关系见：
+
+- [DEPENDENCIES.md](/home/qiuyu/data/Projects/LSG-SLAM/experiments/kitti360_pnp_icp_compare/DEPENDENCIES.md)

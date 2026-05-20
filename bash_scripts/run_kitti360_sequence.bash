@@ -2,6 +2,12 @@
 
 code_path='/home/qiuyu/data/Projects/LSG-SLAM'
 config_path="${CONFIG_PATH:-$code_path/configs/kitti360/lsgslam.py}"
+group_name=$(grep -E "^group_name = " "$config_path" | head -n 1 | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/")
+
+if [ -z "$group_name" ]; then
+    echo "Failed to parse group_name from $config_path"
+    exit 1
+fi
 
 # scene_name, start_idx, end_idx, stride, image_width, image_height, yaml
 # end_idx 支持:
@@ -53,6 +59,14 @@ do
         fi
 
         echo "Processing $start_idx to $end_idx"
+
+        run_name="${scene_name}_${start_idx}_${end_idx}_${stride}"
+        output_dir="$code_path/results/$group_name/$run_name"
+        output_params="$output_dir/params.npz"
+        if [ -f "$output_params" ]; then
+            echo "Skip completed chunk: $run_name"
+            continue
+        fi
 
         n=`grep -n "scene_name = " $config_path | awk -F':' '{print $1}'` 
         sed -i "$[ n ]c scene_name = '$scene_name'" $config_path

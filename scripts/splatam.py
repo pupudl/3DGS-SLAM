@@ -6,6 +6,7 @@ import time
 from importlib.machinery import SourceFileLoader
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = _BASE_DIR
 
 sys.path.insert(0, _BASE_DIR)
 
@@ -35,6 +36,7 @@ from utils.slam_helpers import (
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
+from utils.pnp_fused_icp_utils import fused_icp_init_camera_pose, get_dataset_frame_id
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
@@ -933,8 +935,13 @@ def rgbd_slam(config: dict):
                 )
                 if mkpts_cur is not None and mkpts_cur.shape[0] > 10:
                     np.savetxt(os.path.join(match_save_dir, "{}_inliers.txt".format(time_idx)), mkpts_cur.shape)
-
-                    pnp_prior_pose_w2c, est_T_curr_last, pnp_num_inliers = estimate_pnp(mkpts_cur, mkpts_last, curr_data, last_data, dataset)
+                    pnp_result = estimate_pnp(mkpts_cur, mkpts_last, curr_data, last_data, dataset)
+                    if pnp_result is not None:
+                        pnp_prior_pose_w2c, est_T_curr_last, pnp_num_inliers = pnp_result
+                    else:
+                        pnp_num_inliers = 0
+                        pnp_prior_pose_w2c = None
+                        est_T_curr_last = np.eye(4)
                 else:
                     pnp_num_inliers = 0
                     pnp_prior_pose_w2c = None
@@ -950,9 +957,11 @@ def rgbd_slam(config: dict):
                 pnp_num_inliers = 0
                 est_T_curr_last = np.eye(4)
 
+        frame_id = get_dataset_frame_id(dataset, time_idx)
+
         # Initialize Mapping Data for selected frame
         curr_data = {'cam': cam, 'im': color, 'depth': depth, 'depth_original': depth_original, 'id': iter_time_idx, 'intrinsics': intrinsics, 
-                     'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c, "feats": curr_feats, "descs": curr_desc_all}
+                     'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c, "feats": curr_feats, "descs": curr_desc_all, "frame_id": frame_id}
 
         grad_mask = None
         if config["use_grad_mask"]:
@@ -976,7 +985,7 @@ def rgbd_slam(config: dict):
             tracking_color = tracking_color.permute(2, 0, 1) / 255
             tracking_depth = tracking_depth.permute(2, 0, 1)
             tracking_curr_data = {'cam': tracking_cam, 'im': tracking_color, 'depth': tracking_depth, 'id': iter_time_idx,
-                                  'intrinsics': tracking_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
+                                  'intrinsics': tracking_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c, "frame_id": frame_id}
         else:
             tracking_curr_data = curr_data
 
@@ -1017,6 +1026,7 @@ def rgbd_slam(config: dict):
 
         # Initialize the camera pose for the current frame
         if time_idx > 0:
+            pose_init_method = config.get("pose_init_method", "pnp_icp")
             if not config['use_warp_loss'] or pnp_num_inliers < 10:
                 print('use motion model prior pose')
                 params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'], gt_w2c=gt_w2c)
@@ -1026,7 +1036,30 @@ def rgbd_slam(config: dict):
                 # if isinstance(dataset, KittiDataset):
                 #     inlier_threshold = 150
 
-                if (config.get('enable_pnp_init', False) or not isinstance(dataset, KittiDataset)) and pnp_num_inliers > 50:
+                if pose_init_method == "pnp_fused_icp":
+                    init_pose = est_T_curr_last
+                    icp_corr_threshold = config['tracking']['icp_corr_threshold']
+                    if pnp_num_inliers < 50:
+                        icp_corr_threshold = np.max([3.0, icp_corr_threshold])
+                    params, init_pose, fitness, inlier_rmse = fused_icp_init_camera_pose(
+                        params,
+                        time_idx,
+                        curr_data['pc'],
+                        last_data['pc'],
+                        dataset,
+                        curr_data["frame_id"],
+                        last_data["frame_id"],
+                        init_pose,
+                        icp_corr_threshold,
+                        device,
+                        PROJECT_ROOT,
+                        icp,
+                        lidar_max_points=config['tracking'].get('fused_lidar_max_points', 120000),
+                        lidar_min_forward_m=config['tracking'].get('lidar_min_forward_m', 0.0),
+                        lidar_max_forward_m=config['tracking'].get('lidar_max_forward_m', 0.0),
+                    )
+                    print("fused icp fitness/rmse = ", fitness, inlier_rmse)
+                elif (config.get('enable_pnp_init', False) or not isinstance(dataset, KittiDataset)) and pnp_num_inliers > 50:
                 # if pnp_num_inliers > inlier_threshold:
                     print('use pnp prior pose')
                     with torch.no_grad():

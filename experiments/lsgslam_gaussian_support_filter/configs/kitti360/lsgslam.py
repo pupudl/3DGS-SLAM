@@ -1,4 +1,6 @@
 import os
+from os.path import join as p_join
+from datetime import datetime
 
 CONFIG_DIR = os.path.dirname(__file__)
 EXP_ROOT = os.path.dirname(os.path.dirname(CONFIG_DIR))
@@ -14,9 +16,9 @@ keyframe_every = 1
 mapping_window_size = 24
 
 tracking_iters = 100
-mapping_iters = 200
+mapping_iters = 100
 
-kitti360_yaml = '/home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_stage1_feature_probe/configs/kitti360/kitti360.yaml'
+kitti360_yaml = '/home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_gaussian_support_filter/configs/kitti360/kitti360.yaml'
 image_width = 1408
 image_height = 376
 
@@ -24,10 +26,10 @@ start_idx = 2300
 end_idx = 2350
 stride = 2
 
-pose_init_method = "pnp_fused_icp"
+pose_init_method = "pnp_icp"
 
-group_name = "kitti360-0000-pnp-fused-icp-all-anisotropic"
-run_name = f"{scene_name}_{start_idx}_{end_idx}_{stride}_anisotropic"
+group_name = "kitti360-gaussian-support-filter"
+run_name = f"{scene_name}_{start_idx}_{end_idx}_{stride}"
 
 config = dict(
     workdir=os.path.join(EXP_ROOT, "results", group_name),
@@ -42,7 +44,7 @@ config = dict(
     eval_every=1,
     scene_radius_depth_ratio=3,
     mean_sq_dist_method="projective",
-    gaussian_distribution="anisotropic",
+    gaussian_distribution="isotropic",
     report_iter_progress=False,
     load_checkpoint=False,
     checkpoint_time_idx=0,
@@ -55,14 +57,11 @@ config = dict(
     opt_local_map=False,
     use_wandb=False,
     pixel_gs_depth_gamma=0.37,
-    stage1_feature_probe=dict(
+    support_filter=dict(
         enabled=True,
-        checkpoint_path="/home/qiuyu/data/Projects/LSG-SLAM/checkpoints/dinov2_reg_small_finetuned.pth",
-        model_name="vit_small_patch14_reg4_dinov2.lvd142m",
-        output_subdir="stage1_feature_probe",
-        save_raw_tensors=True,
-        save_visualizations=True,
-        save_input_rgbs=True,
+        color_threshold=0.10,
+        depth_tolerance=1.0,
+        min_count=3,
     ),
     wandb=dict(
         entity="",

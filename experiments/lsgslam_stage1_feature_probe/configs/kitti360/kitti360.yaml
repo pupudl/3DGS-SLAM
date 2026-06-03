@@ -9,4 +9,4 @@ camera_params:
   png_depth_scale: 1.0
   crop_edge: 0
   depth_filter_near: 0.1
-  depth_filter_far: 30.0
+  depth_filter_far: 300.0

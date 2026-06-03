@@ -2,9 +2,6 @@ import os
 from os.path import join as p_join
 from datetime import datetime
 
-CONFIG_DIR = os.path.dirname(__file__)
-EXP_ROOT = os.path.dirname(os.path.dirname(CONFIG_DIR))
-
 scenes = ["01"]
 
 primary_device="cuda:0"
@@ -18,7 +15,7 @@ mapping_window_size = 24
 tracking_iters = 200
 mapping_iters = 100
 
-kitti_yaml = os.path.join(CONFIG_DIR, 'kitti01_improved.yaml')
+kitti_yaml = './configs/kitti/kitti01_improved.yaml'
 image_width = 1241
 image_height = 376
 
@@ -30,7 +27,7 @@ group_name = "kitti01-1"
 run_name = f"{scene_name}_{start_idx}_{end_idx}_{stride}"
 
 config = dict(
-    workdir=os.path.join(EXP_ROOT, "results", group_name),
+    workdir=os.path.join("results", group_name),
     run_name=run_name,
     scene_path=f'',
     seed=seed,
@@ -54,15 +51,6 @@ config = dict(
     opt_local_map=False,
     use_wandb=False,
     pixel_gs_depth_gamma=0.37,
-    stage1_feature_probe=dict(
-        enabled=True,
-        checkpoint_path="/home/qiuyu/data/Projects/LSG-SLAM/checkpoints/dinov2_reg_small_finetuned.pth",
-        model_name="vit_small_patch14_reg4_dinov2.lvd142m",
-        output_subdir="stage1_feature_probe",
-        save_raw_tensors=True,
-        save_visualizations=True,
-        save_input_rgbs=True,
-    ),
     wandb=dict(
         entity="",
         project="",

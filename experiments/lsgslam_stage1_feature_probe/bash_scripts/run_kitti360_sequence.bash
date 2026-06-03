@@ -15,7 +15,7 @@ fi
 #   - 正整数: 作为包含式终点索引
 #   - -1: 自动使用全序列(依据 depth_sceneflow/*.npy 数量)
 scene_names=(
-"2013_05_28_drive_0000_sync,2320,2370,2,1408,376,$exp_root/configs/kitti360/kitti360.yaml"
+"2013_05_28_drive_0000_sync,2300,2350,2,1408,376,$exp_root/configs/kitti360/kitti360.yaml"
 )
 
 step=50

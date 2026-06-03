@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -34,9 +35,9 @@ from utils.keyframe_selection import keyframe_selection_overlap
 from utils.recon_helpers import setup_camera
 from utils.slam_helpers import (
     params2rendervar, transformed_params2rendervar, transformed_params2depthplussilhouette,
-    transform_to_frame, l1_loss_v1, matrix_to_quaternion
+    transform_to_frame, l1_loss_v1, matrix_to_quaternion, project_points
 )
-from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
+from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify, remove_points
 from utils.pnp_fused_icp_utils import fused_icp_init_camera_pose, get_dataset_frame_id
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
@@ -46,6 +47,7 @@ from sp_lg.superpoint import SuperPoint
 from sp_lg.disk import DISK
 from sp_lg.utils import load_image, match_pair
 from sp_lg import viz2d
+from sky_mask import SkyMaskPredictor
 from stage1_feature_probe import Stage1FeatureProbe
 from feature_matching import *
 
@@ -81,6 +83,41 @@ def get_dataset(config_dict, basedir, sequence, **kwargs):
         return EurocDataset(config_dict, basedir, sequence, **kwargs)
     else:
         raise ValueError(f"Unknown dataset name {config_dict['dataset_name']}")
+
+
+def resize_bool_mask(mask, target_height, target_width):
+    if mask is None:
+        return None
+    if mask.shape[-2:] == (target_height, target_width):
+        return mask
+    resized = F.interpolate(
+        mask.float().unsqueeze(0),
+        size=(target_height, target_width),
+        mode="nearest",
+    )[0]
+    return resized > 0.5
+
+
+def invert_bool_mask(mask):
+    if mask is None:
+        return None
+    return ~mask
+
+
+def apply_sky_mask_to_color(color, sky_mask):
+    if color is None or sky_mask is None:
+        return color
+    masked = color.clone()
+    masked[:, sky_mask[0]] = 0
+    return masked
+
+
+def apply_sky_mask_to_depth(depth, sky_mask):
+    if depth is None or sky_mask is None:
+        return depth
+    masked = depth.clone()
+    masked[:, sky_mask[0]] = 0
+    return masked
 
 
 def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True, 
@@ -176,6 +213,21 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
     return params, variables
 
 
+def prune_gaussians_by_id(params, variables, optimizer, gaussian_ids):
+    if gaussian_ids is None or len(gaussian_ids) == 0:
+        return params, variables
+    device = params["means3D"].device
+    num_pts = params["means3D"].shape[0]
+    valid_ids = [int(gaussian_id) for gaussian_id in gaussian_ids if 0 <= int(gaussian_id) < num_pts]
+    if not valid_ids:
+        return params, variables
+    to_remove = torch.zeros(num_pts, device=device, dtype=torch.bool)
+    to_remove[torch.as_tensor(valid_ids, device=device, dtype=torch.long)] = True
+    params, variables = remove_points(to_remove, params, variables, optimizer)
+    torch.cuda.empty_cache()
+    return params, variables
+
+
 def initialize_optimizer(params, lrs_dict, tracking):
     lrs = lrs_dict
     param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
@@ -186,13 +238,17 @@ def initialize_optimizer(params, lrs_dict, tracking):
 
 
 def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, 
-                              mean_sq_dist_method, densify_dataset=None, gaussian_distribution=None, config=None):
+                              mean_sq_dist_method, densify_dataset=None, gaussian_distribution=None, config=None,
+                              sky_mask_predictor=None):
     # Get RGB-D Data & Camera Parameters
     color, depth, intrinsics, pose, depth_original, global_feature = dataset[0]
 
     # Process RGB-D Data
     color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
     depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+    sky_mask = None
+    if sky_mask_predictor is not None:
+        sky_mask = sky_mask_predictor.get_mask(0, color)
     
     # Process Camera Parameters
     intrinsics = intrinsics[:3, :3]
@@ -206,13 +262,17 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
         color, depth, densify_intrinsics, _ = densify_dataset[0]
         color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
         depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+        init_sky_mask = resize_bool_mask(sky_mask, color.shape[1], color.shape[2])
         densify_intrinsics = densify_intrinsics[:3, :3]
         densify_cam = setup_camera(color.shape[2], color.shape[1], densify_intrinsics.cpu().numpy(), w2c.detach().cpu().numpy(), depth_threshold=config['pixel_gs_depth_threshold'])
     else:
         densify_intrinsics = intrinsics
+        init_sky_mask = sky_mask
 
     # Get Initial Point Cloud (PyTorch CUDA Tensor)
     mask = (depth > 0) # Mask out invalid depth values
+    if init_sky_mask is not None:
+        mask = mask & invert_bool_mask(init_sky_mask)
     mask = mask.reshape(-1)
     init_pt_cld, mean3_sq_dist = get_pointcloud(color, depth, densify_intrinsics, w2c, 
                                                 mask=mask, compute_mean_sq_dist=True, 
@@ -222,7 +282,11 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
     params, variables = initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribution)
 
     # Initialize an estimate of scene radius for Gaussian-Splatting Densification
-    variables['scene_radius'] = torch.max(depth)/scene_radius_depth_ratio
+    scene_depth = apply_sky_mask_to_depth(depth, init_sky_mask)
+    valid_scene_depth = scene_depth[scene_depth > 0]
+    if valid_scene_depth.numel() == 0:
+        valid_scene_depth = depth[depth > 0]
+    variables['scene_radius'] = torch.max(valid_scene_depth)/scene_radius_depth_ratio
 
     if densify_dataset is not None:
         return params, variables, intrinsics, w2c, cam, densify_intrinsics, densify_cam
@@ -291,6 +355,9 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     # Mask with presence silhouette mask (accounts for empty space)
     if tracking and use_sil_for_loss:
         mask = mask & presence_sil_mask
+    sky_mask = curr_data.get("sky_mask")
+    if sky_mask is not None:
+        mask = mask & invert_bool_mask(sky_mask)
 
     # Depth loss
     if use_l1:
@@ -302,8 +369,12 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     
     # RGB Loss
     gt_image = curr_data['im']
+    if sky_mask is not None:
+        color_keep_mask = torch.tile(invert_bool_mask(sky_mask), (3, 1, 1)).detach()
+        gt_image = gt_image * color_keep_mask
+        im = im * color_keep_mask
     if grad_mask is not None:
-        gt_image = grad_mask * curr_data['im']
+        gt_image = grad_mask * gt_image
         im = grad_mask * im
 
         # print(grad_mask.shape)
@@ -318,13 +389,37 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         # exit()
 
     if render_pair_out is not None:
+        valid_depth_mask = (curr_data["depth"] > 0)
+        if sky_mask is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(sky_mask)
+        projected_means2d = project_points(
+            transformed_gaussians["means3D"].detach(),
+            curr_data["intrinsics"].detach(),
+        )
+        seen_mask = (radius > 0).detach()
+        attribution_mask = valid_depth_mask
+        if presence_sil_mask is not None:
+            attribution_mask = attribution_mask & presence_sil_mask.unsqueeze(0)
         render_pair_out["render_image"] = im.detach().cpu()
         render_pair_out["gt_image"] = gt_image.detach().cpu()
         render_pair_out["render_depth"] = depth.detach().cpu()
         render_pair_out["gt_depth"] = curr_data["depth"].detach().cpu()
         render_pair_out["presence_sil_mask"] = presence_sil_mask.detach().cpu()
-        render_pair_out["valid_depth_mask"] = (curr_data["depth"] > 0).detach().cpu()
+        render_pair_out["valid_depth_mask"] = valid_depth_mask.detach().cpu()
         render_pair_out["loss_mask"] = mask.detach().cpu()
+        render_pair_out["gaussian_data"] = {
+            "projected_means2D": projected_means2d.detach().cpu(),
+            "radius": radius.detach().cpu(),
+            "seen": seen_mask.detach().cpu(),
+            "gaussian_ids": torch.arange(
+                params["means3D"].shape[0], device=params["means3D"].device, dtype=torch.long
+            ).detach().cpu(),
+            "depth": transformed_gaussians["means3D"][:, 2].detach().cpu(),
+            "attribution_mask": attribution_mask.detach().cpu(),
+            "timestep": variables.get("timestep", None).detach().cpu()
+            if variables.get("timestep", None) is not None
+            else None,
+        }
     
     if tracking and (use_sil_for_loss or ignore_outlier_depth_loss):
         color_mask = torch.tile(mask, (3, 1, 1))
@@ -416,6 +511,54 @@ def render_rgb_for_frame(params, curr_data, iter_time_idx):
     return image
 
 
+def render_selected_gaussians_for_frame(params, curr_data, iter_time_idx, gaussian_ids):
+    if gaussian_ids is None:
+        return None
+    if isinstance(gaussian_ids, torch.Tensor):
+        selected_ids = gaussian_ids.detach().to(device=params["means3D"].device, dtype=torch.long)
+    else:
+        selected_ids = torch.as_tensor(
+            gaussian_ids,
+            device=params["means3D"].device,
+            dtype=torch.long,
+        )
+    if selected_ids.numel() == 0:
+        return None
+    selected_ids = torch.unique(selected_ids)
+
+    transformed_gaussians = transform_to_frame(
+        params,
+        iter_time_idx,
+        gaussians_grad=False,
+        camera_grad=False,
+    )
+    subset_params = {}
+    for key, value in params.items():
+        if key in ["cam_unnorm_rots", "cam_trans"]:
+            subset_params[key] = value
+        else:
+            subset_params[key] = value[selected_ids]
+    subset_transformed = {
+        key: value[selected_ids] for key, value in transformed_gaussians.items()
+    }
+    rendervar = transformed_params2rendervar(subset_params, subset_transformed)
+    image, _, _, _ = Renderer(raster_settings=curr_data["cam"])(**rendervar)
+
+    sky_mask = curr_data.get("sky_mask")
+    if sky_mask is not None:
+        color_keep_mask = torch.tile(invert_bool_mask(sky_mask), (3, 1, 1)).detach()
+        image = image * color_keep_mask
+    return image.detach().cpu()
+
+
+def save_rgb_tensor_image(path, image):
+    if image is None:
+        return
+    image_np = image.detach().float().cpu().clamp(0.0, 1.0).permute(1, 2, 0).numpy()
+    image_uint8 = (image_np * 255.0).astype(np.uint8)
+    cv2.imwrite(path, cv2.cvtColor(image_uint8, cv2.COLOR_RGB2BGR))
+
+
 def _save_single_channel_image(path, array):
     array = np.asarray(array)
     if array.dtype != np.uint8:
@@ -423,7 +566,7 @@ def _save_single_channel_image(path, array):
     cv2.imwrite(path, array)
 
 
-def save_tracking_debug(frame_dir, render_pair, params, time_idx):
+def save_probe_debug(frame_dir, render_pair, params, time_idx):
     os.makedirs(frame_dir, exist_ok=True)
 
     render_image = render_pair["render_image"].float().cpu().numpy()
@@ -458,7 +601,7 @@ def save_tracking_debug(frame_dir, render_pair, params, time_idx):
         "cam_quat_wxyz=" + " ".join(f"{v:.8f}" for v in curr_cam_rot.cpu().numpy().tolist()),
         "cam_trans_xyz=" + " ".join(f"{v:.8f}" for v in curr_cam_tran.cpu().numpy().tolist()),
     ]
-    with open(os.path.join(frame_dir, "tracking_stats.txt"), "w", encoding="ascii") as f:
+    with open(os.path.join(frame_dir, "probe_stats.txt"), "w", encoding="ascii") as f:
         f.write("\n".join(stats_lines) + "\n")
 
     if render_mean < 1.0 or dark_frac > 0.99:
@@ -524,6 +667,8 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     non_presence_depth_mask = (render_depth > gt_depth) * (depth_error > 50*depth_error.median())
     # Determine non-presence mask
     non_presence_mask = non_presence_sil_mask | non_presence_depth_mask
+    if curr_data.get("sky_mask") is not None:
+        non_presence_mask = non_presence_mask & invert_bool_mask(curr_data["sky_mask"][0])
     # Flatten mask
     non_presence_mask = non_presence_mask.reshape(-1)
 
@@ -536,6 +681,8 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
         curr_w2c[:3, 3] = curr_cam_tran
         valid_depth_mask = (curr_data['depth'][0, :, :] > 0)
+        if curr_data.get("sky_mask") is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(curr_data["sky_mask"][0])
         non_presence_mask = non_presence_mask & valid_depth_mask.reshape(-1)
         new_pt_cld, mean3_sq_dist = get_pointcloud(curr_data['im'], curr_data['depth'], curr_data['intrinsics'], 
                                     curr_w2c, mask=non_presence_mask, compute_mean_sq_dist=True,
@@ -762,6 +909,8 @@ def compute_grad_mask(original_image, dataset, edge_threshold=1.1):
 def rgbd_slam(config: dict):
     # Print Config
     print("Loaded Config:")
+    if "sky_mask" not in config:
+        config["sky_mask"] = {"enabled": False}
     if "use_depth_loss_thres" not in config['tracking']:
         config['tracking']['use_depth_loss_thres'] = False
         config['tracking']['depth_loss_thres'] = 100000
@@ -797,6 +946,9 @@ def rgbd_slam(config: dict):
     feature_probe = None
     feature_probe_cfg = config.get("stage1_feature_probe", {})
     feature_probe_output_dir = None
+    prune_anomaly_gaussians = False
+    save_prune_summary = True
+    save_pruned_map_render = True
     if feature_probe_cfg.get("enabled", False):
         feature_probe_output_dir = os.path.join(
             output_dir,
@@ -812,7 +964,32 @@ def rgbd_slam(config: dict):
             save_raw_tensors=feature_probe_cfg.get("save_raw_tensors", True),
             save_visualizations=feature_probe_cfg.get("save_visualizations", True),
             save_input_rgbs=feature_probe_cfg.get("save_input_rgbs", False),
+            save_gaussian_anomaly_scores=feature_probe_cfg.get(
+                "save_gaussian_anomaly_scores", True
+            ),
+            gaussian_anomaly_topk=feature_probe_cfg.get("gaussian_anomaly_topk", 64),
+            gaussian_anomaly_radius_scale=feature_probe_cfg.get(
+                "gaussian_anomaly_radius_scale", 1.5
+            ),
+            gaussian_anomaly_min_valid_pixels=feature_probe_cfg.get(
+                "gaussian_anomaly_min_valid_pixels", 4
+            ),
+            gaussian_anomaly_use_distance_weight=feature_probe_cfg.get(
+                "gaussian_anomaly_use_distance_weight", True
+            ),
+            gaussian_anomaly_threshold=feature_probe_cfg.get(
+                "gaussian_anomaly_threshold", 0.35
+            ),
+            gaussian_anomaly_min_component_pixels=feature_probe_cfg.get(
+                "gaussian_anomaly_min_component_pixels", 16
+            ),
+            gaussian_anomaly_component_dilation=feature_probe_cfg.get(
+                "gaussian_anomaly_component_dilation", 2
+            ),
         )
+        prune_anomaly_gaussians = feature_probe_cfg.get("prune_anomaly_gaussians", True)
+        save_prune_summary = feature_probe_cfg.get("save_prune_summary", True)
+        save_pruned_map_render = feature_probe_cfg.get("save_pruned_map_render", True)
 
     # SuperPoint+LightGlue
     max_num_keypoints = 1024
@@ -871,13 +1048,30 @@ def rgbd_slam(config: dict):
         use_train_split=dataset_config["use_train_split"],
     )
 
+    sky_mask_predictor = SkyMaskPredictor(
+        config.get("sky_mask", {}),
+        dataset,
+        device,
+        output_dir,
+    )
+
     # print(isinstance(dataset, KittiDataset))
     # print(isinstance(dataset, EurocDataset))
     # print(isinstance(dataset, GradSLAMDataset))
     # print(isinstance(dataset, torch.utils.data.Dataset))
     # exit()
-    _, _, _, _, depth_original_first_frame, _ = dataset[0]
-    pixel_gs_depth_threshold = config['pixel_gs_depth_gamma'] * torch.max(depth_original_first_frame).item()
+    first_color_frame, first_depth_frame, _, _, depth_original_first_frame, _ = dataset[0]
+    first_color_frame = first_color_frame.permute(2, 0, 1) / 255
+    if depth_original_first_frame is not None:
+        depth_for_threshold = depth_original_first_frame.permute(2, 0, 1)
+    else:
+        depth_for_threshold = first_depth_frame.permute(2, 0, 1)
+    first_sky_mask = sky_mask_predictor.get_mask(0, first_color_frame)
+    threshold_depth = apply_sky_mask_to_depth(depth_for_threshold, first_sky_mask)
+    valid_threshold_depth = threshold_depth[threshold_depth > 0]
+    if valid_threshold_depth.numel() == 0:
+        valid_threshold_depth = depth_for_threshold[depth_for_threshold > 0]
+    pixel_gs_depth_threshold = config['pixel_gs_depth_gamma'] * torch.max(valid_threshold_depth).item()
     config['pixel_gs_depth_threshold'] = pixel_gs_depth_threshold
 
     num_frames = dataset_config["num_frames"]
@@ -906,13 +1100,15 @@ def rgbd_slam(config: dict):
                                                                         config['scene_radius_depth_ratio'],
                                                                         config['mean_sq_dist_method'],
                                                                         densify_dataset=densify_dataset,
-                                                                        gaussian_distribution=config['gaussian_distribution'], config=config)                                                                                                                  
+                                                                        gaussian_distribution=config['gaussian_distribution'], config=config,
+                                                                        sky_mask_predictor=sky_mask_predictor)                                                                                                                  
     else:
         # Initialize Parameters & Canoncial Camera parameters
         params, variables, intrinsics, first_frame_w2c, cam = initialize_first_timestep(dataset, num_frames, 
                                                                                         config['scene_radius_depth_ratio'],
                                                                                         config['mean_sq_dist_method'],
-                                                                                        gaussian_distribution=config['gaussian_distribution'], config=config)
+                                                                                        gaussian_distribution=config['gaussian_distribution'], config=config,
+                                                                                        sky_mask_predictor=sky_mask_predictor)
     
     # Init seperate dataloader for tracking if required
     if seperate_tracking_res:
@@ -983,7 +1179,8 @@ def rgbd_slam(config: dict):
                 # Initialize Keyframe Info
                 color = color.permute(2, 0, 1) / 255
                 depth = depth.permute(2, 0, 1)
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth}
+                sky_mask = sky_mask_predictor.get_mask(time_idx, color)
+                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'sky_mask': sky_mask}
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
     else:
@@ -998,11 +1195,29 @@ def rgbd_slam(config: dict):
         # Process RGB-D Data
         color = color.permute(2, 0, 1) / 255
         depth = depth.permute(2, 0, 1)
-        depth_original = depth_original.permute(2, 0, 1)
+        depth_original = depth_original.permute(2, 0, 1) if depth_original is not None else None
+        sky_mask = sky_mask_predictor.get_mask(time_idx, color)
+        color_for_matching = apply_sky_mask_to_color(color, sky_mask)
+        depth_original_for_matching = apply_sky_mask_to_depth(depth_original, sky_mask)
         gt_w2c_all_frames.append(gt_w2c)
         curr_gt_w2c = gt_w2c_all_frames
         # Optimize only current time step for tracking
         iter_time_idx = time_idx
+        frame_id = get_dataset_frame_id(dataset, time_idx)
+        curr_frame_data = {
+            'cam': cam,
+            'im': color,
+            'match_im': color_for_matching,
+            'depth': depth,
+            'depth_original': depth_original_for_matching,
+            'id': iter_time_idx,
+            'intrinsics': intrinsics,
+            'w2c': first_frame_w2c,
+            'iter_gt_w2c_list': curr_gt_w2c,
+            'frame_id': frame_id,
+            'depth_threshold': config['pixel_gs_depth_threshold'],
+            'sky_mask': sky_mask,
+        }
 
         # if time_idx == num_frames - 1:
         #     config["tracking"]["use_gt_poses"] = False
@@ -1015,11 +1230,11 @@ def rgbd_slam(config: dict):
         print("use_gt_poses =", config["tracking"]["use_gt_poses"])
 
         if config["use_warp_loss"]:
-            if depth_original is not None:
-                mask = (depth_original < 0.1) | (depth_original > np.min([dataset.depth_filter_far, 30.0]))
+            if depth_original_for_matching is not None:
+                mask = (depth_original_for_matching < 0.1) | (depth_original_for_matching > np.min([dataset.depth_filter_far, 30.0]))
             else:
                 mask = (depth < 0.1) | (depth > np.min([dataset.depth_filter_far, 30.0]))
-            color_feature = torch.clone(color)
+            color_feature = torch.clone(color_for_matching)
             color_feature[:, mask[0]] = 0
             # color_height = color_feature.shape[1]
             # color_feature[:, :int(color_height / 2), :] = 0
@@ -1028,7 +1243,7 @@ def rgbd_slam(config: dict):
             # cv2.imshow('im_show', im_show)
             # cv2.waitKey(0)
             # exit()
-            curr_feats, curr_desc_all = extract_feature(color_feature, depth_original, sp_extractor, device)
+            curr_feats, curr_desc_all = extract_feature(color_feature, depth_original_for_matching, sp_extractor, device)
         else:
             curr_feats = None
             curr_desc_all = None
@@ -1045,10 +1260,10 @@ def rgbd_slam(config: dict):
                 match_save_path = os.path.join(match_save_dir, "{}_matches.png".format(time_idx))
                 mkpts_cur, mkpts_last, mscores = match_feature(
                     config,
-                    color,
+                    curr_frame_data["match_im"],
                     curr_feats,
                     intrinsics,
-                    last_data["im"],
+                    last_data["match_im"],
                     last_data["feats"],
                     lg_matcher,
                     device,
@@ -1057,7 +1272,7 @@ def rgbd_slam(config: dict):
                 )
                 if mkpts_cur is not None and mkpts_cur.shape[0] > 10:
                     np.savetxt(os.path.join(match_save_dir, "{}_inliers.txt".format(time_idx)), mkpts_cur.shape)
-                    pnp_result = estimate_pnp(mkpts_cur, mkpts_last, curr_data, last_data, dataset)
+                    pnp_result = estimate_pnp(mkpts_cur, mkpts_last, curr_frame_data, last_data, dataset)
                     if pnp_result is not None:
                         pnp_prior_pose_w2c, est_T_curr_last, pnp_num_inliers = pnp_result
                     else:
@@ -1079,17 +1294,15 @@ def rgbd_slam(config: dict):
                 pnp_num_inliers = 0
                 est_T_curr_last = np.eye(4)
 
-        frame_id = get_dataset_frame_id(dataset, time_idx)
-
         # Initialize Mapping Data for selected frame
-        curr_data = {'cam': cam, 'im': color, 'depth': depth, 'depth_original': depth_original, 'id': iter_time_idx, 'intrinsics': intrinsics, 
-                     'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c, "feats": curr_feats, "descs": curr_desc_all,
-                     "frame_id": frame_id, "depth_threshold": config['pixel_gs_depth_threshold']}
+        curr_data = {**curr_frame_data, "feats": curr_feats, "descs": curr_desc_all}
 
         grad_mask = None
         if config["use_grad_mask"]:
             print("use_grad mask")
             grad_mask = compute_grad_mask(curr_data['im'], dataset=dataset, edge_threshold=1.1)
+            if sky_mask is not None:
+                grad_mask = grad_mask & invert_bool_mask(sky_mask)
             
             # print(grad_mask.shape)
             # print(curr_data['im'].shape)
@@ -1107,9 +1320,11 @@ def rgbd_slam(config: dict):
             tracking_color, tracking_depth, _, _ = tracking_dataset[time_idx]
             tracking_color = tracking_color.permute(2, 0, 1) / 255
             tracking_depth = tracking_depth.permute(2, 0, 1)
+            tracking_sky_mask = resize_bool_mask(sky_mask, tracking_color.shape[1], tracking_color.shape[2])
             tracking_curr_data = {'cam': tracking_cam, 'im': tracking_color, 'depth': tracking_depth, 'id': iter_time_idx,
                                   'intrinsics': tracking_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c,
-                                  "frame_id": frame_id, "depth_threshold": config['pixel_gs_depth_threshold']}
+                                  "frame_id": frame_id, "depth_threshold": config['pixel_gs_depth_threshold'],
+                                  'sky_mask': tracking_sky_mask}
         else:
             tracking_curr_data = curr_data
 
@@ -1135,7 +1350,10 @@ def rgbd_slam(config: dict):
         pts = torch.tensor(pts, dtype=torch.float32, device=device)
         depth_tmp = depth_tmp.flatten()
         color_tmp = color_tmp.reshape([-1, 3])
-        valid_depth_indices = torch.where((depth_tmp > np.max([0.1, dataset.depth_filter_near])) & (depth_tmp < np.max([30.0, dataset.depth_filter_far])))[0]
+        valid_depth_mask = (depth_tmp > np.max([0.1, dataset.depth_filter_near])) & (depth_tmp < np.max([30.0, dataset.depth_filter_far]))
+        if sky_mask is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(sky_mask).flatten()
+        valid_depth_indices = torch.where(valid_depth_mask)[0]
         pts = pts[:, valid_depth_indices]
         depth_tmp = depth_tmp[valid_depth_indices]
         color_tmp = color_tmp[valid_depth_indices, :]
@@ -1359,42 +1577,6 @@ def rgbd_slam(config: dict):
                 params['cam_unnorm_rots'][..., time_idx] = rel_w2c_rot_quat
                 params['cam_trans'][..., time_idx] = rel_w2c_tran
 
-        feature_probe_frame_name = None
-        if feature_probe is not None:
-            with torch.no_grad():
-                render_pair = {}
-                frame_id = tracking_curr_data.get("frame_id", time_idx)
-                frame_name = f"{time_idx:06d}_frame_{frame_id}"
-                feature_probe_frame_name = frame_name
-                _, _, _ = get_loss(
-                    params,
-                    tracking_curr_data,
-                    variables,
-                    iter_time_idx,
-                    config['tracking']['loss_weights'],
-                    config['tracking']['use_sil_for_loss'],
-                    config['tracking']['sil_thres'],
-                    config['tracking']['use_l1'],
-                    config['tracking']['ignore_outlier_depth_loss'],
-                    tracking=True,
-                    plot_dir=eval_dir,
-                    visualize_tracking_loss=False,
-                    tracking_iteration=None,
-                    grad_mask=grad_mask,
-                    render_pair_out=render_pair,
-                )
-                feature_probe.save_feature_pair(
-                    gt_image=render_pair["gt_image"],
-                    render_image=render_pair["render_image"],
-                    output_root=feature_probe_output_dir,
-                    frame_name=frame_name,
-                )
-                save_tracking_debug(
-                    os.path.join(feature_probe_output_dir, frame_name, "tracking_debug"),
-                    render_pair,
-                    params,
-                    time_idx,
-                )
         # Update the runtime numbers
         tracking_end_time = time.time()
         tracking_frame_time_sum += tracking_end_time - tracking_start_time
@@ -1426,8 +1608,10 @@ def rgbd_slam(config: dict):
                     densify_color, densify_depth, _, _ = densify_dataset[time_idx]
                     densify_color = densify_color.permute(2, 0, 1) / 255
                     densify_depth = densify_depth.permute(2, 0, 1)
+                    densify_sky_mask = resize_bool_mask(sky_mask, densify_color.shape[1], densify_color.shape[2])
                     densify_curr_data = {'cam': densify_cam, 'im': densify_color, 'depth': densify_depth, 'id': time_idx, 
-                                 'intrinsics': densify_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
+                                 'intrinsics': densify_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c,
+                                 'sky_mask': densify_sky_mask}
                 else:
                     densify_curr_data = curr_data
 
@@ -1449,7 +1633,8 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Select Keyframes for Mapping
                 num_keyframes = config['mapping_window_size']-2
-                selected_keyframes = keyframe_selection_overlap(depth, curr_w2c, intrinsics, keyframe_list[:-1], num_keyframes)
+                keyframe_selection_depth = apply_sky_mask_to_depth(depth, sky_mask)
+                selected_keyframes = keyframe_selection_overlap(keyframe_selection_depth, curr_w2c, intrinsics, keyframe_list[:-1], num_keyframes)
                 selected_time_idx = [keyframe_list[frame_idx]['id'] for frame_idx in selected_keyframes]
                 if len(keyframe_list) > 0:
                     # Add last keyframe to the selected keyframes
@@ -1478,14 +1663,17 @@ def rgbd_slam(config: dict):
                     iter_time_idx = time_idx
                     iter_color = color
                     iter_depth = depth
+                    iter_sky_mask = sky_mask
                 else:
                     # Use Keyframe Data
                     iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
                     iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
                     iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
+                    iter_sky_mask = keyframe_list[selected_rand_keyframe_idx].get('sky_mask')
                 iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
                 iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
-                             'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
+                             'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c,
+                             'sky_mask': iter_sky_mask}
                 # Loss for current frame
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
@@ -1552,9 +1740,11 @@ def rgbd_slam(config: dict):
                     iter_time_idx = keyframe_list[-1]['id']
                     iter_color = keyframe_list[-1]['color']
                     iter_depth = keyframe_list[-1]['depth']
+                    iter_sky_mask = keyframe_list[-1].get('sky_mask')
                     iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
                     iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
-                                'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c}
+                                'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c,
+                                'sky_mask': iter_sky_mask}
                     # Loss for current frame
                     loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                     config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
@@ -1597,6 +1787,66 @@ def rgbd_slam(config: dict):
                     mapping_iter_time_count += 1
                 if num_iters_local_mapping > 0:
                     progress_bar.close()
+
+            if config.get('opt_current_frame', False):
+                print('opt_current_frame')
+                current_mapping_lrs = {
+                                    "means3D": 0.0000,
+                                    "rgb_colors": config['mapping']['lrs']['rgb_colors'],
+                                    "unnorm_rotations": 0.0000,
+                                    "logit_opacities": 0.0000,
+                                    "log_scales": 0.0000,
+                                    "cam_unnorm_rots": 0.0000,
+                                    "cam_trans": 0.0000
+                                    }
+                optimizer = initialize_optimizer(params, current_mapping_lrs, tracking=False)
+                num_iters_current_mapping = int(num_iters_mapping / 2)
+                if num_iters_current_mapping > 0:
+                    progress_bar = tqdm(range(num_iters_current_mapping), desc=f"Current Frame Mapping Time Step: {time_idx}")
+                for iter in range(num_iters_current_mapping):
+                    iter_start_time = time.time()
+                    iter_time_idx = time_idx
+                    iter_color = color
+                    iter_depth = depth
+                    iter_sky_mask = sky_mask
+                    iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
+                    iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx,
+                                 'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c,
+                                 'sky_mask': iter_sky_mask}
+                    loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
+                                                    config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
+                                                    config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True, grad_mask=grad_mask)
+                    if config['use_wandb']:
+                        wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
+                    loss.backward()
+                    with torch.no_grad():
+                        if config['mapping']['prune_gaussians']:
+                            params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'])
+                            if config['use_wandb']:
+                                wandb_run.log({"Mapping/Number of Gaussians - Pruning": params['means3D'].shape[0],
+                                               "Mapping/step": wandb_mapping_step})
+                        if config['mapping']['use_gaussian_splatting_densification']:
+                            params, variables = densify(params, variables, optimizer, iter, config['mapping']['densify_dict'])
+                            if config['use_wandb']:
+                                wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
+                                               "Mapping/step": wandb_mapping_step})
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        if config['report_iter_progress']:
+                            if config['use_wandb']:
+                                report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'],
+                                                wandb_run=wandb_run, wandb_step=wandb_mapping_step, wandb_save_qual=config['wandb']['save_qual'],
+                                                mapping=True, online_time_idx=time_idx)
+                            else:
+                                report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'],
+                                                mapping=True, online_time_idx=time_idx)
+                        else:
+                            progress_bar.update(1)
+                    iter_end_time = time.time()
+                    mapping_iter_time_sum += iter_end_time - iter_start_time
+                    mapping_iter_time_count += 1
+                if num_iters_current_mapping > 0:
+                    progress_bar.close()
             
             # Update the runtime numbers
             mapping_end_time = time.time()
@@ -1621,33 +1871,96 @@ def rgbd_slam(config: dict):
                     save_params_ckpt(params, ckpt_output_dir, time_idx)
                     print('Failed to evaluate trajectory.')
 
-            if feature_probe is not None and feature_probe_frame_name is not None:
+            if feature_probe is not None:
                 with torch.no_grad():
                     render_pair = {}
+                    frame_id = curr_data.get("frame_id", time_idx)
+                    frame_name = f"{time_idx:06d}_frame_{frame_id}"
                     _, _, _ = get_loss(
                         params,
-                        tracking_curr_data,
+                        curr_data,
                         variables,
                         time_idx,
-                        config['tracking']['loss_weights'],
-                        config['tracking']['use_sil_for_loss'],
-                        config['tracking']['sil_thres'],
-                        config['tracking']['use_l1'],
-                        config['tracking']['ignore_outlier_depth_loss'],
-                        tracking=True,
-                        plot_dir=eval_dir,
-                        visualize_tracking_loss=False,
-                        tracking_iteration=None,
+                        config['mapping']['loss_weights'],
+                        config['mapping']['use_sil_for_loss'],
+                        config['mapping']['sil_thres'],
+                        config['mapping']['use_l1'],
+                        config['mapping']['ignore_outlier_depth_loss'],
+                        mapping=True,
                         grad_mask=grad_mask,
                         render_pair_out=render_pair,
                     )
-                    feature_probe.save_feature_pair(
+                    gaussian_summary = feature_probe.save_feature_pair(
                         gt_image=render_pair["gt_image"],
                         render_image=render_pair["render_image"],
                         output_root=feature_probe_output_dir,
-                        frame_name=f"{feature_probe_frame_name}_mapping_after_update",
+                        frame_name=frame_name,
+                        gaussian_data=render_pair.get("gaussian_data"),
                     )
-        
+                    gaussian_anomaly_dir = os.path.join(
+                        feature_probe_output_dir,
+                        frame_name,
+                        "gaussian_anomaly",
+                    )
+                    prune_ids = [] if gaussian_summary is None else gaussian_summary.get("scored_gaussian_ids", [])
+                    matched_render = render_selected_gaussians_for_frame(
+                        params,
+                        curr_data,
+                        time_idx,
+                        prune_ids,
+                    )
+                    save_rgb_tensor_image(
+                        os.path.join(gaussian_anomaly_dir, "matched_gaussians_render.png"),
+                        matched_render,
+                    )
+                    if save_prune_summary:
+                        prune_summary = {
+                            "frame_name": frame_name,
+                            "time_idx": int(time_idx),
+                            "num_pruned": len(prune_ids),
+                            "pruned_gaussian_ids": [int(gaussian_id) for gaussian_id in prune_ids],
+                        }
+                        with open(
+                            os.path.join(gaussian_anomaly_dir, "pruned_gaussians_summary.json"),
+                            "w",
+                            encoding="ascii",
+                        ) as summary_file:
+                            json.dump(prune_summary, summary_file, indent=2)
+                    if prune_anomaly_gaussians and prune_ids:
+                        params, variables = prune_gaussians_by_id(
+                            params,
+                            variables,
+                            optimizer,
+                            prune_ids,
+                        )
+                        print(f"Probe prune at frame {time_idx}: removed {len(prune_ids)} gaussians")
+                    if save_pruned_map_render:
+                        render_pair_after_prune = {}
+                        _, _, _ = get_loss(
+                            params,
+                            curr_data,
+                            variables,
+                            time_idx,
+                            config['mapping']['loss_weights'],
+                            config['mapping']['use_sil_for_loss'],
+                            config['mapping']['sil_thres'],
+                            config['mapping']['use_l1'],
+                            config['mapping']['ignore_outlier_depth_loss'],
+                            mapping=True,
+                            grad_mask=grad_mask,
+                            render_pair_out=render_pair_after_prune,
+                        )
+                        save_rgb_tensor_image(
+                            os.path.join(gaussian_anomaly_dir, "map_render_after_prune.png"),
+                            render_pair_after_prune.get("render_image"),
+                        )
+                    save_probe_debug(
+                        os.path.join(feature_probe_output_dir, frame_name, "probe_debug"),
+                        render_pair,
+                        params,
+                        time_idx,
+                    )
+
         # plot progress
         # if time_idx >= 0:
         #     with torch.no_grad():
@@ -1664,7 +1977,7 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Initialize Keyframe Info
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth}
+                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'sky_mask': sky_mask}
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)

@@ -17,7 +17,7 @@
 - 环境依赖，例如 `torch`、`timm`、`open3d`、`opencv-python`
 - 本地特征权重：`/home/qiuyu/data/Projects/LSG-SLAM/checkpoints/dinov2_reg_small_finetuned.pth`
 
-`stage1_feature_probe` 不会参与 tracking 或 mapping 的优化，只会在 tracking 每帧结束后额外保存：
+`stage1_feature_probe` 不会参与 tracking 或 mapping 的优化，只会在当前帧 mapping 完成后额外保存：
 
 - `gt_features.pt`
 - `render_features.pt`

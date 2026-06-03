@@ -1,11 +1,13 @@
 import types
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
+
+from .gaussian_anomaly import save_gaussian_anomaly_artifacts
 
 try:
     import timm
@@ -128,12 +130,28 @@ class Stage1FeatureProbe:
         save_raw_tensors: bool = True,
         save_visualizations: bool = True,
         save_input_rgbs: bool = False,
+        save_gaussian_anomaly_scores: bool = True,
+        gaussian_anomaly_topk: int = 64,
+        gaussian_anomaly_radius_scale: float = 1.5,
+        gaussian_anomaly_min_valid_pixels: int = 4,
+        gaussian_anomaly_use_distance_weight: bool = True,
+        gaussian_anomaly_threshold: float = 0.35,
+        gaussian_anomaly_min_component_pixels: int = 16,
+        gaussian_anomaly_component_dilation: int = 2,
     ):
         self.device = device
         self.checkpoint_path = Path(checkpoint_path)
         self.save_raw_tensors = save_raw_tensors
         self.save_visualizations = save_visualizations
         self.save_input_rgbs = save_input_rgbs
+        self.save_gaussian_anomaly_scores = save_gaussian_anomaly_scores
+        self.gaussian_anomaly_topk = gaussian_anomaly_topk
+        self.gaussian_anomaly_radius_scale = gaussian_anomaly_radius_scale
+        self.gaussian_anomaly_min_valid_pixels = gaussian_anomaly_min_valid_pixels
+        self.gaussian_anomaly_use_distance_weight = gaussian_anomaly_use_distance_weight
+        self.gaussian_anomaly_threshold = gaussian_anomaly_threshold
+        self.gaussian_anomaly_min_component_pixels = gaussian_anomaly_min_component_pixels
+        self.gaussian_anomaly_component_dilation = gaussian_anomaly_component_dilation
         self.model = self._build_model(model_name)
 
     def _build_model(self, model_name: str) -> torch.nn.Module:
@@ -264,6 +282,20 @@ class Stage1FeatureProbe:
         render_features: torch.Tensor,
         target_hw: Tuple[int, int],
     ) -> np.ndarray:
+        similarity = Stage1FeatureProbe._similarity_map(
+            gt_features,
+            render_features,
+            target_hw,
+        )
+        similarity = (similarity.numpy() * 255.0).astype(np.uint8)
+        return similarity
+
+    @staticmethod
+    def _similarity_map(
+        gt_features: torch.Tensor,
+        render_features: torch.Tensor,
+        target_hw: Tuple[int, int],
+    ) -> torch.Tensor:
         if gt_features.shape != render_features.shape:
             raise ValueError(
                 "Feature shapes must match for similarity visualization, "
@@ -283,7 +315,6 @@ class Stage1FeatureProbe:
         ).squeeze(0).squeeze(0)
         similarity = similarity.clamp(-1.0, 1.0)
         similarity = (similarity + 1.0) * 0.5
-        similarity = (similarity.numpy() * 255.0).astype(np.uint8)
         return similarity
 
     @staticmethod
@@ -297,12 +328,19 @@ class Stage1FeatureProbe:
         render_image: torch.Tensor,
         output_root: str,
         frame_name: str,
-    ) -> None:
+        gaussian_data: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Optional[Dict[str, object]]:
         frame_dir = Path(output_root) / frame_name
         frame_dir.mkdir(parents=True, exist_ok=True)
+        gaussian_summary = None
 
         gt_features = self.extract(gt_image)
         render_features = self.extract(render_image)
+        similarity_map = self._similarity_map(
+            gt_features,
+            render_features,
+            target_hw=(gt_image.shape[1], gt_image.shape[2]),
+        )
 
         if self.save_raw_tensors:
             torch.save(gt_features.half(), frame_dir / "gt_features.pt")
@@ -313,16 +351,14 @@ class Stage1FeatureProbe:
             gt_vis, render_vis = self._feature_pair_to_vis(
                 gt_features, render_features, target_hw
             )
-            similarity_vis = self._similarity_to_vis(
-                gt_features, render_features, target_hw
-            )
+            similarity_vis = (similarity_map.numpy() * 255.0).astype(np.uint8)
             Image.fromarray(gt_vis).save(frame_dir / "gt_features_vis.png")
             Image.fromarray(render_vis).save(frame_dir / "render_features_vis.png")
             Image.fromarray(similarity_vis).save(frame_dir / "similarity.png")
 
+        gt_rgb = self._tensor_to_rgb_image(gt_image)
+        render_rgb = self._tensor_to_rgb_image(render_image)
         if self.save_input_rgbs:
-            gt_rgb = self._tensor_to_rgb_image(gt_image)
-            render_rgb = self._tensor_to_rgb_image(render_image)
             Image.fromarray(gt_rgb).save(frame_dir / "gt_rgb.png")
             Image.fromarray(render_rgb).save(frame_dir / "render_rgb.png")
 
@@ -332,3 +368,21 @@ class Stage1FeatureProbe:
                     (gt_vis, similarity_rgb, render_vis, gt_rgb, render_rgb), axis=1
                 )
                 Image.fromarray(comparison).save(frame_dir / "feature_comparison.png")
+
+        if self.save_gaussian_anomaly_scores and gaussian_data is not None:
+            anomaly_map = 1.0 - similarity_map
+            gaussian_summary = save_gaussian_anomaly_artifacts(
+                frame_dir=frame_dir,
+                gt_rgb=gt_rgb,
+                anomaly_map=anomaly_map,
+                gaussian_data=gaussian_data,
+                valid_mask=gaussian_data.get("attribution_mask"),
+                topk=self.gaussian_anomaly_topk,
+                radius_scale=self.gaussian_anomaly_radius_scale,
+                min_valid_pixels=self.gaussian_anomaly_min_valid_pixels,
+                use_distance_weight=self.gaussian_anomaly_use_distance_weight,
+                anomaly_threshold=self.gaussian_anomaly_threshold,
+                min_component_pixels=self.gaussian_anomaly_min_component_pixels,
+                component_dilation=self.gaussian_anomaly_component_dilation,
+            )
+        return gaussian_summary

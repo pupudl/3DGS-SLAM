@@ -13,6 +13,27 @@
 - `matched_gaussians_render.png` 用来看这帧准备删掉的是哪些高斯
 - `map_render_after_prune.png` 用来看删完以后、当前帧地图渲染是什么样
 
+另外，KITTI / KITTI-360 配置里默认开启了一个独立的 `depth_probe`：
+
+- 每帧 `mapping` 后，把当前帧 LiDAR 投影到图像上得到稀疏真实深度
+- LiDAR 没覆盖到的像素，只在 LiDAR 实际覆盖的那片纵向行带内用当前帧 `depth_original` 补齐
+- 图像上半部分这类天然没有 LiDAR 的区域，不会再退回到 `depth_original`
+- 再和当前帧 `mapping` 后渲染出来的深度做差异图
+
+`depth_probe` 现在是顶层独立开关，不再依赖 `stage1_feature_probe.enabled`：
+
+- 关闭 `stage1_feature_probe.enabled` 时，可以只保留 `depth_probe.enabled=True`
+- 这样会跳过特征提取和高斯异常分析，但仍然输出每帧深度差异图
+- `depth_probe.max_depth_m` 可以限制只比较近距离区域；设成 `20.0` 就表示只保留 20 米内的监督深度区域
+
+`gaussian_anomaly` 现在还支持两种阈值策略开关：
+
+- `gaussian_anomaly_use_adaptive_threshold=True` 时，阈值按当前帧异常分布自适应计算
+- `gaussian_anomaly_enable_fallback=True` 时，如果主阈值没提到有效连通域，会回退到更宽松的阈值再试一次
+- 如果想只用固定阈值 `gaussian_anomaly_threshold`，可以设：
+  - `gaussian_anomaly_use_adaptive_threshold=False`
+  - `gaussian_anomaly_enable_fallback=False`
+
 ## 目录
 
 - `scripts/`：实验版前端与回环脚本副本
@@ -63,6 +84,18 @@ python3 /home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_stage1_feature_pr
 - `gt_rgb.png`
 - `render_rgb.png`
 - `feature_comparison.png`
+- `depth_probe/`
+  - `lidar_depth.png`
+  - `fused_gt_depth.png`
+  - `render_depth.png`
+  - `depth_diff_abs.png`
+  - `depth_diff_signed.png`
+  - `lidar_coverage_mask.png`
+  - `lidar_row_band_mask.png`
+  - `depth_range_mask.png`
+  - `depth_valid_mask.png`
+  - `depth_probe_tensors.pt`
+  - `depth_probe_summary.json`
 - `gaussian_anomaly/`
   - `anomaly_masked.png`
   - `gaussian_anomaly_scores.pt`
@@ -71,4 +104,3 @@ python3 /home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_stage1_feature_pr
   - `matched_gaussians_render.png`
   - `pruned_gaussians_summary.json`
   - `map_render_after_prune.png`
-

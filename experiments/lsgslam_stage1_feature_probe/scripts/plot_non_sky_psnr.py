@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
         default="kitti360-0000_non_sky_psnr_comparison",
         help="Prefix for output PNG/CSV/TXT files.",
     )
+    parser.add_argument(
+        "--x-axis",
+        choices=["frame_id", "index"],
+        default="frame_id",
+        help="Use original frame ids or 1-based frame indices on the plot x-axis.",
+    )
     return parser.parse_args()
 
 
@@ -327,6 +333,7 @@ def plot_metric(
     output_path: Path,
     experiment_to_metrics: dict[str, list[FrameMetric]],
     metric_name: str,
+    x_axis_mode: str,
 ) -> None:
     plt.style.use("seaborn-v0_8-whitegrid")
     fig, ax = plt.subplots(figsize=(14, 6))
@@ -334,7 +341,10 @@ def plot_metric(
 
     for idx, (name, frame_metrics) in enumerate(experiment_to_metrics.items()):
         color = cmap(idx % cmap.N)
-        frame_ids = [metric.frame_id for metric in frame_metrics]
+        if x_axis_mode == "index":
+            frame_ids = [metric.probe_idx + 1 for metric in frame_metrics]
+        else:
+            frame_ids = [metric.frame_id for metric in frame_metrics]
         values = [metric.values[metric_name] for metric in frame_metrics]
         avg_value = float(np.mean(values))
         if metric_name == "psnr":
@@ -361,7 +371,7 @@ def plot_metric(
         ax.set_title("Per-frame LPIPS on Non-sky Pixels")
         ax.set_ylabel("LPIPS (lower is better)")
 
-    ax.set_xlabel("Frame ID")
+    ax.set_xlabel("Frame Index" if x_axis_mode == "index" else "Frame ID")
     ax.legend()
     ax.set_axisbelow(True)
     fig.tight_layout()
@@ -411,7 +421,7 @@ def main() -> None:
 
     for metric_name in metrics:
         plot_path = make_plot_path(output_dir, output_prefix, metric_name, len(metrics))
-        plot_metric(plot_path, experiment_to_metrics, metric_name)
+        plot_metric(plot_path, experiment_to_metrics, metric_name, args.x_axis)
         print(f"Wrote plot: {plot_path}")
 
 

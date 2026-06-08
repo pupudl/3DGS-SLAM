@@ -80,6 +80,21 @@ config = dict(
         gaussian_anomaly_threshold=0.35,
         gaussian_anomaly_min_component_pixels=16,
         gaussian_anomaly_component_dilation=2,
+        gaussian_anomaly_use_adaptive_threshold=True,
+        gaussian_anomaly_enable_fallback=True,
+    ),
+    depth_probe=dict(
+        enabled=True,
+        output_subdir="stage1_feature_probe",
+        save_visualizations=True,
+        save_raw_tensors=True,
+        mask_sky=True,
+        fallback_only_within_lidar_rows=True,
+        lidar_row_band_margin=0,
+        max_depth_m=None,
+        depth_vis_max=None,
+        abs_diff_vis_max=5.0,
+        signed_diff_vis_max=5.0,
     ),
     sky_mask=dict(
         enabled=False,
@@ -141,6 +156,7 @@ config = dict(
     ),
     mapping=dict(
         num_iters=mapping_iters,
+        joint_frame_batch_size=4,
         add_new_gaussians=True,
         sil_thres=0.5, # For Addition of new Gaussians
         use_l1=True,

@@ -105,6 +105,8 @@ def compute_gaussian_anomaly_scores(
     anomaly_threshold: float = 0.35,
     min_component_pixels: int = 16,
     component_dilation: int = 2,
+    use_adaptive_threshold: bool = True,
+    enable_threshold_fallback: bool = True,
     anomaly_threshold_floor: float = 0.05,
     anomaly_threshold_primary_quantile: float = 0.95,
     anomaly_threshold_fallback_quantile: float = 0.85,
@@ -154,14 +156,22 @@ def compute_gaussian_anomaly_scores(
             f"got {centers.shape[0]} and {radius.shape[0]}"
         )
 
-    primary_threshold, fallback_threshold, max_anomaly_value = _resolve_anomaly_threshold(
-        anomaly_map=anomaly_map,
-        valid_mask=valid_mask_hw,
-        max_threshold=anomaly_threshold,
-        threshold_floor=anomaly_threshold_floor,
-        primary_quantile=anomaly_threshold_primary_quantile,
-        fallback_quantile=anomaly_threshold_fallback_quantile,
-    )
+    if use_adaptive_threshold:
+        primary_threshold, fallback_threshold, max_anomaly_value = _resolve_anomaly_threshold(
+            anomaly_map=anomaly_map,
+            valid_mask=valid_mask_hw,
+            max_threshold=anomaly_threshold,
+            threshold_floor=anomaly_threshold_floor,
+            primary_quantile=anomaly_threshold_primary_quantile,
+            fallback_quantile=anomaly_threshold_fallback_quantile,
+        )
+    else:
+        fixed_threshold = float(anomaly_threshold)
+        primary_threshold = fixed_threshold
+        fallback_threshold = fixed_threshold
+        values = anomaly_map[valid_mask_hw]
+        values = values[values > 0]
+        max_anomaly_value = fixed_threshold if values.numel() == 0 else float(values.max().item())
 
     support_mask, components = _extract_anomaly_components(
         anomaly_map=anomaly_map,
@@ -171,7 +181,7 @@ def compute_gaussian_anomaly_scores(
         component_dilation=component_dilation,
     )
     threshold_mode = "primary"
-    if not components and fallback_threshold < primary_threshold:
+    if enable_threshold_fallback and not components and fallback_threshold < primary_threshold:
         support_mask, components = _extract_anomaly_components(
             anomaly_map=anomaly_map,
             valid_mask=valid_mask_hw,
@@ -334,6 +344,8 @@ def save_gaussian_anomaly_artifacts(
     anomaly_threshold: float = 0.35,
     min_component_pixels: int = 16,
     component_dilation: int = 2,
+    use_adaptive_threshold: bool = True,
+    enable_threshold_fallback: bool = True,
     anomaly_threshold_floor: float = 0.05,
     anomaly_threshold_primary_quantile: float = 0.95,
     anomaly_threshold_fallback_quantile: float = 0.85,
@@ -360,6 +372,8 @@ def save_gaussian_anomaly_artifacts(
         anomaly_threshold=anomaly_threshold,
         min_component_pixels=min_component_pixels,
         component_dilation=component_dilation,
+        use_adaptive_threshold=use_adaptive_threshold,
+        enable_threshold_fallback=enable_threshold_fallback,
         anomaly_threshold_floor=anomaly_threshold_floor,
         anomaly_threshold_primary_quantile=anomaly_threshold_primary_quantile,
         anomaly_threshold_fallback_quantile=anomaly_threshold_fallback_quantile,
@@ -418,6 +432,8 @@ def save_gaussian_anomaly_artifacts(
         "min_valid_pixels": min_valid_pixels,
         "use_distance_weight": use_distance_weight,
         "anomaly_threshold": anomaly_threshold,
+        "use_adaptive_threshold": use_adaptive_threshold,
+        "enable_threshold_fallback": enable_threshold_fallback,
         "used_threshold": payload["used_threshold"],
         "primary_threshold": payload["primary_threshold"],
         "fallback_threshold": payload["fallback_threshold"],

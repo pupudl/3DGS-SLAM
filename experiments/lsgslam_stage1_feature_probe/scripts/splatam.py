@@ -48,7 +48,7 @@ from sp_lg.disk import DISK
 from sp_lg.utils import load_image, match_pair
 from sp_lg import viz2d
 from sky_mask import SkyMaskPredictor
-from stage1_feature_probe import Stage1FeatureProbe
+from stage1_feature_probe import Stage1FeatureProbe, save_depth_probe_artifacts
 from feature_matching import *
 
 
@@ -945,10 +945,22 @@ def rgbd_slam(config: dict):
 
     feature_probe = None
     feature_probe_cfg = config.get("stage1_feature_probe", {})
+    legacy_depth_probe_cfg = feature_probe_cfg.get("depth_probe", {})
+    depth_probe_cfg = config.get("depth_probe", legacy_depth_probe_cfg)
     feature_probe_output_dir = None
+    depth_probe_output_dir = None
     prune_anomaly_gaussians = False
     save_prune_summary = True
     save_pruned_map_render = True
+    if depth_probe_cfg.get("enabled", False):
+        depth_probe_output_dir = os.path.join(
+            output_dir,
+            depth_probe_cfg.get(
+                "output_subdir",
+                feature_probe_cfg.get("output_subdir", "stage1_feature_probe"),
+            ),
+        )
+        os.makedirs(depth_probe_output_dir, exist_ok=True)
     if feature_probe_cfg.get("enabled", False):
         feature_probe_output_dir = os.path.join(
             output_dir,
@@ -985,6 +997,12 @@ def rgbd_slam(config: dict):
             ),
             gaussian_anomaly_component_dilation=feature_probe_cfg.get(
                 "gaussian_anomaly_component_dilation", 2
+            ),
+            gaussian_anomaly_use_adaptive_threshold=feature_probe_cfg.get(
+                "gaussian_anomaly_use_adaptive_threshold", True
+            ),
+            gaussian_anomaly_enable_fallback=feature_probe_cfg.get(
+                "gaussian_anomaly_enable_fallback", True
             ),
         )
         prune_anomaly_gaussians = feature_probe_cfg.get("prune_anomaly_gaussians", True)
@@ -1649,35 +1667,62 @@ def rgbd_slam(config: dict):
             # Reset Optimizer & Learning Rates for Full Map Optimization
             optimizer = initialize_optimizer(params, config['mapping']['lrs'], tracking=False) 
 
+            mapping_joint_frame_count = max(
+                1, int(config['mapping'].get('joint_frame_batch_size', 1))
+            )
+
             # Mapping Global map
             mapping_start_time = time.time()
             if num_iters_mapping > 0:
                 progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
             for iter in range(num_iters_mapping):
                 iter_start_time = time.time()
-                # Randomly select a frame until current time step amongst keyframes
-                rand_idx = np.random.randint(0, len(selected_keyframes))
-                selected_rand_keyframe_idx = selected_keyframes[rand_idx]
-                if selected_rand_keyframe_idx == -1:
-                    # Use Current Frame Data
-                    iter_time_idx = time_idx
-                    iter_color = color
-                    iter_depth = depth
-                    iter_sky_mask = sky_mask
-                else:
-                    # Use Keyframe Data
-                    iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
-                    iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
-                    iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
-                    iter_sky_mask = keyframe_list[selected_rand_keyframe_idx].get('sky_mask')
-                iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
-                iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
-                             'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c,
-                             'sky_mask': iter_sky_mask}
-                # Loss for current frame
-                loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
-                                                config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
-                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True, grad_mask=grad_mask)
+                sampled_frame_indices = np.random.permutation(len(selected_keyframes))[
+                    :min(mapping_joint_frame_count, len(selected_keyframes))
+                ]
+                sampled_losses = []
+                sampled_iter_data = []
+                for sampled_idx in sampled_frame_indices:
+                    selected_rand_keyframe_idx = selected_keyframes[int(sampled_idx)]
+                    if selected_rand_keyframe_idx == -1:
+                        # Use Current Frame Data
+                        iter_time_idx = time_idx
+                        iter_color = color
+                        iter_depth = depth
+                        iter_sky_mask = sky_mask
+                    else:
+                        # Use Keyframe Data
+                        iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
+                        iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
+                        iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
+                        iter_sky_mask = keyframe_list[selected_rand_keyframe_idx].get('sky_mask')
+                    iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
+                    iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx,
+                                 'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c,
+                                 'sky_mask': iter_sky_mask}
+                    sampled_iter_data.append((iter_time_idx, iter_data))
+                    frame_loss, variables, frame_losses = get_loss(
+                        params,
+                        iter_data,
+                        variables,
+                        iter_time_idx,
+                        config['mapping']['loss_weights'],
+                        config['mapping']['use_sil_for_loss'],
+                        config['mapping']['sil_thres'],
+                        config['mapping']['use_l1'],
+                        config['mapping']['ignore_outlier_depth_loss'],
+                        mapping=True,
+                        grad_mask=grad_mask,
+                    )
+                    sampled_losses.append((frame_loss, frame_losses))
+
+                loss = sum(frame_loss for frame_loss, _ in sampled_losses) / len(sampled_losses)
+                losses = {}
+                for _, frame_losses in sampled_losses:
+                    for loss_name, loss_value in frame_losses.items():
+                        losses[loss_name] = losses.get(loss_name, 0.0) + loss_value
+                losses = {loss_name: loss_value / len(sampled_losses) for loss_name, loss_value in losses.items()}
+                iter_time_idx, iter_data = sampled_iter_data[-1]
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
@@ -1871,7 +1916,7 @@ def rgbd_slam(config: dict):
                     save_params_ckpt(params, ckpt_output_dir, time_idx)
                     print('Failed to evaluate trajectory.')
 
-            if feature_probe is not None:
+            if feature_probe is not None or depth_probe_cfg.get("enabled", False):
                 with torch.no_grad():
                     render_pair = {}
                     frame_id = curr_data.get("frame_id", time_idx)
@@ -1890,72 +1935,110 @@ def rgbd_slam(config: dict):
                         grad_mask=grad_mask,
                         render_pair_out=render_pair,
                     )
-                    gaussian_summary = feature_probe.save_feature_pair(
-                        gt_image=render_pair["gt_image"],
-                        render_image=render_pair["render_image"],
-                        output_root=feature_probe_output_dir,
-                        frame_name=frame_name,
-                        gaussian_data=render_pair.get("gaussian_data"),
-                    )
-                    gaussian_anomaly_dir = os.path.join(
-                        feature_probe_output_dir,
-                        frame_name,
-                        "gaussian_anomaly",
-                    )
-                    prune_ids = [] if gaussian_summary is None else gaussian_summary.get("scored_gaussian_ids", [])
-                    matched_render = render_selected_gaussians_for_frame(
-                        params,
-                        curr_data,
-                        time_idx,
-                        prune_ids,
-                    )
-                    save_rgb_tensor_image(
-                        os.path.join(gaussian_anomaly_dir, "matched_gaussians_render.png"),
-                        matched_render,
-                    )
-                    if save_prune_summary:
-                        prune_summary = {
-                            "frame_name": frame_name,
-                            "time_idx": int(time_idx),
-                            "num_pruned": len(prune_ids),
-                            "pruned_gaussian_ids": [int(gaussian_id) for gaussian_id in prune_ids],
-                        }
-                        with open(
-                            os.path.join(gaussian_anomaly_dir, "pruned_gaussians_summary.json"),
-                            "w",
-                            encoding="ascii",
-                        ) as summary_file:
-                            json.dump(prune_summary, summary_file, indent=2)
-                    if prune_anomaly_gaussians and prune_ids:
-                        params, variables = prune_gaussians_by_id(
-                            params,
-                            variables,
-                            optimizer,
-                            prune_ids,
+                    gaussian_summary = None
+                    if feature_probe is not None:
+                        gaussian_summary = feature_probe.save_feature_pair(
+                            gt_image=render_pair["gt_image"],
+                            render_image=render_pair["render_image"],
+                            output_root=feature_probe_output_dir,
+                            frame_name=frame_name,
+                            gaussian_data=render_pair.get("gaussian_data"),
                         )
-                        print(f"Probe prune at frame {time_idx}: removed {len(prune_ids)} gaussians")
-                    if save_pruned_map_render:
-                        render_pair_after_prune = {}
-                        _, _, _ = get_loss(
+                    fallback_depth_for_probe = curr_data.get("depth_original")
+                    if fallback_depth_for_probe is None:
+                        fallback_depth_for_probe = render_pair["gt_depth"]
+                    depth_probe_summary = save_depth_probe_artifacts(
+                        output_root=depth_probe_output_dir,
+                        frame_name=frame_name,
+                        dataset=dataset,
+                        frame_id=frame_id,
+                        intrinsics=curr_data["intrinsics"],
+                        render_depth=render_pair["render_depth"],
+                        fallback_depth=fallback_depth_for_probe,
+                        project_root=PROJECT_ROOT,
+                        sky_mask=curr_data.get("sky_mask"),
+                        enabled=depth_probe_cfg.get("enabled", False),
+                        save_visualizations=depth_probe_cfg.get("save_visualizations", True),
+                        save_raw_tensors=depth_probe_cfg.get("save_raw_tensors", True),
+                        mask_sky=depth_probe_cfg.get("mask_sky", True),
+                        fallback_only_within_lidar_rows=depth_probe_cfg.get(
+                            "fallback_only_within_lidar_rows", True
+                        ),
+                        lidar_row_band_margin=depth_probe_cfg.get("lidar_row_band_margin", 0),
+                        max_depth_m=depth_probe_cfg.get("max_depth_m"),
+                        depth_vis_max=depth_probe_cfg.get("depth_vis_max"),
+                        abs_diff_vis_max=depth_probe_cfg.get("abs_diff_vis_max", 5.0),
+                        signed_diff_vis_max=depth_probe_cfg.get("signed_diff_vis_max", 5.0),
+                    )
+                    if depth_probe_summary.get("status") == "skipped":
+                        print(
+                            f"Depth probe skipped at frame {time_idx}: "
+                            f"{depth_probe_summary.get('reason', 'unknown reason')}"
+                        )
+                    if feature_probe is not None:
+                        gaussian_anomaly_dir = os.path.join(
+                            feature_probe_output_dir,
+                            frame_name,
+                            "gaussian_anomaly",
+                        )
+                        prune_ids = [] if gaussian_summary is None else gaussian_summary.get("scored_gaussian_ids", [])
+                        matched_render = render_selected_gaussians_for_frame(
                             params,
                             curr_data,
-                            variables,
                             time_idx,
-                            config['mapping']['loss_weights'],
-                            config['mapping']['use_sil_for_loss'],
-                            config['mapping']['sil_thres'],
-                            config['mapping']['use_l1'],
-                            config['mapping']['ignore_outlier_depth_loss'],
-                            mapping=True,
-                            grad_mask=grad_mask,
-                            render_pair_out=render_pair_after_prune,
+                            prune_ids,
                         )
                         save_rgb_tensor_image(
-                            os.path.join(gaussian_anomaly_dir, "map_render_after_prune.png"),
-                            render_pair_after_prune.get("render_image"),
+                            os.path.join(gaussian_anomaly_dir, "matched_gaussians_render.png"),
+                            matched_render,
                         )
+                        if save_prune_summary:
+                            prune_summary = {
+                                "frame_name": frame_name,
+                                "time_idx": int(time_idx),
+                                "num_pruned": len(prune_ids),
+                                "pruned_gaussian_ids": [int(gaussian_id) for gaussian_id in prune_ids],
+                            }
+                            with open(
+                                os.path.join(gaussian_anomaly_dir, "pruned_gaussians_summary.json"),
+                                "w",
+                                encoding="ascii",
+                            ) as summary_file:
+                                json.dump(prune_summary, summary_file, indent=2)
+                        if prune_anomaly_gaussians and prune_ids:
+                            params, variables = prune_gaussians_by_id(
+                                params,
+                                variables,
+                                optimizer,
+                                prune_ids,
+                            )
+                            print(f"Probe prune at frame {time_idx}: removed {len(prune_ids)} gaussians")
+                        if save_pruned_map_render:
+                            render_pair_after_prune = {}
+                            _, _, _ = get_loss(
+                                params,
+                                curr_data,
+                                variables,
+                                time_idx,
+                                config['mapping']['loss_weights'],
+                                config['mapping']['use_sil_for_loss'],
+                                config['mapping']['sil_thres'],
+                                config['mapping']['use_l1'],
+                                config['mapping']['ignore_outlier_depth_loss'],
+                                mapping=True,
+                                grad_mask=grad_mask,
+                                render_pair_out=render_pair_after_prune,
+                            )
+                            save_rgb_tensor_image(
+                                os.path.join(gaussian_anomaly_dir, "map_render_after_prune.png"),
+                                render_pair_after_prune.get("render_image"),
+                            )
                     save_probe_debug(
-                        os.path.join(feature_probe_output_dir, frame_name, "probe_debug"),
+                        os.path.join(
+                            (feature_probe_output_dir if feature_probe is not None else depth_probe_output_dir),
+                            frame_name,
+                            "probe_debug",
+                        ),
                         render_pair,
                         params,
                         time_idx,

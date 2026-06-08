@@ -138,6 +138,8 @@ class Stage1FeatureProbe:
         gaussian_anomaly_threshold: float = 0.35,
         gaussian_anomaly_min_component_pixels: int = 16,
         gaussian_anomaly_component_dilation: int = 2,
+        gaussian_anomaly_use_adaptive_threshold: bool = True,
+        gaussian_anomaly_enable_fallback: bool = True,
     ):
         self.device = device
         self.checkpoint_path = Path(checkpoint_path)
@@ -152,6 +154,8 @@ class Stage1FeatureProbe:
         self.gaussian_anomaly_threshold = gaussian_anomaly_threshold
         self.gaussian_anomaly_min_component_pixels = gaussian_anomaly_min_component_pixels
         self.gaussian_anomaly_component_dilation = gaussian_anomaly_component_dilation
+        self.gaussian_anomaly_use_adaptive_threshold = gaussian_anomaly_use_adaptive_threshold
+        self.gaussian_anomaly_enable_fallback = gaussian_anomaly_enable_fallback
         self.model = self._build_model(model_name)
 
     def _build_model(self, model_name: str) -> torch.nn.Module:
@@ -384,5 +388,7 @@ class Stage1FeatureProbe:
                 anomaly_threshold=self.gaussian_anomaly_threshold,
                 min_component_pixels=self.gaussian_anomaly_min_component_pixels,
                 component_dilation=self.gaussian_anomaly_component_dilation,
+                use_adaptive_threshold=self.gaussian_anomaly_use_adaptive_threshold,
+                enable_threshold_fallback=self.gaussian_anomaly_enable_fallback,
             )
         return gaussian_summary

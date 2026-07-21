@@ -186,3 +186,5 @@ third_party/TransVPR/*.pth
 /experiments/*/results/
 /checkpoints/
 /experiments/*/scripts/__pycache__/
+*.zip
+experiments/**/results/

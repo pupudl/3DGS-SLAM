@@ -26,6 +26,7 @@
 - `third_party/rigidmask`
 - rigidmask checkpoint
 - `third_party/rigidmask/models/ngransac` 编译产物
+- `third_party/GndNet` 和 `trained_models/checkpoint.pth.tar`（`lidar_motion_probe` 的 GndNet 去地面后端；当前适配层不依赖 ROS、`ipdb` 或 `numba`）
 - `torch`
 - `opencv-python`
 - `kornia`

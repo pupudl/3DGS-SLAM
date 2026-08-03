@@ -12,7 +12,7 @@ fi
 
 # scene_name, start_idx, end_idx, stride, image_width, image_height, yaml
 scene_names=(
-"2013_05_28_drive_0000_sync,2300,2350,2,1408,376,$exp_root/configs/kitti360/kitti360.yaml"
+"2013_05_28_drive_0000_sync,2150,2200,2,1408,376,$exp_root/configs/kitti360/kitti360.yaml"
 )
 
 step=50

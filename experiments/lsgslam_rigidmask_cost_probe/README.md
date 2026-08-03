@@ -103,20 +103,63 @@ bash /home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_rigidmask_cost_probe
 - `rigidmask_frontend_arrays.npz`
 - `rigidmask_frontend_summary.json`
 
-如果你想把这些代价图进一步融合成一个启发式的动态分数图和二值 mask，可以对整个
-`rigidmask_frontend_probe` 目录运行：
+当 `rigidmask_frontend_probe.dynamic_fusion.enabled=True` 时，`splatam.py` 会在每帧
+RigidMask cost、stage1 similarity 和可用的 LiDAR motion residual 都保存后，立即为当前
+pair 生成启发式动态分数图和二值 mask，不需要等整段序列跑完再统一后处理。
+
+LiDAR residual 是稀疏投影证据：高 residual 会抬高可信动态区域；低 residual 不再逐像素压暗。
+`dynamic_mask_pre_lidar.png` 里的候选连通域只有在两种情况下才会被压暗/从 mask 中删除：
+一是有足够 LiDAR 覆盖且 `lidar_residual_score.png` 整体接近全黑；二是这个候选块基本没有
+LiDAR 覆盖，同时没有任何明显高 residual 支持。后者默认开启，可在离线补跑时用
+`--keep-uncovered-components` 做保守对照。
+另外会做一层 LiDAR hard static filter：高于 LiDAR 图像采样上边界的区域，会直接把
+`dynamic_score.png` 和 `dynamic_mask.png` 置黑。
+旧结果如果还没有 `lidar_motion_probe/image_lidar_static_masks.npz`，离线补跑会先 fallback 到
+已有 residual 投影估计 LiDAR 上边界。
+如果几何/外观整体证据很弱并触发空 mask gate，默认仍输出空 mask；LiDAR 只修正已有候选，
+不会用少量高 residual 亮点打破整帧静态判断。
+
+默认会把每个 pair 目录下的输出归类为：
+
+```text
+<pair_name>/
+  inputs/
+  costs/
+  filters/
+  dynamic/
+  raw/
+  metadata/
+```
+
+其中 `dynamic/` 下会生成：
+
+- `dynamic_score.png`
+- `dynamic_score_pre_lidar.png`
+- `dynamic_score_geom.png`
+- `dynamic_gate.png`
+- `dynamic_mask.png`
+- `dynamic_mask_pre_lidar.png`
+- `lidar_residual_score.png`
+- `lidar_residual_confidence.png`
+- `lidar_suppression_mask.png`
+
+其中 `filters/` 下还会保存：
+
+- `lidar_static_exclusion_mask.png`
+- `lidar_above_range_mask.png`
+- `lidar_visible_mask.png`
+
+融合摘要会写到 `metadata/dynamic_fusion_summary.json`。
+
+旧结果仍然可以对整个 `rigidmask_frontend_probe` 目录补跑：
 
 ```bash
 python3 /home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_rigidmask_cost_probe/scripts/fuse_rigidmask_dynamic_scores.py \
   /home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_rigidmask_cost_probe/results/<group_name>/<run_name>/rigidmask_frontend_probe
 ```
 
-它会在每个 pair 目录下额外生成：
-
-- `dynamic_score.png`
-- `dynamic_gate.png`
-- `dynamic_mask.png`
-- `dynamic_fusion_summary.json`
+如果想保留旧的平铺输出结构，加 `--flat-outputs`；如果想做不含 LiDAR 的对照，加
+`--no-lidar-residual`。
 
 ## RigidMask Depth Mask
 

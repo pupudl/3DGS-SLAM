@@ -5,6 +5,7 @@ import shutil
 import sys
 import time
 from importlib.machinery import SourceFileLoader
+from pathlib import Path
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(_BASE_DIR))
@@ -54,7 +55,127 @@ from probes import (
     Stage1FeatureProbe,
     save_depth_probe_artifacts,
 )
+from fuse_rigidmask_dynamic_scores import find_pair_file, process_pair_dir
 from feature_matching import *
+
+
+DEFAULT_RIGIDMASK_DYNAMIC_FUSION_CFG = {
+    "enabled": True,
+    "mask_percentile": 85.0,
+    "empty_score_mean_thresh": 0.06,
+    "empty_score_p90_thresh": 0.15,
+    "empty_score_p99_thresh": 0.25,
+    "empty_high_score_thresh": 0.25,
+    "empty_high_score_area_thresh": 0.01,
+    "appearance_boost_alpha": 0.5,
+    "feature_probe_subdir": "stage1_feature_probe",
+    "lidar_residual_enabled": True,
+    "lidar_motion_subdir": "lidar_motion_probe",
+    "lidar_projection_filename": "image_residual_nonground_features.npz",
+    "lidar_splat_radius": 2.0,
+    "lidar_confidence_norm": 1.5,
+    "lidar_static_residual_m": 0.15,
+    "lidar_dynamic_residual_m": 0.70,
+    "lidar_residual_high_q": 95.0,
+    "lidar_residual_mad_scale": 2.0,
+    "lidar_min_visible_points": 20,
+    "lidar_static_mask_enabled": True,
+    "lidar_static_mask_filename": "image_lidar_static_masks.npz",
+    "lidar_static_filter_above_range": True,
+    "lidar_static_above_row_percentile": 0.1,
+    "lidar_static_above_row_margin_px": 8.0,
+    "lidar_down_weight": 0.65,
+    "lidar_up_weight": 0.45,
+    "lidar_confidence_thresh": 0.25,
+    "lidar_promote_score_thresh": 0.65,
+    "lidar_promote_visual_thresh": 0.20,
+    "lidar_component_min_covered_cells": 3,
+    "lidar_component_min_covered_fraction": 0.03,
+    "lidar_suppress_uncovered_components": True,
+    "lidar_uncovered_component_min_area": 64,
+    "lidar_component_dark_mean_thresh": 0.08,
+    "lidar_component_dark_p95_thresh": 0.18,
+    "lidar_component_dark_high_score_thresh": 0.35,
+    "lidar_component_dark_max_high_fraction": 0.02,
+    "lidar_allow_empty_override": False,
+    "lidar_empty_override_min_cells": 3,
+    "organize_outputs": True,
+}
+
+
+def get_rigidmask_dynamic_fusion_cfg(rigidmask_frontend_probe_cfg):
+    fusion_cfg = DEFAULT_RIGIDMASK_DYNAMIC_FUSION_CFG.copy()
+    fusion_cfg.update(rigidmask_frontend_probe_cfg.get("dynamic_fusion", {}))
+    return fusion_cfg
+
+
+def maybe_fuse_rigidmask_dynamic_score(
+    rigidmask_frontend_probe_output_dir,
+    rigidmask_frontend_probe_cfg,
+    dataset,
+    time_idx,
+    num_frames,
+    curr_frame_id,
+):
+    if rigidmask_frontend_probe_output_dir is None:
+        return None
+    fusion_cfg = get_rigidmask_dynamic_fusion_cfg(rigidmask_frontend_probe_cfg)
+    if not fusion_cfg.get("enabled", True):
+        return None
+    if time_idx >= num_frames - 1:
+        return None
+
+    next_frame_id = get_dataset_frame_id(dataset, time_idx + 1)
+    pair_name = f"{time_idx:06d}_frame_{curr_frame_id}_to_{next_frame_id}"
+    pair_dir = Path(rigidmask_frontend_probe_output_dir) / pair_name
+    if not find_pair_file(pair_dir, "rigidmask_frontend_arrays.npz").exists():
+        return None
+
+    fusion_summary = process_pair_dir(
+        pair_dir=pair_dir,
+        mask_percentile=fusion_cfg["mask_percentile"],
+        empty_score_mean_thresh=fusion_cfg["empty_score_mean_thresh"],
+        empty_score_p90_thresh=fusion_cfg["empty_score_p90_thresh"],
+        empty_score_p99_thresh=fusion_cfg["empty_score_p99_thresh"],
+        empty_high_score_thresh=fusion_cfg["empty_high_score_thresh"],
+        empty_high_score_area_thresh=fusion_cfg["empty_high_score_area_thresh"],
+        appearance_boost_alpha=fusion_cfg["appearance_boost_alpha"],
+        feature_probe_subdir=fusion_cfg["feature_probe_subdir"],
+        lidar_residual_enabled=fusion_cfg["lidar_residual_enabled"],
+        lidar_motion_subdir=fusion_cfg["lidar_motion_subdir"],
+        lidar_projection_filename=fusion_cfg["lidar_projection_filename"],
+        lidar_splat_radius=fusion_cfg["lidar_splat_radius"],
+        lidar_confidence_norm=fusion_cfg["lidar_confidence_norm"],
+        lidar_static_residual_m=fusion_cfg["lidar_static_residual_m"],
+        lidar_dynamic_residual_m=fusion_cfg["lidar_dynamic_residual_m"],
+        lidar_residual_high_q=fusion_cfg["lidar_residual_high_q"],
+        lidar_residual_mad_scale=fusion_cfg["lidar_residual_mad_scale"],
+        lidar_min_visible_points=fusion_cfg["lidar_min_visible_points"],
+        lidar_static_mask_enabled=fusion_cfg["lidar_static_mask_enabled"],
+        lidar_static_mask_filename=fusion_cfg["lidar_static_mask_filename"],
+        lidar_static_filter_above_range=fusion_cfg["lidar_static_filter_above_range"],
+        lidar_static_above_row_percentile=fusion_cfg["lidar_static_above_row_percentile"],
+        lidar_static_above_row_margin_px=fusion_cfg["lidar_static_above_row_margin_px"],
+        lidar_down_weight=fusion_cfg["lidar_down_weight"],
+        lidar_up_weight=fusion_cfg["lidar_up_weight"],
+        lidar_confidence_thresh=fusion_cfg["lidar_confidence_thresh"],
+        lidar_promote_score_thresh=fusion_cfg["lidar_promote_score_thresh"],
+        lidar_promote_visual_thresh=fusion_cfg["lidar_promote_visual_thresh"],
+        lidar_component_min_covered_cells=fusion_cfg["lidar_component_min_covered_cells"],
+        lidar_component_min_covered_fraction=fusion_cfg["lidar_component_min_covered_fraction"],
+        lidar_suppress_uncovered_components=fusion_cfg["lidar_suppress_uncovered_components"],
+        lidar_uncovered_component_min_area=fusion_cfg["lidar_uncovered_component_min_area"],
+        lidar_component_dark_mean_thresh=fusion_cfg["lidar_component_dark_mean_thresh"],
+        lidar_component_dark_p95_thresh=fusion_cfg["lidar_component_dark_p95_thresh"],
+        lidar_component_dark_high_score_thresh=fusion_cfg["lidar_component_dark_high_score_thresh"],
+        lidar_component_dark_max_high_fraction=fusion_cfg["lidar_component_dark_max_high_fraction"],
+        lidar_allow_empty_override=fusion_cfg["lidar_allow_empty_override"],
+        lidar_empty_override_min_cells=fusion_cfg["lidar_empty_override_min_cells"],
+        organize_outputs=fusion_cfg["organize_outputs"],
+    )
+    if fusion_summary is not None:
+        print(f"RigidMask dynamic fusion saved for {pair_name}")
+    return fusion_summary
 
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
@@ -1670,6 +1791,15 @@ def rgbd_slam(config: dict):
                     f"RigidMask frontend probe skipped at frame {time_idx}: "
                     f"{probe_summary.get('reason', 'unknown reason')}"
                 )
+            elif feature_probe is None:
+                maybe_fuse_rigidmask_dynamic_score(
+                    rigidmask_frontend_probe_output_dir,
+                    rigidmask_frontend_probe_cfg,
+                    dataset,
+                    time_idx,
+                    num_frames,
+                    frame_id,
+                )
 
         if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
             try:
@@ -2048,6 +2178,15 @@ def rgbd_slam(config: dict):
                         print(
                             f"Depth probe skipped at frame {time_idx}: "
                             f"{depth_probe_summary.get('reason', 'unknown reason')}"
+                        )
+                    if rigidmask_frontend_probe is not None:
+                        maybe_fuse_rigidmask_dynamic_score(
+                            rigidmask_frontend_probe_output_dir,
+                            rigidmask_frontend_probe_cfg,
+                            dataset,
+                            time_idx,
+                            num_frames,
+                            frame_id,
                         )
                     if feature_probe is not None:
                         gaussian_anomaly_dir = os.path.join(

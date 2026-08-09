@@ -2,6 +2,8 @@ import os
 from os.path import join as p_join
 from datetime import datetime
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 scenes = ["2013_05_28_drive_0000_sync"]
 
 primary_device="cuda:0"
@@ -54,6 +56,57 @@ config = dict(
     opt_local_map=False,
     use_wandb=False,
     pixel_gs_depth_gamma=0.37,
+    dynamic_mask=dict(
+        enabled=False,
+        output_subdir="dynamic_mask",
+        fail_on_error=False,
+        require_lidar_residual=False,
+        rigidmask=dict(
+            enabled=True,
+            repo_root=os.path.join(PROJECT_ROOT, "third_party", "rigidmask"),
+            checkpoint_path=os.path.join(PROJECT_ROOT, "third_party", "rigidmask", "weights", "rigidmask-kitti", "weights.pth"),
+            calibration_path=os.path.join(PROJECT_ROOT, "data", "kitti360", "calibration", "perspective.txt"),
+            disparity_dir="disparity_sceneflow",
+            sensor="stereo",
+            use_opencv_essential_mat=True,
+            save_raw_tensors=True,
+            save_visualizations=False,
+            save_input_rgbs=True,
+            depth_mask=dict(
+                enabled=False,
+                min_depth_m=0.5,
+                max_depth_m=30.0,
+                mask_sky=False,
+                apply_stage="post_dynamic_mask",
+                save_visualizations=False,
+                save_raw_tensors=True,
+            ),
+        ),
+        lidar_residual=dict(
+            enabled=True,
+            gndnet_repo_root=os.path.join(PROJECT_ROOT, "third_party", "GndNet"),
+            gndnet_checkpoint_path=os.path.join(PROJECT_ROOT, "third_party", "GndNet", "trained_models", "checkpoint.pth.tar"),
+            gndnet_config_path=os.path.join(PROJECT_ROOT, "third_party", "GndNet", "config", "config_kittiSem.yaml"),
+            compute_nonground_residual=True,
+            save_visualizations=False,
+            save_nonground_visualizations=False,
+        ),
+        appearance=dict(
+            enabled=True,
+            checkpoint_path=os.path.join(PROJECT_ROOT, "checkpoints", "dinov2_reg_small_finetuned.pth"),
+            output_subdir="appearance_similarity",
+            save_raw_tensors=True,
+            save_feature_tensors=False,
+            save_visualizations=False,
+            save_input_rgbs=False,
+            offload_after_use=True,
+            require_appearance=True,
+        ),
+        fusion=dict(
+            appearance_boost_alpha=0.5,
+            save_diagnostics=False,
+        ),
+    ),
     wandb=dict(
         entity="",
         project="",

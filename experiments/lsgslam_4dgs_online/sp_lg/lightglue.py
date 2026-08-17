@@ -311,7 +311,7 @@ class LightGlue(nn.Module):
             # state_dict = torch.hub.load_state_dict_from_url(
             #     self.url.format(self.version, pretrained), file_name=fname)
             # self.load_state_dict(state_dict, strict=False)
-            ckpt = Path(__file__).parent / 'superpoint_lightglue.pth'
+            ckpt = 'sp_lg/superpoint_lightglue.pth'
             checkpoint = torch.load(ckpt)
             self.load_state_dict(checkpoint, strict=False)
         elif conf.weights is not None:

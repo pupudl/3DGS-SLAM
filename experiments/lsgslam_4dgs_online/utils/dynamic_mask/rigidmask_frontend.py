@@ -181,6 +181,124 @@ def _apply_numpy_mask(array, mask):
     return masked
 
 
+def _resize_flow_to_shape(flow_x, flow_y, target_shape):
+    target_h, target_w = target_shape
+    src_h, src_w = flow_x.shape
+    if (src_h, src_w) == (target_h, target_w):
+        return flow_x.astype(np.float32), flow_y.astype(np.float32)
+    resized_x = cv2.resize(flow_x, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    resized_y = cv2.resize(flow_y, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    resized_x = resized_x * (float(target_w) / max(float(src_w), 1.0))
+    resized_y = resized_y * (float(target_h) / max(float(src_h), 1.0))
+    return resized_x.astype(np.float32), resized_y.astype(np.float32)
+
+
+def _build_forward_splat(flow_x, flow_y, target_shape):
+    src_h, src_w = flow_x.shape
+    target_h, target_w = target_shape
+    yy, xx = np.mgrid[0:src_h, 0:src_w].astype(np.float32)
+    dst_x = xx + flow_x.astype(np.float32)
+    dst_y = yy + flow_y.astype(np.float32)
+    valid = (
+        np.isfinite(dst_x)
+        & np.isfinite(dst_y)
+        & (dst_x >= 0.0)
+        & (dst_x <= float(target_w - 1))
+        & (dst_y >= 0.0)
+        & (dst_y <= float(target_h - 1))
+    )
+    valid_src = np.flatnonzero(valid.reshape(-1))
+    dst_x = dst_x.reshape(-1)[valid_src]
+    dst_y = dst_y.reshape(-1)[valid_src]
+    x0 = np.floor(dst_x).astype(np.int32)
+    y0 = np.floor(dst_y).astype(np.int32)
+    dx = dst_x - x0
+    dy = dst_y - y0
+
+    src_indices = []
+    dst_indices = []
+    weights = []
+    for ox, oy, weight in (
+        (0, 0, (1.0 - dx) * (1.0 - dy)),
+        (1, 0, dx * (1.0 - dy)),
+        (0, 1, (1.0 - dx) * dy),
+        (1, 1, dx * dy),
+    ):
+        xi = x0 + ox
+        yi = y0 + oy
+        inside = (xi >= 0) & (xi < target_w) & (yi >= 0) & (yi < target_h) & (weight > 0.0)
+        src_indices.append(valid_src[inside])
+        dst_indices.append((yi[inside] * target_w + xi[inside]).astype(np.int64))
+        weights.append(weight[inside].astype(np.float32))
+
+    coverage = np.zeros(target_h * target_w, dtype=np.float32)
+    for dst_idx, weight in zip(dst_indices, weights):
+        np.add.at(coverage, dst_idx, weight)
+
+    return {
+        "source_shape": (src_h, src_w),
+        "target_shape": (target_h, target_w),
+        "source_indices": src_indices,
+        "target_indices": dst_indices,
+        "weights": weights,
+        "coverage": coverage.reshape(target_h, target_w),
+    }
+
+
+def _forward_splat_array(array, splat):
+    flat_src = array.astype(np.float32).reshape(-1)
+    target_h, target_w = splat["target_shape"]
+    out = np.zeros(target_h * target_w, dtype=np.float32)
+    denom = np.zeros(target_h * target_w, dtype=np.float32)
+    for src_idx, dst_idx, weight in zip(
+        splat["source_indices"],
+        splat["target_indices"],
+        splat["weights"],
+    ):
+        values = flat_src[src_idx]
+        finite = np.isfinite(values) & np.isfinite(weight)
+        if not np.any(finite):
+            continue
+        np.add.at(out, dst_idx[finite], values[finite] * weight[finite])
+        np.add.at(denom, dst_idx[finite], weight[finite])
+
+    result = np.full(target_h * target_w, np.nan, dtype=np.float32)
+    covered = denom > 1e-6
+    result[covered] = out[covered] / denom[covered]
+    return result.reshape(target_h, target_w)
+
+
+def _warp_raw_arrays_forward_to_target(raw_arrays):
+    flow_x_full = raw_arrays["flow_full_x"].astype(np.float32)
+    flow_y_full = raw_arrays["flow_full_y"].astype(np.float32)
+    full_shape = flow_x_full.shape
+    cost_shape = raw_arrays["homography_cost"].shape
+
+    flow_x_cost, flow_y_cost = _resize_flow_to_shape(flow_x_full, flow_y_full, cost_shape)
+    cost_splat = _build_forward_splat(flow_x_cost, flow_y_cost, cost_shape)
+    full_splat = _build_forward_splat(flow_x_full, flow_y_full, full_shape)
+
+    warped = {}
+    for key, value in raw_arrays.items():
+        if value.ndim != 2:
+            warped[key] = value
+        elif value.shape == cost_shape:
+            warped[key] = _forward_splat_array(value, cost_splat)
+        elif value.shape == full_shape:
+            warped[key] = _forward_splat_array(value, full_splat)
+        else:
+            warped[key] = value
+
+    warped["warp_coverage_cost_grid"] = cost_splat["coverage"].astype(np.float32)
+    warped["warp_coverage_full"] = full_splat["coverage"].astype(np.float32)
+    return warped, {
+        "enabled": True,
+        "method": "forward_splat_bilinear",
+        "cost_grid_coverage": float(np.mean(cost_splat["coverage"] > 1e-6)),
+        "full_coverage": float(np.mean(full_splat["coverage"] > 1e-6)),
+    }
+
+
 def _normalize_depth_mask_apply_stage(depth_mask_cfg):
     stage = str(depth_mask_cfg.get("apply_stage", "pre_fusion")).strip().lower()
     aliases = {
@@ -285,7 +403,7 @@ class RigidMaskFrontendProbe:
     def should_run(self, time_idx, num_frames):
         if not self.cfg.get("enabled", False):
             return False
-        if time_idx >= num_frames - 1:
+        if time_idx <= 0:
             return False
         return (time_idx % self.run_every) == 0
 
@@ -302,6 +420,216 @@ class RigidMaskFrontendProbe:
         else:
             raise FileNotFoundError(f"Missing disparity prior for frame {frame_id} in {self.disp_dir}")
         return torch.tensor(disp, device="cuda")[None, None].float()
+
+    def _build_raw_arrays(self, results):
+        return {
+            "homography_cost": results["homography_cost"][0, 0].detach().cpu().numpy(),
+            "epipolar_cost": results["epipolar_cost"][0, 0].detach().cpu().numpy(),
+            "pp2d_cost": results["pp2d_cost"][0, 0].detach().cpu().numpy(),
+            "pp3d_orth_cost": results["pp3d_orth_cost"][0, 0].detach().cpu().numpy(),
+            "pp3d_dir_cost": results["pp3d_dir_cost"][0, 0].detach().cpu().numpy(),
+            "depth_contrast_cost": results["depth_contrast_cost"][0, 0].detach().cpu().numpy(),
+            "oor2_cost_grid": results["oor2_cost_grid"][0, 0].detach().cpu().numpy(),
+            "dc_unc_cost_grid": results["dc_unc_cost_grid"][0, 0].detach().cpu().numpy(),
+            "p3dmag": results["p3dmag"][0, 0].detach().cpu().numpy(),
+            "tau_cost_grid": results["tau_cost_grid"][0, 0].detach().cpu().numpy(),
+            "disp_cost_grid": results["disp_cost_grid"][0, 0].detach().cpu().numpy(),
+            "flow_full_x": results["flow_full"][0, 0].detach().cpu().numpy(),
+            "flow_full_y": results["flow_full"][0, 1].detach().cpu().numpy(),
+            "tau_full": results["tau_full"][0].detach().cpu().numpy(),
+            "oor2_full": results["oor2_full"][0].detach().cpu().numpy(),
+            "dc_unc_full": results["dc_unc_full"][0].detach().cpu().numpy(),
+        }
+
+    def _save_target_pair(
+        self,
+        pair_dir,
+        pair_name,
+        raw_arrays,
+        target_time_idx,
+        target_frame_id,
+        counterpart_frame_id,
+        target_role,
+        target_rgb_orig,
+        reference_rgb_orig,
+        prev_rgb_orig,
+        curr_rgb_orig,
+        target_disp_input,
+        target_sky_mask,
+        results,
+        elapsed,
+        warp_summary=None,
+    ):
+        os.makedirs(pair_dir, exist_ok=True)
+        raw_arrays = {key: value.copy() for key, value in raw_arrays.items()}
+
+        depth_mask_summary = {
+            "enabled": bool(self.depth_mask_cfg.get("enabled", False)),
+            "mask_sky": bool(self.depth_mask_cfg.get("mask_sky", False)),
+            "apply_stage": _normalize_depth_mask_apply_stage(self.depth_mask_cfg),
+        }
+        if self.depth_mask_cfg.get("enabled", False):
+            full_depth_mask_t, depth_metric_t = _build_depth_mask_from_disp(
+                target_disp_input[0, 0],
+                self.calib,
+                min_depth_m=self.depth_mask_cfg.get("min_depth_m", 0.1),
+                max_depth_m=self.depth_mask_cfg.get("max_depth_m"),
+                min_disp=self.depth_mask_cfg.get("min_disp", 1e-6),
+            )
+            input_depth_mask_np = full_depth_mask_t.detach().cpu().numpy().astype(bool)
+            cost_h, cost_w = raw_arrays["homography_cost"].shape
+            cost_depth_mask_np = _resize_bool_mask(full_depth_mask_t, cost_w, cost_h)
+            full_h, full_w = raw_arrays["flow_full_x"].shape
+            full_depth_mask_np = _resize_bool_mask(full_depth_mask_t, full_w, full_h)
+
+            if self.depth_mask_cfg.get("mask_sky", False) and target_sky_mask is not None:
+                input_sky_mask_np = _resize_bool_mask(
+                    target_sky_mask,
+                    input_depth_mask_np.shape[1],
+                    input_depth_mask_np.shape[0],
+                )
+                cost_sky_mask_np = _resize_bool_mask(target_sky_mask, cost_w, cost_h)
+                full_sky_mask_np = _resize_bool_mask(target_sky_mask, full_w, full_h)
+
+                input_depth_mask_np = input_depth_mask_np & (~input_sky_mask_np)
+                cost_depth_mask_np = cost_depth_mask_np & (~cost_sky_mask_np)
+                full_depth_mask_np = full_depth_mask_np & (~full_sky_mask_np)
+            else:
+                input_sky_mask_np = None
+                full_sky_mask_np = None
+
+            if depth_mask_summary["apply_stage"] == "pre_fusion":
+                cost_keys = [
+                    "homography_cost",
+                    "epipolar_cost",
+                    "pp2d_cost",
+                    "pp3d_orth_cost",
+                    "pp3d_dir_cost",
+                    "depth_contrast_cost",
+                    "oor2_cost_grid",
+                    "dc_unc_cost_grid",
+                    "p3dmag",
+                    "tau_cost_grid",
+                    "disp_cost_grid",
+                ]
+                full_keys = [
+                    "flow_full_x",
+                    "flow_full_y",
+                    "tau_full",
+                    "oor2_full",
+                    "dc_unc_full",
+                ]
+                for key in cost_keys:
+                    raw_arrays[key] = _apply_numpy_mask(raw_arrays[key], cost_depth_mask_np)
+                for key in full_keys:
+                    raw_arrays[key] = _apply_numpy_mask(raw_arrays[key], full_depth_mask_np)
+
+            if self.depth_mask_cfg.get("save_raw_tensors", True):
+                raw_arrays["depth_mask_cost_grid"] = cost_depth_mask_np.astype(np.uint8)
+                raw_arrays["depth_mask_full"] = full_depth_mask_np.astype(np.uint8)
+                raw_arrays["depth_mask_input_full"] = input_depth_mask_np.astype(np.uint8)
+                raw_arrays["depth_metric_input_full"] = depth_metric_t.detach().cpu().numpy()
+                if input_sky_mask_np is not None:
+                    raw_arrays["sky_mask_cost_grid"] = cost_sky_mask_np.astype(np.uint8)
+                    raw_arrays["sky_mask_input_full"] = input_sky_mask_np.astype(np.uint8)
+                    raw_arrays["sky_mask_full"] = full_sky_mask_np.astype(np.uint8)
+
+            if self.depth_mask_cfg.get("save_visualizations", True):
+                cv2.imwrite(
+                    os.path.join(pair_dir, "depth_mask_full.png"),
+                    (full_depth_mask_np.astype(np.uint8) * 255),
+                )
+                if full_sky_mask_np is not None:
+                    cv2.imwrite(
+                        os.path.join(pair_dir, "sky_mask_full.png"),
+                        (full_sky_mask_np.astype(np.uint8) * 255),
+                    )
+
+            valid_depth = depth_metric_t[input_depth_mask_np]
+            depth_mask_summary.update(
+                {
+                    "min_depth_m": None
+                    if self.depth_mask_cfg.get("min_depth_m") is None
+                    else float(self.depth_mask_cfg.get("min_depth_m")),
+                    "max_depth_m": None
+                    if self.depth_mask_cfg.get("max_depth_m") is None
+                    else float(self.depth_mask_cfg.get("max_depth_m")),
+                    "mask_ratio_input_full": float(input_depth_mask_np.mean()),
+                    "mask_ratio_full": float(full_depth_mask_np.mean()),
+                    "mask_ratio_cost_grid": float(cost_depth_mask_np.mean()),
+                    "valid_depth_mean_m": float(valid_depth.mean().item()) if valid_depth.numel() > 0 else None,
+                }
+            )
+
+        if self.cfg.get("save_input_rgbs", True):
+            cv2.imwrite(os.path.join(pair_dir, "anchor_rgb.png"), target_rgb_orig[:, :, ::-1])
+            cv2.imwrite(os.path.join(pair_dir, "reference_rgb.png"), reference_rgb_orig[:, :, ::-1])
+            cv2.imwrite(os.path.join(pair_dir, "prev_rgb.png"), prev_rgb_orig[:, :, ::-1])
+            cv2.imwrite(os.path.join(pair_dir, "curr_rgb.png"), curr_rgb_orig[:, :, ::-1])
+
+        if self.cfg.get("save_raw_tensors", True):
+            np.savez_compressed(os.path.join(pair_dir, "rigidmask_frontend_arrays.npz"), **raw_arrays)
+
+        if self.cfg.get("save_visualizations", True):
+            vis_targets = {
+                "homography_cost.png": raw_arrays["homography_cost"],
+                "epipolar_cost.png": raw_arrays["epipolar_cost"],
+                "pp2d_cost.png": raw_arrays["pp2d_cost"],
+                "pp3d_orth_cost.png": raw_arrays["pp3d_orth_cost"],
+                "pp3d_dir_cost.png": raw_arrays["pp3d_dir_cost"],
+                "depth_contrast_cost.png": raw_arrays["depth_contrast_cost"],
+                "oor2_cost_grid.png": raw_arrays["oor2_cost_grid"],
+                "dc_unc_cost_grid.png": raw_arrays["dc_unc_cost_grid"],
+                "tau_cost_grid.png": raw_arrays["tau_cost_grid"],
+                "flow_magnitude.png": np.sqrt(raw_arrays["flow_full_x"] ** 2 + raw_arrays["flow_full_y"] ** 2),
+                "tau_full.png": raw_arrays["tau_full"],
+            }
+            for filename, array in vis_targets.items():
+                array_vis = _normalize_for_vis(array)
+                if array_vis.shape != target_rgb_orig.shape[:2]:
+                    array_vis = cv2.resize(
+                        array_vis,
+                        (target_rgb_orig.shape[1], target_rgb_orig.shape[0]),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                cv2.imwrite(os.path.join(pair_dir, filename), array_vis)
+
+        summary = {
+            "status": "ok",
+            "pair_name": pair_name,
+            "time_idx": int(target_time_idx),
+            "target_time_idx": int(target_time_idx),
+            "target_frame_id": str(target_frame_id),
+            "target_role": target_role,
+            "curr_frame_id": str(target_frame_id),
+            "counterpart_frame_id": str(counterpart_frame_id),
+            "reference_direction": "previous",
+            "inference_direction": "reference_to_current",
+            "cost_coordinate_frame": target_role,
+            "runtime_sec": elapsed,
+            "cost_shape": list(results["cost_shape"]),
+            "rot": results["rot"][0].detach().cpu().tolist(),
+            "trans": results["trans"][0].detach().cpu().tolist(),
+            "depth_mask": depth_mask_summary,
+            "lidar_pair_name": f"{int(counterpart_frame_id):010d}_{int(target_frame_id):010d}"
+            if target_role == "current"
+            else f"{int(target_frame_id):010d}_{int(counterpart_frame_id):010d}",
+            "lidar_projection_filename": "image_residual_nonground_features.npz"
+            if target_role == "current"
+            else "image_residual_nonground_features_prev.npz",
+            "lidar_static_mask_filename": "image_lidar_static_masks.npz"
+            if target_role == "current"
+            else "image_lidar_static_masks_prev.npz",
+        }
+        if target_role == "current":
+            summary["reference_frame_id"] = str(counterpart_frame_id)
+            summary["warp_to_current"] = warp_summary or {}
+        else:
+            summary["next_frame_id"] = str(counterpart_frame_id)
+
+        with open(os.path.join(pair_dir, "rigidmask_frontend_summary.json"), "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2)
+        return summary
 
     def _run_frontend(self, imgLR, disc_aux, disp_input):
         import kornia
@@ -443,22 +771,31 @@ class RigidMaskFrontendProbe:
             "cost_shape": (h, w),
         }
 
-    def save_pair(self, output_root, time_idx, curr_frame_id, next_frame_id, sky_mask=None):
+    def save_pair(
+        self,
+        output_root,
+        time_idx,
+        curr_frame_id,
+        reference_frame_id,
+        sky_mask=None,
+        reference_sky_mask=None,
+    ):
         model_bundle = self._ensure_model_bundle()
-        pair_name = f"{time_idx:06d}_frame_{curr_frame_id}_to_{next_frame_id}"
-        pair_dir = os.path.join(output_root, pair_name)
-        os.makedirs(pair_dir, exist_ok=True)
+        current_pair_name = f"{time_idx:06d}_frame_{curr_frame_id}_from_{reference_frame_id}"
+        previous_pair_name = f"{time_idx:06d}_frame_{reference_frame_id}_to_{curr_frame_id}_target_prev"
+        current_pair_dir = os.path.join(output_root, current_pair_name)
+        previous_pair_dir = os.path.join(output_root, previous_pair_name)
 
-        left_path = os.path.join(self.image_dir, f"{int(curr_frame_id):010d}.png")
-        right_path = os.path.join(self.image_dir, f"{int(next_frame_id):010d}.png")
-        if not os.path.exists(left_path) or not os.path.exists(right_path):
-            return {"status": "skipped", "reason": "missing_image", "pair_name": pair_name}
+        anchor_path = os.path.join(self.image_dir, f"{int(curr_frame_id):010d}.png")
+        reference_path = os.path.join(self.image_dir, f"{int(reference_frame_id):010d}.png")
+        if not os.path.exists(anchor_path) or not os.path.exists(reference_path):
+            return {"status": "skipped", "reason": "missing_image", "pair_name": current_pair_name}
 
-        prev_rgb_orig = cv2.imread(left_path)[:, :, ::-1]
-        curr_rgb_orig = cv2.imread(right_path)[:, :, ::-1]
-        resized_w, resized_h = _resize_to_rigidmask_shape(prev_rgb_orig, self.cfg["testres"])
-        prev_rgb = cv2.resize(prev_rgb_orig, (resized_w, resized_h))
-        curr_rgb = cv2.resize(curr_rgb_orig, (resized_w, resized_h))
+        anchor_rgb_orig = cv2.imread(anchor_path)[:, :, ::-1]
+        reference_rgb_orig = cv2.imread(reference_path)[:, :, ::-1]
+        resized_w, resized_h = _resize_to_rigidmask_shape(reference_rgb_orig, self.cfg["testres"])
+        anchor_rgb = cv2.resize(anchor_rgb_orig, (resized_w, resized_h))
+        reference_rgb = cv2.resize(reference_rgb_orig, (resized_w, resized_h))
 
         _reconfigure_runtime_modules(
             model_bundle["model"],
@@ -468,17 +805,27 @@ class RigidMaskFrontendProbe:
             resized_h,
         )
         imgL, imgR, imgL_noaug = _prepare_pair_tensors(
-            prev_rgb, curr_rgb, model_bundle["mean_L"], model_bundle["mean_R"]
+            reference_rgb, anchor_rgb, model_bundle["mean_L"], model_bundle["mean_R"]
         )
         disc_aux = [
             None,
             None,
             None,
-            _build_intrinsics_list(self.calib, prev_rgb_orig.shape, resized_w, resized_h, self.cfg["sensor"]),
+            _build_intrinsics_list(self.calib, reference_rgb_orig.shape, resized_w, resized_h, self.cfg["sensor"]),
             imgL_noaug,
             None,
         ]
-        disp_input = self._load_disp_input(curr_frame_id)
+        disp_input = self._load_disp_input(reference_frame_id)
+        depth_mask_disp_input = (
+            self._load_disp_input(curr_frame_id)
+            if self.depth_mask_cfg.get("enabled", False)
+            else None
+        )
+        reference_depth_mask_disp_input = (
+            self._load_disp_input(reference_frame_id)
+            if self.depth_mask_cfg.get("enabled", False)
+            else None
+        )
 
         with torch.no_grad():
             imgLR = torch.cat([imgL, imgR], 0)
@@ -488,170 +835,63 @@ class RigidMaskFrontendProbe:
             torch.cuda.synchronize()
             elapsed = time.time() - start_time
 
-        if self.cfg.get("save_input_rgbs", True):
-            cv2.imwrite(os.path.join(pair_dir, "prev_rgb.png"), prev_rgb_orig[:, :, ::-1])
-            cv2.imwrite(os.path.join(pair_dir, "curr_rgb.png"), curr_rgb_orig[:, :, ::-1])
+        previous_raw_arrays = self._build_raw_arrays(results)
+        current_raw_arrays, warp_summary = _warp_raw_arrays_forward_to_target(previous_raw_arrays)
 
-        raw_arrays = {
-            "homography_cost": results["homography_cost"][0, 0].detach().cpu().numpy(),
-            "epipolar_cost": results["epipolar_cost"][0, 0].detach().cpu().numpy(),
-            "pp2d_cost": results["pp2d_cost"][0, 0].detach().cpu().numpy(),
-            "pp3d_orth_cost": results["pp3d_orth_cost"][0, 0].detach().cpu().numpy(),
-            "pp3d_dir_cost": results["pp3d_dir_cost"][0, 0].detach().cpu().numpy(),
-            "depth_contrast_cost": results["depth_contrast_cost"][0, 0].detach().cpu().numpy(),
-            "oor2_cost_grid": results["oor2_cost_grid"][0, 0].detach().cpu().numpy(),
-            "dc_unc_cost_grid": results["dc_unc_cost_grid"][0, 0].detach().cpu().numpy(),
-            "p3dmag": results["p3dmag"][0, 0].detach().cpu().numpy(),
-            "tau_cost_grid": results["tau_cost_grid"][0, 0].detach().cpu().numpy(),
-            "disp_cost_grid": results["disp_cost_grid"][0, 0].detach().cpu().numpy(),
-            "flow_full_x": results["flow_full"][0, 0].detach().cpu().numpy(),
-            "flow_full_y": results["flow_full"][0, 1].detach().cpu().numpy(),
-            "tau_full": results["tau_full"][0].detach().cpu().numpy(),
-            "oor2_full": results["oor2_full"][0].detach().cpu().numpy(),
-            "dc_unc_full": results["dc_unc_full"][0].detach().cpu().numpy(),
-        }
-
-        depth_mask_summary = {
-            "enabled": bool(self.depth_mask_cfg.get("enabled", False)),
-            "mask_sky": bool(self.depth_mask_cfg.get("mask_sky", False)),
-            "apply_stage": _normalize_depth_mask_apply_stage(self.depth_mask_cfg),
-        }
-        if self.depth_mask_cfg.get("enabled", False):
-            full_depth_mask_t, depth_metric_t = _build_depth_mask_from_disp(
-                disp_input[0, 0],
-                self.calib,
-                min_depth_m=self.depth_mask_cfg.get("min_depth_m", 0.1),
-                max_depth_m=self.depth_mask_cfg.get("max_depth_m"),
-                min_disp=self.depth_mask_cfg.get("min_disp", 1e-6),
-            )
-            input_depth_mask_np = full_depth_mask_t.detach().cpu().numpy().astype(bool)
-            cost_h, cost_w = raw_arrays["homography_cost"].shape
-            cost_depth_mask_np = _resize_bool_mask(full_depth_mask_t, cost_w, cost_h)
-            full_h, full_w = raw_arrays["flow_full_x"].shape
-            full_depth_mask_np = _resize_bool_mask(full_depth_mask_t, full_w, full_h)
-
-            if self.depth_mask_cfg.get("mask_sky", False) and sky_mask is not None:
-                input_sky_mask_np = _resize_bool_mask(
-                    sky_mask,
-                    input_depth_mask_np.shape[1],
-                    input_depth_mask_np.shape[0],
-                )
-                cost_sky_mask_np = _resize_bool_mask(sky_mask, cost_w, cost_h)
-                full_sky_mask_np = _resize_bool_mask(sky_mask, full_w, full_h)
-
-                input_depth_mask_np = input_depth_mask_np & (~input_sky_mask_np)
-                cost_depth_mask_np = cost_depth_mask_np & (~cost_sky_mask_np)
-                full_depth_mask_np = full_depth_mask_np & (~full_sky_mask_np)
-            else:
-                input_sky_mask_np = None
-                full_sky_mask_np = None
-
-            if depth_mask_summary["apply_stage"] == "pre_fusion":
-                cost_keys = [
-                    "homography_cost",
-                    "epipolar_cost",
-                    "pp2d_cost",
-                    "pp3d_orth_cost",
-                    "pp3d_dir_cost",
-                    "depth_contrast_cost",
-                    "oor2_cost_grid",
-                    "dc_unc_cost_grid",
-                    "p3dmag",
-                    "tau_cost_grid",
-                    "disp_cost_grid",
-                ]
-                full_keys = [
-                    "flow_full_x",
-                    "flow_full_y",
-                    "tau_full",
-                    "oor2_full",
-                    "dc_unc_full",
-                ]
-                for key in cost_keys:
-                    raw_arrays[key] = _apply_numpy_mask(raw_arrays[key], cost_depth_mask_np)
-                for key in full_keys:
-                    raw_arrays[key] = _apply_numpy_mask(raw_arrays[key], full_depth_mask_np)
-
-            if self.depth_mask_cfg.get("save_raw_tensors", True):
-                raw_arrays["depth_mask_cost_grid"] = cost_depth_mask_np.astype(np.uint8)
-                raw_arrays["depth_mask_full"] = full_depth_mask_np.astype(np.uint8)
-                raw_arrays["depth_mask_input_full"] = input_depth_mask_np.astype(np.uint8)
-                raw_arrays["depth_metric_input_full"] = depth_metric_t.detach().cpu().numpy()
-                if input_sky_mask_np is not None:
-                    raw_arrays["sky_mask_cost_grid"] = cost_sky_mask_np.astype(np.uint8)
-                    raw_arrays["sky_mask_input_full"] = input_sky_mask_np.astype(np.uint8)
-                    raw_arrays["sky_mask_full"] = full_sky_mask_np.astype(np.uint8)
-
-            if self.depth_mask_cfg.get("save_visualizations", True):
-                cv2.imwrite(
-                    os.path.join(pair_dir, "depth_mask_full.png"),
-                    (full_depth_mask_np.astype(np.uint8) * 255),
-                )
-                if full_sky_mask_np is not None:
-                    cv2.imwrite(
-                        os.path.join(pair_dir, "sky_mask_full.png"),
-                        (full_sky_mask_np.astype(np.uint8) * 255),
-                    )
-
-            valid_depth = depth_metric_t[input_depth_mask_np]
-            depth_mask_summary.update(
-                {
-                    "min_depth_m": None
-                    if self.depth_mask_cfg.get("min_depth_m") is None
-                    else float(self.depth_mask_cfg.get("min_depth_m")),
-                    "max_depth_m": None
-                    if self.depth_mask_cfg.get("max_depth_m") is None
-                    else float(self.depth_mask_cfg.get("max_depth_m")),
-                    "mask_ratio_input_full": float(input_depth_mask_np.mean()),
-                    "mask_ratio_full": float(full_depth_mask_np.mean()),
-                    "mask_ratio_cost_grid": float(cost_depth_mask_np.mean()),
-                    "valid_depth_mean_m": float(valid_depth.mean().item()) if valid_depth.numel() > 0 else None,
-                }
-            )
-
-        if self.cfg.get("save_raw_tensors", True):
-            np.savez_compressed(os.path.join(pair_dir, "rigidmask_frontend_arrays.npz"), **raw_arrays)
-
-        if self.cfg.get("save_visualizations", True):
-            vis_targets = {
-                "homography_cost.png": raw_arrays["homography_cost"],
-                "epipolar_cost.png": raw_arrays["epipolar_cost"],
-                "pp2d_cost.png": raw_arrays["pp2d_cost"],
-                "pp3d_orth_cost.png": raw_arrays["pp3d_orth_cost"],
-                "pp3d_dir_cost.png": raw_arrays["pp3d_dir_cost"],
-                "depth_contrast_cost.png": raw_arrays["depth_contrast_cost"],
-                "oor2_cost_grid.png": raw_arrays["oor2_cost_grid"],
-                "dc_unc_cost_grid.png": raw_arrays["dc_unc_cost_grid"],
-                "tau_cost_grid.png": raw_arrays["tau_cost_grid"],
-                "flow_magnitude.png": np.sqrt(raw_arrays["flow_full_x"] ** 2 + raw_arrays["flow_full_y"] ** 2),
-                "tau_full.png": raw_arrays["tau_full"],
-            }
-            for filename, array in vis_targets.items():
-                array_vis = _normalize_for_vis(array)
-                if array_vis.shape != prev_rgb_orig.shape[:2]:
-                    array_vis = cv2.resize(
-                        array_vis,
-                        (prev_rgb_orig.shape[1], prev_rgb_orig.shape[0]),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                cv2.imwrite(os.path.join(pair_dir, filename), array_vis)
-
-        summary = {
-            "status": "ok",
-            "pair_name": pair_name,
-            "time_idx": int(time_idx),
-            "curr_frame_id": str(curr_frame_id),
-            "next_frame_id": str(next_frame_id),
-            "runtime_sec": elapsed,
-            "cost_shape": list(results["cost_shape"]),
-            "rot": results["rot"][0].detach().cpu().tolist(),
-            "trans": results["trans"][0].detach().cpu().tolist(),
-            "depth_mask": depth_mask_summary,
-        }
-        with open(os.path.join(pair_dir, "rigidmask_frontend_summary.json"), "w", encoding="utf-8") as handle:
-            json.dump(summary, handle, indent=2)
+        previous_summary = self._save_target_pair(
+            pair_dir=previous_pair_dir,
+            pair_name=previous_pair_name,
+            raw_arrays=previous_raw_arrays,
+            target_time_idx=time_idx - 1,
+            target_frame_id=reference_frame_id,
+            counterpart_frame_id=curr_frame_id,
+            target_role="previous",
+            target_rgb_orig=reference_rgb_orig,
+            reference_rgb_orig=anchor_rgb_orig,
+            prev_rgb_orig=reference_rgb_orig,
+            curr_rgb_orig=anchor_rgb_orig,
+            target_disp_input=reference_depth_mask_disp_input
+            if reference_depth_mask_disp_input is not None
+            else disp_input,
+            target_sky_mask=reference_sky_mask,
+            results=results,
+            elapsed=elapsed,
+        )
+        current_summary = self._save_target_pair(
+            pair_dir=current_pair_dir,
+            pair_name=current_pair_name,
+            raw_arrays=current_raw_arrays,
+            target_time_idx=time_idx,
+            target_frame_id=curr_frame_id,
+            counterpart_frame_id=reference_frame_id,
+            target_role="current",
+            target_rgb_orig=anchor_rgb_orig,
+            reference_rgb_orig=reference_rgb_orig,
+            prev_rgb_orig=reference_rgb_orig,
+            curr_rgb_orig=anchor_rgb_orig,
+            target_disp_input=depth_mask_disp_input if depth_mask_disp_input is not None else disp_input,
+            target_sky_mask=sky_mask,
+            results=results,
+            elapsed=elapsed,
+            warp_summary=warp_summary,
+        )
 
         if self.offload_after_use and self.model_bundle is not None:
             self.model_bundle["model"] = self.model_bundle["model"].cpu().eval()
             torch.cuda.empty_cache()
-        return summary
+        return {
+            **current_summary,
+            "pair_name": current_pair_name,
+            "pair_dir": current_pair_dir,
+            "status": "ok",
+            "targets": {
+                "previous": {
+                    **previous_summary,
+                    "pair_dir": previous_pair_dir,
+                },
+                "current": {
+                    **current_summary,
+                    "pair_dir": current_pair_dir,
+                },
+            },
+        }

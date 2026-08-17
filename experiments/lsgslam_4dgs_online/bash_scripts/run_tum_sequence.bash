@@ -1,8 +1,7 @@
 #!/bin/bash
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-code_path="$(cd "$script_dir/.." && pwd)"
-config_path="$code_path/configs/tum/lsgslam.py"
+code_path='' # path to lsg slam code
+config_path=$code_path'/configs/tum/lsgslam.py'
 
 scene_names=(
 "freiburg1_desk"  

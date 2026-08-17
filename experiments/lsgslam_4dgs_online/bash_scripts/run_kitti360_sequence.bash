@@ -1,8 +1,10 @@
 #!/bin/bash
 
+set -e
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 code_path="$(cd "$script_dir/.." && pwd)"
-config_path="${CONFIG_PATH:-$code_path/configs/kitti360/lsgslam.py}"
+config_path="${CONFIG_PATH:-$code_path/configs/kitti360/lsgslam_pnp_fused_icp.py}"
 group_name=$(grep -E "^group_name = " "$config_path" | head -n 1 | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/")
 
 if [ -z "$group_name" ]; then
@@ -15,10 +17,10 @@ fi
 #   - 正整数: 作为包含式终点索引
 #   - -1: 自动使用全序列(依据 depth_sceneflow/*.npy 数量)
 scene_names=(
-"2013_05_28_drive_0000_sync,2150,2200,2,1408,376,./configs/kitti360/kitti360.yaml"
+"${KITTI360_SCENE:-2013_05_28_drive_0000_sync},${KITTI360_START:-0},${KITTI360_END:--1},${KITTI360_STRIDE:-2},${KITTI360_WIDTH:-1408},${KITTI360_HEIGHT:-376},${KITTI360_YAML:-./configs/kitti360/kitti360.yaml}"
 )
 
-step=50
+step="${KITTI360_STEP:-200}"
 
 for j in 0;
 do 
@@ -90,8 +92,8 @@ do
         n=`grep -n "stride = " $config_path | awk -F':' '{print $1}'` 
         sed -i "$[ n ]c stride = $stride" $config_path
 
-        cd $code_path
-        python3 scripts/splatam.py $config_path
+        cd "$code_path"
+        python3 scripts/splatam.py "$config_path"
 
     done
 
@@ -116,6 +118,6 @@ do
     n=`grep -n "stride = " $config_path | awk -F':' '{print $1}'` 
     sed -i "$[ n ]c stride = $stride" $config_path
 
-    cd $code_path
-    python3 scripts/loop_closure.py $config_path
+    cd "$code_path"
+    python3 scripts/loop_closure.py "$config_path"
 done

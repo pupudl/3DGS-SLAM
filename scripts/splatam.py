@@ -316,9 +316,10 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
                                                                  transformed_gaussians)
 
     # RGB Rendering
-    rendervar['means2D'].retain_grad()
+    if rendervar['means2D'].requires_grad:
+        rendervar['means2D'].retain_grad()
+        variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
     im, radius, _, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar)
-    variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
 
     # Depth & Silhouette Rendering
     depth_sil, _, _, _ = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)

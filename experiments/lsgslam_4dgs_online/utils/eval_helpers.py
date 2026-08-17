@@ -13,6 +13,13 @@ from utils.slam_helpers import (
     transform_to_frame, transformed_params2rendervar, transformed_params2depthplussilhouette,
     quat_mult, matrix_to_quaternion
 )
+from utils.dynamic_gs import (
+    dynamic_params2depthplussilhouette,
+    dynamic_params2rendervar,
+    has_dynamic_gaussians,
+    merge_rendervars,
+    transform_dynamic_to_frame,
+)
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
@@ -522,6 +529,24 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres,
         rendervar = transformed_params2rendervar(final_params, transformed_gaussians)
         depth_sil_rendervar = transformed_params2depthplussilhouette(final_params, curr_data['w2c'],
                                                                      transformed_gaussians)
+        if has_dynamic_gaussians(final_params):
+            transformed_dynamic, active_dynamic = transform_dynamic_to_frame(
+                final_params,
+                final_params,
+                time_idx,
+                gaussians_grad=False,
+                camera_grad=False,
+            )
+            if transformed_dynamic is not None:
+                dynamic_rendervar = dynamic_params2rendervar(final_params, transformed_dynamic, active_dynamic)
+                dynamic_depth_sil_rendervar = dynamic_params2depthplussilhouette(
+                    final_params,
+                    transformed_dynamic,
+                    active_dynamic,
+                    curr_data['w2c'],
+                )
+                rendervar = merge_rendervars(rendervar, dynamic_rendervar)
+                depth_sil_rendervar = merge_rendervars(depth_sil_rendervar, dynamic_depth_sil_rendervar)
 
         # Render Depth & Silhouette
         depth_sil, _, _, _ = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)

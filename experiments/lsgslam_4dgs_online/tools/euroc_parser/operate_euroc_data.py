@@ -3,7 +3,6 @@ import os
 
 base_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../")
 sys.path.append(base_dir)
-PROJECT_ROOT = os.path.abspath(base_dir)
 base_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../third_party/IGEV-Stereo")
 sys.path.append(base_dir)
 
@@ -84,8 +83,8 @@ cam1_mapx, cam1_mapy = cv2.initUndistortRectifyMap(
 
 # # params
 base_path = '' # path to euroc dataset
-igev_sceneflow_model_path = os.path.join(PROJECT_ROOT, "third_party", "IGEV-Stereo", "pretrained_models", "sceneflow.pth")
-vpr_model_path = os.path.join(PROJECT_ROOT, "third_party", "TransVPR", "TransVPR_MSLS.pth")
+igev_sceneflow_model_path = '../../third_party/IGEV-Stereo/pretrained_models/sceneflow.pth'
+vpr_model_path = '../../third_party/TransVPR/TransVPR_MSLS.pth'
 
 scene_names = [
     "V2_01_easy",

@@ -3,7 +3,6 @@ import os
 
 base_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../")
 sys.path.append(base_dir)
-PROJECT_ROOT = os.path.abspath(base_dir)
 base_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../third_party/IGEV-Stereo")
 sys.path.append(base_dir)
 
@@ -36,10 +35,10 @@ import shutil
 sequences = ['02']
 print(sequences)
 
-image_folder = os.path.join(PROJECT_ROOT, "data", "kitti", "sequences") # path to kitti dataset
-pose_folder = os.path.join(PROJECT_ROOT, "data", "kitti", "poses") # path to kitti pose files
-igev_kitti_model_path = os.path.join(PROJECT_ROOT, "third_party", "IGEV-Stereo", "pretrained_models", "kitti15.pth")
-vpr_model_path = os.path.join(PROJECT_ROOT, "third_party", "TransVPR", "TransVPR_MSLS.pth")
+image_folder = "/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences" # path to kitti dataset
+pose_folder = '/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/poses' # path to kitti pose files
+igev_kitti_model_path = '/home/qiuyu/data/Projects/LSG-SLAM/third_party/IGEV-Stereo/pretrained_models/kitti15.pth'
+vpr_model_path = '/home/qiuyu/data/Projects/LSG-SLAM/third_party/TransVPR/TransVPR_MSLS.pth'
 
 for sequence in sequences:
     print(sequence)

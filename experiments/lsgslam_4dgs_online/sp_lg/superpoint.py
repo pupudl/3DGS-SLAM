@@ -40,7 +40,6 @@
 # --------------------------------------------------------------------*/
 # %BANNER_END%
 
-import os
 import torch
 from torch import nn
 
@@ -137,7 +136,7 @@ class SuperPoint(nn.Module):
         # url = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"
         # self.load_state_dict(torch.hub.load_state_dict_from_url(url))
 
-        ckpt = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'superpoint_v1.pth')
+        ckpt = 'sp_lg/superpoint_v1.pth'
         checkpoint = torch.load(ckpt)
         self.load_state_dict(checkpoint)
 

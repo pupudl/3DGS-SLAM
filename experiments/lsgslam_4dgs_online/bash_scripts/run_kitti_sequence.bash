@@ -1,7 +1,6 @@
 #!/bin/bash
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-code_path="$(cd "$script_dir/.." && pwd)"
+code_path='/home/qiuyu/data/Projects/LSG-SLAM'
 config_path="${CONFIG_PATH:-$code_path/configs/kitti/lsgslam.py}"
 group_name=$(grep -E "^group_name = " "$config_path" | head -n 1 | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/")
 

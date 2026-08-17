@@ -8,6 +8,8 @@ import numpy as np
 
 PAIR_OUTPUT_GROUPS = {
     "inputs": {
+        "anchor_rgb.png",
+        "reference_rgb.png",
         "prev_rgb.png",
         "curr_rgb.png",
     },
@@ -38,6 +40,7 @@ PAIR_OUTPUT_GROUPS = {
         "dynamic_gate.png",
         "dynamic_mask.png",
         "dynamic_mask_pre_lidar.png",
+        "fastsam_instance_mask.png",
         "appearance_score.png",
         "similarity_score.png",
         "lidar_residual_score.png",
@@ -46,9 +49,11 @@ PAIR_OUTPUT_GROUPS = {
     },
     "raw": {
         "rigidmask_frontend_arrays.npz",
+        "fastsam_masks.npz",
     },
     "metadata": {
         "rigidmask_frontend_summary.json",
+        "fastsam_summary.json",
         "dynamic_fusion_summary.json",
     },
 }
@@ -297,6 +302,122 @@ def resize_to_image(score, image_shape):
     return cv2.resize(score, (width, height), interpolation=cv2.INTER_LINEAR)
 
 
+def resize_candidate_mask(mask, target_shape):
+    target_h, target_w = target_shape
+    if mask.shape == (target_h, target_w):
+        return mask.astype(bool)
+    resized = cv2.resize(mask.astype(np.uint8), (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    return resized.astype(bool)
+
+
+def load_fastsam_candidates_for_pair(pair_dir, target_shape):
+    masks_path = find_pair_file(pair_dir, "fastsam_masks.npz")
+    summary_path = find_pair_file(pair_dir, "fastsam_summary.json")
+    if not masks_path.exists():
+        return None, {
+            "enabled": True,
+            "status": "missing",
+            "masks_path": str(masks_path),
+        }
+
+    data = np.load(masks_path)
+    if "masks" in data.files:
+        masks = np.asarray(data["masks"])
+    else:
+        masks = np.zeros((0, target_shape[0], target_shape[1]), dtype=np.uint8)
+    if masks.ndim == 2:
+        masks = masks[None]
+    if masks.ndim != 3:
+        return None, {
+            "enabled": True,
+            "status": "invalid_shape",
+            "masks_path": str(masks_path),
+            "shape": list(masks.shape),
+        }
+
+    resized_masks = [resize_candidate_mask(mask, target_shape) for mask in masks]
+    summary = {
+        "enabled": True,
+        "status": "ok",
+        "masks_path": str(masks_path),
+        "summary_path": str(summary_path) if summary_path.exists() else "",
+        "num_candidates": int(len(resized_masks)),
+    }
+    if summary_path.exists():
+        try:
+            with open(summary_path, "r", encoding="utf-8") as handle:
+                probe_summary = json.load(handle)
+            summary["probe_backend"] = probe_summary.get("backend")
+            summary["probe_num_masks"] = probe_summary.get("num_masks")
+        except Exception as exc:
+            summary["summary_read_error"] = str(exc)
+    if not resized_masks:
+        return np.zeros((0, target_shape[0], target_shape[1]), dtype=bool), summary
+    return np.stack(resized_masks, axis=0), summary
+
+
+def refine_mask_with_fastsam_candidates(
+    mask,
+    score,
+    candidates,
+    min_overlap_fraction,
+    min_score_mean,
+    min_score_p90,
+    min_area_cells,
+    max_area_fraction,
+):
+    if candidates is None or candidates.shape[0] == 0:
+        return mask, np.zeros_like(mask, dtype=np.float32), {
+            "status": "no_candidates",
+            "selected_candidates": 0,
+        }
+
+    base_mask = mask.astype(bool)
+    refined = base_mask.copy()
+    selected_union = np.zeros_like(base_mask, dtype=bool)
+    image_area = max(int(base_mask.size), 1)
+    max_area_cells = int(round(image_area * float(max_area_fraction)))
+    inspected = 0
+    selected = 0
+    skipped_area = 0
+
+    for candidate in candidates:
+        candidate = candidate.astype(bool)
+        area = int(np.count_nonzero(candidate))
+        if area < int(min_area_cells) or area > max_area_cells:
+            skipped_area += 1
+            continue
+        inspected += 1
+        candidate_scores = score[candidate]
+        if candidate_scores.size == 0:
+            continue
+        overlap_fraction = float(np.count_nonzero(base_mask & candidate) / max(area, 1))
+        score_mean = float(candidate_scores.mean())
+        score_p90 = float(np.percentile(candidate_scores, 90.0))
+        should_select = (
+            overlap_fraction >= float(min_overlap_fraction)
+            or (score_mean >= float(min_score_mean) and score_p90 >= float(min_score_p90))
+        )
+        if should_select:
+            selected_union |= candidate
+            refined |= candidate
+            selected += 1
+
+    return refined.astype(np.float32), selected_union.astype(np.float32), {
+        "status": "ok",
+        "inspected_candidates": int(inspected),
+        "selected_candidates": int(selected),
+        "skipped_by_area": int(skipped_area),
+        "selected_pixels": int(np.count_nonzero(selected_union)),
+        "selected_fraction": float(np.count_nonzero(selected_union) / image_area),
+        "min_overlap_fraction": float(min_overlap_fraction),
+        "min_score_mean": float(min_score_mean),
+        "min_score_p90": float(min_score_p90),
+        "min_area_cells": int(min_area_cells),
+        "max_area_fraction": float(max_area_fraction),
+    }
+
+
 #找到并读取当前帧对应的特征相似度图
 def load_similarity_map_for_pair(pair_dir, summary, appearance_subdir):
     time_idx = summary.get("time_idx")
@@ -372,7 +493,7 @@ def frame_id_variants(frame_id):
 
 
 def load_preview_shape(pair_dir, arrays):
-    for filename in ("prev_rgb.png", "curr_rgb.png"):
+    for filename in ("anchor_rgb.png", "prev_rgb.png", "reference_rgb.png", "curr_rgb.png"):
         image_path = find_pair_file(pair_dir, filename)
         if image_path.exists():
             image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -400,6 +521,12 @@ def find_lidar_motion_pair_dir_for_pair(pair_dir, summary, lidar_motion_subdir):
             "status": "skipped_missing_lidar_motion_root",
             "root": str(lidar_root),
         }
+
+    lidar_pair_name = summary.get("lidar_pair_name")
+    if lidar_pair_name:
+        candidate = lidar_root / str(lidar_pair_name)
+        if candidate.is_dir():
+            return candidate, None
 
     candidate_dirs = []
     for curr_variant in curr_variants:
@@ -812,6 +939,7 @@ def process_pair_dir(
     appearance_boost_alpha,
     appearance_subdir,
     lidar_residual_enabled=True,
+    require_lidar_residual=False,
     lidar_motion_subdir="lidar_motion_probe",
     lidar_projection_filename="image_residual_nonground_features.npz",
     lidar_splat_radius=2,
@@ -841,6 +969,12 @@ def process_pair_dir(
     lidar_component_dark_max_high_fraction=0.02,
     lidar_allow_empty_override=False,
     lidar_empty_override_min_cells=3,
+    fastsam_enabled=False,
+    fastsam_min_overlap_fraction=0.20,
+    fastsam_min_score_mean=0.35,
+    fastsam_min_score_p90=0.55,
+    fastsam_min_area_cells=32,
+    fastsam_max_area_fraction=0.80,
     save_diagnostics=False,
     organize_outputs=True,
 ):
@@ -854,6 +988,8 @@ def process_pair_dir(
     arrays = dict(np.load(arrays_path))
     with open(summary_path, "r", encoding="utf-8") as handle:
         summary = json.load(handle)
+    lidar_projection_filename = summary.get("lidar_projection_filename", lidar_projection_filename)
+    lidar_static_mask_filename = summary.get("lidar_static_mask_filename", lidar_static_mask_filename)
     if organize_outputs:
         organize_pair_outputs(pair_dir)
 
@@ -981,6 +1117,14 @@ def process_pair_dir(
             }
         )
 
+    if require_lidar_residual and (
+        not lidar_residual_enabled
+        or lidar_score is None
+        or lidar_confidence is None
+        or lidar_summary.get("status") != "ok"
+    ):
+        return None
+
     #判断是否强制输出空掩码：只看几何分数，避免外观异常改变整帧静态判定。
     force_empty_mask, global_stats = should_force_empty_mask(
         geom_score,
@@ -1097,11 +1241,37 @@ def process_pair_dir(
     if lidar_static_exclusion_mask is not None:
         mask = mask * (~lidar_static_exclusion_mask).astype(np.float32)
 
+    fastsam_candidates = None
+    fastsam_load_summary = {
+        "enabled": bool(fastsam_enabled),
+        "status": "disabled",
+    }
+    fastsam_refine_summary = None
+    fastsam_instance_mask = None
+    if fastsam_enabled:
+        fastsam_candidates, fastsam_load_summary = load_fastsam_candidates_for_pair(pair_dir, score.shape)
+        if fastsam_candidates is not None:
+            mask, fastsam_instance_mask, fastsam_refine_summary = refine_mask_with_fastsam_candidates(
+                mask,
+                score,
+                fastsam_candidates,
+                min_overlap_fraction=fastsam_min_overlap_fraction,
+                min_score_mean=fastsam_min_score_mean,
+                min_score_p90=fastsam_min_score_p90,
+                min_area_cells=fastsam_min_area_cells,
+                max_area_fraction=fastsam_max_area_fraction,
+            )
+            if lidar_static_exclusion_mask is not None:
+                mask = mask * (~lidar_static_exclusion_mask).astype(np.float32)
+                fastsam_instance_mask = fastsam_instance_mask * (~lidar_static_exclusion_mask).astype(np.float32)
+
     final_mask_filter, final_mask_filter_source = final_mask_filter_from_saved_masks(arrays, summary)
     final_mask_filter_ratio = None
     if final_mask_filter is not None:
         mask = mask * final_mask_filter.astype(np.float32)
         final_mask_filter_ratio = float(final_mask_filter.mean())
+        if fastsam_instance_mask is not None:
+            fastsam_instance_mask = fastsam_instance_mask * final_mask_filter.astype(np.float32)
 
     score_full = resize_to_image(score, preview_shape)
     mask_full = resize_to_image(mask, preview_shape)
@@ -1147,6 +1317,11 @@ def process_pair_dir(
                     pair_output_path(pair_dir, "lidar_suppression_mask.png", organize_outputs),
                     resize_to_image(suppression_mask.astype(np.float32), preview_shape),
                 )
+        if fastsam_instance_mask is not None:
+            save_gray_image(
+                pair_output_path(pair_dir, "fastsam_instance_mask.png", organize_outputs),
+                resize_to_image(fastsam_instance_mask, preview_shape),
+            )
     if appearance_score is not None and similarity_score is not None:
         save_gray_image(
             pair_output_path(pair_dir, "appearance_score.png", organize_outputs),
@@ -1174,6 +1349,10 @@ def process_pair_dir(
             "empty_override_high_cells": int(high_lidar_cells),
         },
         "lidar_static_filter": lidar_static_filter_summary,
+        "fastsam_fusion": {
+            **fastsam_load_summary,
+            "refinement": fastsam_refine_summary,
+        },
         "force_empty_mask": force_empty_mask,
         "force_empty_mask_pre_lidar": force_empty_pre_lidar,
         "mask_threshold": threshold,

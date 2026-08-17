@@ -38,6 +38,18 @@ from utils.slam_helpers import (
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 from utils.pnp_fused_icp_utils import fused_icp_init_camera_pose, get_dataset_frame_id
 from utils.dynamic_mask import DynamicMaskManager
+from utils.dynamic_gs import (
+    apply_dynamic_mask_to_color,
+    apply_dynamic_mask_to_depth,
+    get_dynamic_loss,
+    has_dynamic_gaussians,
+    initialize_dynamic_optimizer,
+    load_dynamic_observation,
+    merge_dynamic_4dgs_config,
+    pack_dynamic_params,
+    resize_bool_mask as resize_dynamic_bool_mask,
+    update_dynamic_params_from_frame,
+)
 from utils.sky_mask import SkyMaskPredictor
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
@@ -284,7 +296,8 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
              mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None,
-             grad_mask=None, render_pair_out=None):
+             grad_mask=None, render_pair_out=None, retain_grad_for_densification=True,
+             ignore_dynamic_mask=False):
     # Initialize Loss Dictionary
     losses = {}
 
@@ -316,10 +329,11 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
                                                                  transformed_gaussians)
 
     # RGB Rendering
-    if rendervar['means2D'].requires_grad:
+    if retain_grad_for_densification and rendervar['means2D'].requires_grad:
         rendervar['means2D'].retain_grad()
     im, radius, _, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar)
-    variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
+    if retain_grad_for_densification:
+        variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
 
     # Depth & Silhouette Rendering
     depth_sil, _, _, _ = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
@@ -345,22 +359,17 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     sky_mask = curr_data.get("sky_mask")
     if sky_mask is not None:
         mask = mask & invert_bool_mask(sky_mask)
-    tracking_dynamic_mask = curr_data.get("dynamic_mask") if tracking else None
-    tracking_static_mask = None
-    if tracking_dynamic_mask is not None:
-        if tracking_dynamic_mask.shape[-2:] != depth.shape[-2:]:
-            tracking_dynamic_mask = resize_bool_mask(
-                tracking_dynamic_mask,
-                depth.shape[-2],
-                depth.shape[-1],
-            )
-        tracking_static_mask = invert_bool_mask(tracking_dynamic_mask.bool()).detach()
-        mask = mask & tracking_static_mask
+    dynamic_mask = curr_data.get("dynamic_mask")
+    if dynamic_mask is not None and not ignore_dynamic_mask:
+        dynamic_mask = resize_dynamic_bool_mask(dynamic_mask, curr_data['depth'].shape[1], curr_data['depth'].shape[2])
+        mask = mask & invert_bool_mask(dynamic_mask)
 
     # Depth loss
     if use_l1:
         mask = mask.detach()
-        if tracking:
+        if not bool(mask.any()):
+            losses['depth'] = torch.zeros((), device=depth.device)
+        elif tracking:
             losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].sum()
         else:
             losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].mean()
@@ -371,8 +380,8 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         color_keep_mask = torch.tile(invert_bool_mask(sky_mask), (3, 1, 1)).detach()
         gt_image = gt_image * color_keep_mask
         im = im * color_keep_mask
-    if tracking_static_mask is not None:
-        color_keep_mask = torch.tile(tracking_static_mask, (3, 1, 1)).detach()
+    if dynamic_mask is not None and not ignore_dynamic_mask:
+        color_keep_mask = torch.tile(invert_bool_mask(dynamic_mask), (3, 1, 1)).detach()
         gt_image = gt_image * color_keep_mask
         im = im * color_keep_mask
     if grad_mask is not None:
@@ -394,6 +403,8 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         valid_depth_mask = (curr_data["depth"] > 0)
         if sky_mask is not None:
             valid_depth_mask = valid_depth_mask & invert_bool_mask(sky_mask)
+        if dynamic_mask is not None and not ignore_dynamic_mask:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(dynamic_mask)
         projected_means2d = project_points(
             transformed_gaussians["means3D"].detach(),
             curr_data["intrinsics"].detach(),
@@ -429,6 +440,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         color_mask = color_mask.detach()
         losses['im'] = torch.abs(gt_image - im)[color_mask].sum()
     elif tracking:
+        color_mask = torch.ones_like(gt_image, dtype=torch.bool)
         losses['im'] = torch.abs(gt_image - im).sum()
     else:
         losses['im'] = 0.8 * l1_loss_v1(im, gt_image) + 0.2 * (1.0 - calc_ssim(im, gt_image))
@@ -539,6 +551,10 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     non_presence_mask = non_presence_sil_mask | non_presence_depth_mask
     if curr_data.get("sky_mask") is not None:
         non_presence_mask = non_presence_mask & invert_bool_mask(curr_data["sky_mask"][0])
+    dynamic_mask = curr_data.get("dynamic_mask")
+    if dynamic_mask is not None:
+        dynamic_mask = resize_dynamic_bool_mask(dynamic_mask, curr_data['depth'].shape[1], curr_data['depth'].shape[2])
+        non_presence_mask = non_presence_mask & invert_bool_mask(dynamic_mask[0])
     # Flatten mask
     non_presence_mask = non_presence_mask.reshape(-1)
 
@@ -553,6 +569,8 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         valid_depth_mask = (curr_data['depth'][0, :, :] > 0)
         if curr_data.get("sky_mask") is not None:
             valid_depth_mask = valid_depth_mask & invert_bool_mask(curr_data["sky_mask"][0])
+        if dynamic_mask is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(dynamic_mask[0])
         non_presence_mask = non_presence_mask & valid_depth_mask.reshape(-1)
         new_pt_cld, mean3_sq_dist = get_pointcloud(curr_data['im'], curr_data['depth'], curr_data['intrinsics'], 
                                     curr_w2c, mask=non_presence_mask, compute_mean_sq_dist=True,
@@ -784,14 +802,13 @@ def rgbd_slam(config: dict):
         config['tracking']['depth_loss_thres'] = 100000
     if "visualize_tracking_loss" not in config['tracking']:
         config['tracking']['visualize_tracking_loss'] = False
-    if "use_dynamic_mask" not in config["tracking"]:
-        config["tracking"]["use_dynamic_mask"] = False
-    if "dynamic_mask_min_static_ratio" not in config["tracking"]:
-        config["tracking"]["dynamic_mask_min_static_ratio"] = 0.05
     if "gaussian_distribution" not in config:
         config['gaussian_distribution'] = "isotropic"
     if "dynamic_mask" not in config:
         config["dynamic_mask"] = {"enabled": False}
+    if "dynamic_4dgs" not in config:
+        config["dynamic_4dgs"] = {"enabled": False}
+    config["dynamic_4dgs"] = merge_dynamic_4dgs_config(config["dynamic_4dgs"])
     if "sky_mask" not in config:
         config["sky_mask"] = {"enabled": False}
     print(f"{config}")
@@ -967,6 +984,9 @@ def rgbd_slam(config: dict):
         tracking_cam = setup_camera(tracking_color.shape[2], tracking_color.shape[1], 
                                     tracking_intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy(), depth_threshold=config['pixel_gs_depth_threshold'])
     
+    dynamic_4dgs_cfg = config.get("dynamic_4dgs", {})
+    dynamic_params = None
+
     # Initialize list to keep track of Keyframes
     keyframe_list = []
     keyframe_time_indices = []
@@ -1015,7 +1035,26 @@ def rgbd_slam(config: dict):
                 color = color.permute(2, 0, 1) / 255
                 depth = depth.permute(2, 0, 1)
                 sky_mask = sky_mask_predictor.get_mask(time_idx, color)
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'sky_mask': sky_mask}
+                kf_frame_id = get_dataset_frame_id(dataset, time_idx)
+                kf_reference_frame_id = get_dataset_frame_id(dataset, time_idx - 1) if time_idx > 0 else None
+                dynamic_observation = load_dynamic_observation(
+                    output_dir,
+                    dynamic_4dgs_cfg,
+                    time_idx,
+                    kf_frame_id,
+                    kf_reference_frame_id,
+                    (color.shape[1], color.shape[2]),
+                    device,
+                )
+                curr_keyframe = {
+                    'id': time_idx,
+                    'est_w2c': curr_w2c,
+                    'color': color,
+                    'depth': depth,
+                    'sky_mask': sky_mask,
+                    'dynamic_mask': dynamic_observation.get('dynamic_mask') if dynamic_observation is not None else None,
+                    'dynamic_score': dynamic_observation.get('dynamic_score') if dynamic_observation is not None else None,
+                }
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
     else:
@@ -1032,13 +1071,26 @@ def rgbd_slam(config: dict):
         depth = depth.permute(2, 0, 1)
         depth_original = depth_original.permute(2, 0, 1) if depth_original is not None else None
         sky_mask = sky_mask_predictor.get_mask(time_idx, color)
+        frame_id = get_dataset_frame_id(dataset, time_idx)
+        reference_frame_id = get_dataset_frame_id(dataset, time_idx - 1) if time_idx > 0 else None
+        dynamic_observation = load_dynamic_observation(
+            output_dir,
+            dynamic_4dgs_cfg,
+            time_idx,
+            frame_id,
+            reference_frame_id,
+            (color.shape[1], color.shape[2]),
+            device,
+        )
+        dynamic_mask = dynamic_observation.get("dynamic_mask") if dynamic_observation is not None else None
         color_for_matching = apply_sky_mask_to_color(color, sky_mask)
         depth_original_for_matching = apply_sky_mask_to_depth(depth_original, sky_mask)
+        color_for_matching = apply_dynamic_mask_to_color(color_for_matching, dynamic_mask)
+        depth_original_for_matching = apply_dynamic_mask_to_depth(depth_original_for_matching, dynamic_mask)
         gt_w2c_all_frames.append(gt_w2c)
         curr_gt_w2c = gt_w2c_all_frames
         # Optimize only current time step for tracking
         iter_time_idx = time_idx
-        frame_id = get_dataset_frame_id(dataset, time_idx)
         curr_frame_data = {
             'cam': cam,
             'im': color,
@@ -1053,25 +1105,8 @@ def rgbd_slam(config: dict):
             'depth_threshold': config['pixel_gs_depth_threshold'],
             'sky_mask': sky_mask,
         }
-        if dynamic_mask_manager.enabled and config["tracking"].get("use_dynamic_mask", False):
-            tracking_dynamic_mask = dynamic_mask_manager.load_dynamic_mask_for_time_idx(
-                time_idx,
-                num_frames,
-                color.shape[1],
-                color.shape[2],
-            )
-            if tracking_dynamic_mask is not None:
-                static_ratio = invert_bool_mask(tracking_dynamic_mask).float().mean().item()
-                if static_ratio >= float(config["tracking"].get("dynamic_mask_min_static_ratio", 0.05)):
-                    curr_frame_data["dynamic_mask"] = tracking_dynamic_mask
-                    curr_frame_data["match_im"] = apply_sky_mask_to_color(
-                        curr_frame_data["match_im"],
-                        tracking_dynamic_mask,
-                    )
-                    curr_frame_data["depth_original"] = apply_sky_mask_to_depth(
-                        curr_frame_data["depth_original"],
-                        tracking_dynamic_mask,
-                    )
+        if dynamic_observation is not None:
+            curr_frame_data.update(dynamic_observation)
 
         # if time_idx == num_frames - 1:
         #     config["tracking"]["use_gt_poses"] = False
@@ -1175,11 +1210,7 @@ def rgbd_slam(config: dict):
             tracking_color = tracking_color.permute(2, 0, 1) / 255
             tracking_depth = tracking_depth.permute(2, 0, 1)
             tracking_sky_mask = resize_bool_mask(sky_mask, tracking_color.shape[1], tracking_color.shape[2])
-            tracking_dynamic_mask = resize_bool_mask(
-                curr_data.get("dynamic_mask"),
-                tracking_color.shape[1],
-                tracking_color.shape[2],
-            )
+            tracking_dynamic_mask = resize_dynamic_bool_mask(dynamic_mask, tracking_color.shape[1], tracking_color.shape[2])
             tracking_curr_data = {'cam': tracking_cam, 'im': tracking_color, 'depth': tracking_depth, 'id': iter_time_idx,
                                   'intrinsics': tracking_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c,
                                   "frame_id": frame_id, "depth_threshold": config['pixel_gs_depth_threshold'],
@@ -1212,8 +1243,8 @@ def rgbd_slam(config: dict):
         valid_depth_mask = (depth_tmp > np.max([0.1, dataset.depth_filter_near])) & (depth_tmp < np.max([30.0, dataset.depth_filter_far]))
         if sky_mask is not None:
             valid_depth_mask = valid_depth_mask & invert_bool_mask(sky_mask).flatten()
-        if curr_data.get("dynamic_mask") is not None:
-            valid_depth_mask = valid_depth_mask & invert_bool_mask(curr_data["dynamic_mask"]).flatten()
+        if dynamic_mask is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(dynamic_mask).flatten()
         valid_depth_indices = torch.where(valid_depth_mask)[0]
         pts = pts[:, valid_depth_indices]
         depth_tmp = depth_tmp[valid_depth_indices]
@@ -1442,12 +1473,94 @@ def rgbd_slam(config: dict):
         tracking_frame_time_sum += tracking_end_time - tracking_start_time
         tracking_frame_time_count += 1
 
-        dynamic_mask_manager.run_for_frame(
+        dynamic_frontend_record = dynamic_mask_manager.run_for_frame(
             time_idx=time_idx,
             num_frames=num_frames,
             params=params,
             sky_mask=sky_mask,
         )
+        dynamic_render_pair = None
+        dynamic_appearance_cfg = config.get("dynamic_mask", {}).get("appearance", {})
+        if (
+            dynamic_mask_manager.enabled
+            and dynamic_appearance_cfg.get("enabled", True)
+            and dynamic_appearance_cfg.get("use_mapping_render", True)
+        ):
+            with torch.no_grad():
+                dynamic_render_pair = {}
+                _, _, _ = get_loss(
+                    params,
+                    curr_data,
+                    variables,
+                    time_idx,
+                    config['mapping']['loss_weights'],
+                    config['mapping']['use_sil_for_loss'],
+                    config['mapping']['sil_thres'],
+                    config['mapping']['use_l1'],
+                    config['mapping']['ignore_outlier_depth_loss'],
+                    mapping=True,
+                    grad_mask=None,
+                    render_pair_out=dynamic_render_pair,
+                    retain_grad_for_densification=False,
+                    ignore_dynamic_mask=True,
+                )
+
+        dynamic_mask_ready_before_mapping = False
+        dynamic_mask_manager.finalize_for_frame(
+            time_idx=time_idx,
+            num_frames=num_frames,
+            params=params,
+            curr_data=curr_data,
+            render_pair=dynamic_render_pair,
+        )
+        frontend_dynamic_observation = load_dynamic_observation(
+            output_dir,
+            dynamic_4dgs_cfg,
+            time_idx,
+            frame_id,
+            reference_frame_id,
+            (color.shape[1], color.shape[2]),
+            device,
+        )
+        if frontend_dynamic_observation is not None:
+            curr_data.update(frontend_dynamic_observation)
+            curr_frame_data.update(frontend_dynamic_observation)
+            dynamic_mask = frontend_dynamic_observation.get("dynamic_mask")
+            dynamic_mask_ready_before_mapping = True
+
+        require_dynamic_mask_for_mapping = (
+            dynamic_mask_manager.enabled
+            and dynamic_4dgs_cfg.get("enabled", False)
+            and dynamic_4dgs_cfg.get("require_appearance_mask", False)
+        )
+        skip_mapping_without_dynamic_mask = (
+            require_dynamic_mask_for_mapping
+            and time_idx > 0
+            and curr_data.get("dynamic_mask") is None
+        )
+        if skip_mapping_without_dynamic_mask:
+            print(
+                f"Skipping static mapping at frame {time_idx}: "
+                "appearance-fused dynamic mask is required but unavailable."
+            )
+
+        if dynamic_4dgs_cfg.get("enabled", False) and curr_data.get("dynamic_mask") is not None:
+            dynamic_params, dynamic_changed = update_dynamic_params_from_frame(
+                dynamic_params,
+                curr_data,
+                params,
+                time_idx,
+                num_frames,
+                config['mean_sq_dist_method'],
+                config['gaussian_distribution'],
+                dynamic_4dgs_cfg,
+            )
+            if dynamic_changed:
+                print(
+                    f"Dynamic 4DGS updated at frame {time_idx}: "
+                    f"{dynamic_params['dyn_means3D_canon'].shape[0]} gaussians, "
+                    f"{dynamic_params['dyn_obj_trans'].shape[0]} objects"
+                )
 
         if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
             try:
@@ -1466,7 +1579,7 @@ def rgbd_slam(config: dict):
                 print('Failed to evaluate trajectory.')
 
         # Densification & KeyFrame-based Mapping
-        if time_idx == 0 or (time_idx+1) % config['map_every'] == 0:
+        if (not skip_mapping_without_dynamic_mask) and (time_idx == 0 or (time_idx+1) % config['map_every'] == 0):
             # Densification
             if config['mapping']['add_new_gaussians'] and time_idx > 0:
                 # Setup Data for Densification
@@ -1476,9 +1589,10 @@ def rgbd_slam(config: dict):
                     densify_color = densify_color.permute(2, 0, 1) / 255
                     densify_depth = densify_depth.permute(2, 0, 1)
                     densify_sky_mask = resize_bool_mask(sky_mask, densify_color.shape[1], densify_color.shape[2])
+                    densify_dynamic_mask = resize_dynamic_bool_mask(dynamic_mask, densify_color.shape[1], densify_color.shape[2])
                     densify_curr_data = {'cam': densify_cam, 'im': densify_color, 'depth': densify_depth, 'id': time_idx, 
                                  'intrinsics': densify_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c,
-                                 'sky_mask': densify_sky_mask}
+                                 'sky_mask': densify_sky_mask, 'dynamic_mask': densify_dynamic_mask}
                 else:
                     densify_curr_data = curr_data
 
@@ -1501,6 +1615,7 @@ def rgbd_slam(config: dict):
                 # Select Keyframes for Mapping
                 num_keyframes = config['mapping_window_size']-2
                 keyframe_selection_depth = apply_sky_mask_to_depth(depth, sky_mask)
+                keyframe_selection_depth = apply_dynamic_mask_to_depth(keyframe_selection_depth, dynamic_mask)
                 selected_keyframes = keyframe_selection_overlap(keyframe_selection_depth, curr_w2c, intrinsics, keyframe_list[:-1], num_keyframes)
                 selected_time_idx = [keyframe_list[frame_idx]['id'] for frame_idx in selected_keyframes]
                 if len(keyframe_list) > 0:
@@ -1531,16 +1646,21 @@ def rgbd_slam(config: dict):
                     iter_color = color
                     iter_depth = depth
                     iter_sky_mask = sky_mask
+                    iter_dynamic_mask = curr_data.get('dynamic_mask')
+                    iter_dynamic_score = curr_data.get('dynamic_score')
                 else:
                     # Use Keyframe Data
                     iter_time_idx = keyframe_list[selected_rand_keyframe_idx]['id']
                     iter_color = keyframe_list[selected_rand_keyframe_idx]['color']
                     iter_depth = keyframe_list[selected_rand_keyframe_idx]['depth']
                     iter_sky_mask = keyframe_list[selected_rand_keyframe_idx].get('sky_mask')
+                    iter_dynamic_mask = keyframe_list[selected_rand_keyframe_idx].get('dynamic_mask')
+                    iter_dynamic_score = keyframe_list[selected_rand_keyframe_idx].get('dynamic_score')
                 iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
                 iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
                              'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c,
-                             'sky_mask': iter_sky_mask}
+                             'sky_mask': iter_sky_mask, 'dynamic_mask': iter_dynamic_mask,
+                             'dynamic_score': iter_dynamic_score}
                 # Loss for current frame
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
@@ -1607,10 +1727,13 @@ def rgbd_slam(config: dict):
                     iter_color = keyframe_list[-1]['color']
                     iter_depth = keyframe_list[-1]['depth']
                     iter_sky_mask = keyframe_list[-1].get('sky_mask')
+                    iter_dynamic_mask = keyframe_list[-1].get('dynamic_mask')
+                    iter_dynamic_score = keyframe_list[-1].get('dynamic_score')
                     iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
                     iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
                                 'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c,
-                                'sky_mask': iter_sky_mask}
+                                'sky_mask': iter_sky_mask, 'dynamic_mask': iter_dynamic_mask,
+                                'dynamic_score': iter_dynamic_score}
                     # Loss for current frame
                     loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                     config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
@@ -1653,6 +1776,74 @@ def rgbd_slam(config: dict):
                     mapping_iter_time_count += 1
                 if num_iters_local_mapping > 0:
                     progress_bar.close()
+
+            num_iters_dynamic = int(dynamic_4dgs_cfg.get("num_iters", 0))
+            if (
+                dynamic_4dgs_cfg.get("enabled", False)
+                and has_dynamic_gaussians(dynamic_params)
+                and num_iters_dynamic > 0
+            ):
+                dynamic_train_frames = []
+                for selected_keyframe_idx in selected_keyframes:
+                    if selected_keyframe_idx == -1:
+                        dyn_frame = {
+                            'cam': cam,
+                            'im': color,
+                            'depth': depth,
+                            'id': time_idx,
+                            'intrinsics': intrinsics,
+                            'w2c': first_frame_w2c,
+                            'iter_gt_w2c_list': curr_gt_w2c,
+                            'sky_mask': sky_mask,
+                            'dynamic_mask': curr_data.get('dynamic_mask'),
+                            'dynamic_score': curr_data.get('dynamic_score'),
+                        }
+                    else:
+                        dyn_kf = keyframe_list[selected_keyframe_idx]
+                        dyn_frame = {
+                            'cam': cam,
+                            'im': dyn_kf['color'],
+                            'depth': dyn_kf['depth'],
+                            'id': dyn_kf['id'],
+                            'intrinsics': intrinsics,
+                            'w2c': first_frame_w2c,
+                            'iter_gt_w2c_list': gt_w2c_all_frames[:dyn_kf['id']+1],
+                            'sky_mask': dyn_kf.get('sky_mask'),
+                            'dynamic_mask': dyn_kf.get('dynamic_mask'),
+                            'dynamic_score': dyn_kf.get('dynamic_score'),
+                        }
+                    if dyn_frame.get('dynamic_mask') is not None and bool(dyn_frame['dynamic_mask'].any()):
+                        dynamic_train_frames.append(dyn_frame)
+
+                if dynamic_train_frames:
+                    dynamic_optimizer = initialize_dynamic_optimizer(dynamic_params, dynamic_4dgs_cfg.get("lrs", {}))
+                    if dynamic_optimizer is not None:
+                        progress_bar = tqdm(range(num_iters_dynamic), desc=f"Dynamic 4DGS Time Step: {time_idx}")
+                        for dyn_iter in range(num_iters_dynamic):
+                            dyn_frame = dynamic_train_frames[np.random.randint(0, len(dynamic_train_frames))]
+                            dyn_time_idx = dyn_frame['id']
+                            dyn_loss, dyn_losses = get_dynamic_loss(
+                                dynamic_params,
+                                params,
+                                dyn_frame,
+                                dyn_time_idx,
+                                dynamic_4dgs_cfg,
+                            )
+                            if dyn_loss is None:
+                                progress_bar.update(1)
+                                continue
+                            dyn_loss.backward()
+                            dynamic_optimizer.step()
+                            dynamic_optimizer.zero_grad(set_to_none=True)
+                            if config['use_wandb']:
+                                wandb_dynamic_log = {
+                                    f"Dynamic 4DGS/{k}": v.detach()
+                                    for k, v in dyn_losses.items()
+                                }
+                                wandb_dynamic_log["Dynamic 4DGS/step"] = wandb_mapping_step
+                                wandb_run.log(wandb_dynamic_log)
+                            progress_bar.update(1)
+                        progress_bar.close()
             
             # Update the runtime numbers
             mapping_end_time = time.time()
@@ -1677,37 +1868,45 @@ def rgbd_slam(config: dict):
                     save_params_ckpt(params, ckpt_output_dir, time_idx)
                     print('Failed to evaluate trajectory.')
 
-        dynamic_render_pair = None
-        dynamic_appearance_cfg = config.get("dynamic_mask", {}).get("appearance", {})
-        if (
-            dynamic_mask_manager.enabled
-            and dynamic_appearance_cfg.get("enabled", True)
-            and dynamic_appearance_cfg.get("use_mapping_render", True)
-        ):
-            with torch.no_grad():
-                dynamic_render_pair = {}
-                _, _, _ = get_loss(
-                    params,
-                    curr_data,
-                    variables,
-                    time_idx,
-                    config['mapping']['loss_weights'],
-                    config['mapping']['use_sil_for_loss'],
-                    config['mapping']['sil_thres'],
-                    config['mapping']['use_l1'],
-                    config['mapping']['ignore_outlier_depth_loss'],
-                    mapping=True,
-                    grad_mask=grad_mask,
-                    render_pair_out=dynamic_render_pair,
-                )
-
-        dynamic_mask_manager.finalize_for_frame(
-            time_idx=time_idx,
-            num_frames=num_frames,
-            params=params,
-            curr_data=curr_data,
-            render_pair=dynamic_render_pair,
+        had_dynamic_mask_before_finalize = curr_data.get("dynamic_mask") is not None
+        if not dynamic_mask_ready_before_mapping:
+            dynamic_mask_manager.finalize_for_frame(
+                time_idx=time_idx,
+                num_frames=num_frames,
+                params=params,
+                curr_data=curr_data,
+                render_pair=dynamic_render_pair,
+            )
+        post_dynamic_observation = load_dynamic_observation(
+            output_dir,
+            dynamic_4dgs_cfg,
+            time_idx,
+            frame_id,
+            reference_frame_id,
+            (color.shape[1], color.shape[2]),
+            device,
         )
+        if post_dynamic_observation is not None:
+            curr_data.update(post_dynamic_observation)
+            curr_frame_data.update(post_dynamic_observation)
+            dynamic_mask = post_dynamic_observation.get("dynamic_mask")
+            if dynamic_4dgs_cfg.get("enabled", False) and not had_dynamic_mask_before_finalize:
+                dynamic_params, dynamic_changed = update_dynamic_params_from_frame(
+                    dynamic_params,
+                    curr_data,
+                    params,
+                    time_idx,
+                    num_frames,
+                    config['mean_sq_dist_method'],
+                    config['gaussian_distribution'],
+                    dynamic_4dgs_cfg,
+                )
+                if dynamic_changed:
+                    print(
+                        f"Dynamic 4DGS updated after mask finalization at frame {time_idx}: "
+                        f"{dynamic_params['dyn_means3D_canon'].shape[0]} gaussians, "
+                        f"{dynamic_params['dyn_obj_trans'].shape[0]} objects"
+                    )
         
         # plot progress
         # if time_idx >= 0:
@@ -1715,8 +1914,8 @@ def rgbd_slam(config: dict):
         #         plot_progress(params, curr_data, time_idx, time_idx, sil_thres=config['mapping']['sil_thres'], plot_dir=plot_progress_dir, iter=iter)
 
         # Add frame to keyframe list
-        if ((time_idx == 0) or ((time_idx+1) % config['keyframe_every'] == 0) or \
-                    (time_idx == num_frames-2)) and (not torch.isinf(curr_gt_w2c[-1]).any()) and (not torch.isnan(curr_gt_w2c[-1]).any()):
+        if (not skip_mapping_without_dynamic_mask) and (((time_idx == 0) or ((time_idx+1) % config['keyframe_every'] == 0) or \
+                    (time_idx == num_frames-2)) and (not torch.isinf(curr_gt_w2c[-1]).any()) and (not torch.isnan(curr_gt_w2c[-1]).any())):
             with torch.no_grad():
                 # Get the current estimated rotation & translation
                 curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
@@ -1725,7 +1924,15 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Initialize Keyframe Info
-                curr_keyframe = {'id': time_idx, 'est_w2c': curr_w2c, 'color': color, 'depth': depth, 'sky_mask': sky_mask}
+                curr_keyframe = {
+                    'id': time_idx,
+                    'est_w2c': curr_w2c,
+                    'color': color,
+                    'depth': depth,
+                    'sky_mask': sky_mask,
+                    'dynamic_mask': curr_data.get('dynamic_mask'),
+                    'dynamic_score': curr_data.get('dynamic_score'),
+                }
                 # Add to keyframe list
                 keyframe_list.append(curr_keyframe)
                 keyframe_time_indices.append(time_idx)
@@ -1786,32 +1993,35 @@ def rgbd_slam(config: dict):
                        "Final Stats/Average Mapping Frame Time (s)": mapping_frame_time_avg,
                        "Final Stats/step": 1})
     
+    final_params = convert_params_to_store(params)
+    final_params = pack_dynamic_params(final_params, dynamic_params)
+
     # Evaluate Final Parameters
     with torch.no_grad():
         if config['use_wandb']:
-            eval(dataset, params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
+            eval(dataset, final_params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
                  wandb_run=wandb_run, wandb_save_qual=config['wandb']['eval_save_qual'],
                  mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
                  eval_every=config['eval_every'])
         else:
-            eval(dataset, params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
+            eval(dataset, final_params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
                  mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
                  eval_every=config['eval_every'])
 
     # Add Camera Parameters to Save them
-    params['timestep'] = variables['timestep']
-    params['intrinsics'] = intrinsics.detach().cpu().numpy()
-    params['w2c'] = first_frame_w2c.detach().cpu().numpy()
-    params['org_width'] = dataset_config["desired_image_width"]
-    params['org_height'] = dataset_config["desired_image_height"]
-    params['gt_w2c_all_frames'] = []
+    final_params['timestep'] = variables['timestep']
+    final_params['intrinsics'] = intrinsics.detach().cpu().numpy()
+    final_params['w2c'] = first_frame_w2c.detach().cpu().numpy()
+    final_params['org_width'] = dataset_config["desired_image_width"]
+    final_params['org_height'] = dataset_config["desired_image_height"]
+    final_params['gt_w2c_all_frames'] = []
     for gt_w2c_tensor in gt_w2c_all_frames:
-        params['gt_w2c_all_frames'].append(gt_w2c_tensor.detach().cpu().numpy())
-    params['gt_w2c_all_frames'] = np.stack(params['gt_w2c_all_frames'], axis=0)
-    params['keyframe_time_indices'] = np.array(keyframe_time_indices)
+        final_params['gt_w2c_all_frames'].append(gt_w2c_tensor.detach().cpu().numpy())
+    final_params['gt_w2c_all_frames'] = np.stack(final_params['gt_w2c_all_frames'], axis=0)
+    final_params['keyframe_time_indices'] = np.array(keyframe_time_indices)
     
     # Save Parameters
-    save_params(params, output_dir)
+    save_params(final_params, output_dir)
 
     # Close WandB Run
     if config['use_wandb']:

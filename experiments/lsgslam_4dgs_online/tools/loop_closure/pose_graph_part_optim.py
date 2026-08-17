@@ -31,12 +31,201 @@ from utils.slam_external import build_rotation, calc_ssim, calc_psnr, densify, d
 from utils.eval_helpers import align
 from utils.recon_helpers import setup_camera
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
-from utils.slam_helpers import transformed_params2rendervar, l1_loss_v1, transformed_params2depthplussilhouette, matrix_to_quaternion, transform_to_frame
+from utils.slam_helpers import (
+    transformed_params2rendervar,
+    l1_loss_v1,
+    transformed_params2depthplussilhouette,
+    matrix_to_quaternion,
+    quat_mult,
+    transform_to_frame,
+)
+from utils.dynamic_gs import (
+    dynamic_params2depthplussilhouette,
+    dynamic_params2rendervar,
+    has_dynamic_gaussians,
+    merge_dynamic_4dgs_config,
+    merge_rendervars,
+    transform_dynamic_to_frame,
+)
 from utils.common_utils import save_params
 from datasets.gradslam_datasets import (load_dataset_config, KittiDataset, Kitti360Dataset, EurocDataset, GradSLAMDataset)
 from pytorch_msssim import ms_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 loss_fn_alex = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=True).cuda()
+
+DYNAMIC_TRAINABLE_KEYS = [
+    "dyn_means3D_canon",
+    "dyn_rgb_colors",
+    "dyn_unnorm_rotations",
+    "dyn_logit_opacities",
+    "dyn_log_scales",
+    "dyn_obj_unnorm_rots",
+    "dyn_obj_trans",
+]
+
+DYNAMIC_METADATA_KEYS = [
+    "dyn_obj_ids",
+    "dyn_birth_time",
+    "dyn_obj_visible",
+    "dyn_obj_last_seen",
+    "dyn_obj_obs_count",
+]
+
+DYNAMIC_KEYS = set(DYNAMIC_TRAINABLE_KEYS + DYNAMIC_METADATA_KEYS)
+
+
+def _to_cuda_tensor(value):
+    tensor = torch.as_tensor(value).cuda()
+    if tensor.is_floating_point():
+        tensor = tensor.float()
+    return tensor.contiguous()
+
+
+def _parameterize_keys(params, keys):
+    for k in keys:
+        if k not in params:
+            continue
+        tensor = params[k]
+        if not tensor.is_floating_point():
+            tensor = tensor.float()
+        params[k] = torch.nn.Parameter(
+            tensor.cuda().float().contiguous().requires_grad_(True)
+        )
+    return params
+
+
+def split_static_dynamic_params(params):
+    dynamic_params = {k: v for k, v in params.items() if k in DYNAMIC_KEYS or k.startswith("dyn_")}
+    static_params = {k: v for k, v in params.items() if k not in dynamic_params}
+    return static_params, dynamic_params
+
+
+def _has_dynamic_np(params):
+    return (
+        "dyn_means3D_canon" in params
+        and np.asarray(params["dyn_means3D_canon"]).shape[0] > 0
+    )
+
+
+def _quat_to_rot_np(quats):
+    quats = np.asarray(quats, dtype=np.float32)
+    norm = np.linalg.norm(quats, axis=1, keepdims=True)
+    norm = np.maximum(norm, 1e-8)
+    q = quats / norm
+    r, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    rot = np.zeros((q.shape[0], 3, 3), dtype=np.float32)
+    rot[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    rot[:, 0, 1] = 2 * (x * y - r * z)
+    rot[:, 0, 2] = 2 * (x * z + r * y)
+    rot[:, 1, 0] = 2 * (x * y + r * z)
+    rot[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    rot[:, 1, 2] = 2 * (y * z - r * x)
+    rot[:, 2, 0] = 2 * (x * z - r * y)
+    rot[:, 2, 1] = 2 * (y * z + r * x)
+    rot[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return rot
+
+
+def _rot_to_quat_np(rot_mats):
+    rot_tensor = torch.as_tensor(rot_mats, dtype=torch.float32, device="cuda")
+    return matrix_to_quaternion(rot_tensor).detach().cpu().numpy().astype(np.float32)
+
+
+def _extend_dynamic_frames_np(params, out_num_frames):
+    if not _has_dynamic_np(params) or "dyn_obj_trans" not in params:
+        return params
+    cur_num_frames = int(params["dyn_obj_trans"].shape[-1])
+    if out_num_frames <= cur_num_frames:
+        return params
+    pad = out_num_frames - cur_num_frames
+    num_objects = int(params["dyn_obj_trans"].shape[0])
+
+    trans_pad = np.repeat(params["dyn_obj_trans"][:, :, -1:], pad, axis=2)
+    params["dyn_obj_trans"] = np.concatenate((params["dyn_obj_trans"], trans_pad), axis=2)
+
+    rot_pad = np.zeros((num_objects, 4, pad), dtype=np.float32)
+    rot_pad[:, 0, :] = 1.0
+    params["dyn_obj_unnorm_rots"] = np.concatenate((params["dyn_obj_unnorm_rots"], rot_pad), axis=2)
+
+    visible_pad = np.zeros((num_objects, pad), dtype=params["dyn_obj_visible"].dtype)
+    params["dyn_obj_visible"] = np.concatenate((params["dyn_obj_visible"], visible_pad), axis=1)
+    return params
+
+
+def _merge_dynamic_overlap_np(all_params, next_part_params, overlap_steps, frame_offset, base_c2w):
+    if not _has_dynamic_np(all_params) and not _has_dynamic_np(next_part_params):
+        return all_params
+
+    out_num_frames = int(all_params["cam_unnorm_rots"].shape[-1]) + int(overlap_steps)
+    all_params = _extend_dynamic_frames_np(all_params, out_num_frames)
+    if not _has_dynamic_np(next_part_params):
+        return all_params
+
+    if not _has_dynamic_np(all_params):
+        all_params["dyn_means3D_canon"] = np.zeros((0, 3), dtype=np.float32)
+        all_params["dyn_rgb_colors"] = np.zeros((0, 3), dtype=np.float32)
+        all_params["dyn_unnorm_rotations"] = np.zeros((0, 4), dtype=np.float32)
+        all_params["dyn_logit_opacities"] = np.zeros((0, 1), dtype=np.float32)
+        all_params["dyn_log_scales"] = np.zeros((0, next_part_params["dyn_log_scales"].shape[1]), dtype=np.float32)
+        all_params["dyn_obj_ids"] = np.zeros((0,), dtype=next_part_params["dyn_obj_ids"].dtype)
+        all_params["dyn_birth_time"] = np.zeros((0,), dtype=next_part_params["dyn_birth_time"].dtype)
+        all_params["dyn_obj_unnorm_rots"] = np.zeros((0, 4, out_num_frames), dtype=np.float32)
+        all_params["dyn_obj_trans"] = np.zeros((0, 3, out_num_frames), dtype=np.float32)
+        all_params["dyn_obj_visible"] = np.zeros((0, out_num_frames), dtype=next_part_params["dyn_obj_visible"].dtype)
+        all_params["dyn_obj_last_seen"] = np.zeros((0,), dtype=next_part_params["dyn_obj_last_seen"].dtype)
+        all_params["dyn_obj_obs_count"] = np.zeros((0,), dtype=next_part_params["dyn_obj_obs_count"].dtype)
+
+    next_birth = np.asarray(next_part_params["dyn_birth_time"]).astype(np.int64)
+    selected_gs = (next_birth > 0) & (next_birth <= int(overlap_steps))
+    if not np.any(selected_gs):
+        return all_params
+
+    next_obj_ids_all = np.asarray(next_part_params["dyn_obj_ids"]).astype(np.int64)
+    selected_old_obj_ids = np.unique(next_obj_ids_all[selected_gs])
+    cur_num_objects = int(all_params["dyn_obj_trans"].shape[0])
+    obj_id_map = {int(old_id): cur_num_objects + idx for idx, old_id in enumerate(selected_old_obj_ids)}
+
+    for key in ["dyn_means3D_canon", "dyn_rgb_colors", "dyn_unnorm_rotations", "dyn_logit_opacities", "dyn_log_scales"]:
+        all_params[key] = np.concatenate((all_params[key], next_part_params[key][selected_gs]), axis=0)
+    remapped_obj_ids = np.array([obj_id_map[int(old_id)] for old_id in next_obj_ids_all[selected_gs]], dtype=all_params["dyn_obj_ids"].dtype)
+    shifted_birth = next_birth[selected_gs] + int(frame_offset)
+    all_params["dyn_obj_ids"] = np.concatenate((all_params["dyn_obj_ids"], remapped_obj_ids), axis=0)
+    all_params["dyn_birth_time"] = np.concatenate((all_params["dyn_birth_time"], shifted_birth.astype(all_params["dyn_birth_time"].dtype)), axis=0)
+
+    new_obj_count = len(selected_old_obj_ids)
+    new_trans = np.zeros((new_obj_count, 3, out_num_frames), dtype=np.float32)
+    new_rots = np.zeros((new_obj_count, 4, out_num_frames), dtype=np.float32)
+    new_rots[:, 0, :] = 1.0
+    new_visible = np.zeros((new_obj_count, out_num_frames), dtype=all_params["dyn_obj_visible"].dtype)
+    new_last_seen = np.full((new_obj_count,), -1, dtype=all_params["dyn_obj_last_seen"].dtype)
+    new_obs_count = np.zeros((new_obj_count,), dtype=all_params["dyn_obj_obs_count"].dtype)
+
+    base_rot = np.asarray(base_c2w[:3, :3], dtype=np.float32)
+    for new_idx, old_obj_id in enumerate(selected_old_obj_ids):
+        old_obj_id = int(old_obj_id)
+        for next_t in range(1, int(overlap_steps) + 1):
+            if next_t >= next_part_params["dyn_obj_trans"].shape[-1]:
+                break
+            out_t = int(frame_offset) + next_t
+            visible = bool(next_part_params["dyn_obj_visible"][old_obj_id, next_t])
+            if not visible:
+                continue
+            trans = next_part_params["dyn_obj_trans"][old_obj_id, :, next_t]
+            trans4 = np.concatenate((trans.astype(np.float32), np.ones((1,), dtype=np.float32)), axis=0)
+            new_trans[new_idx, :, out_t] = (base_c2w @ trans4)[:3]
+
+            old_rot = _quat_to_rot_np(next_part_params["dyn_obj_unnorm_rots"][old_obj_id, :, next_t][None])[0]
+            new_rots[new_idx, :, out_t] = _rot_to_quat_np((base_rot @ old_rot)[None])[0]
+            new_visible[new_idx, out_t] = True
+            new_last_seen[new_idx] = out_t
+            new_obs_count[new_idx] += 1
+
+    all_params["dyn_obj_unnorm_rots"] = np.concatenate((all_params["dyn_obj_unnorm_rots"], new_rots), axis=0)
+    all_params["dyn_obj_trans"] = np.concatenate((all_params["dyn_obj_trans"], new_trans), axis=0)
+    all_params["dyn_obj_visible"] = np.concatenate((all_params["dyn_obj_visible"], new_visible), axis=0)
+    all_params["dyn_obj_last_seen"] = np.concatenate((all_params["dyn_obj_last_seen"], new_last_seen), axis=0)
+    all_params["dyn_obj_obs_count"] = np.concatenate((all_params["dyn_obj_obs_count"], new_obs_count), axis=0)
+    return all_params
 
 def getConstDigitsNumber(val, num_digits):
     return "{:.{}f}".format(val, num_digits)
@@ -210,7 +399,7 @@ class PoseGraphManager:
 def load_params(scene_path, optimize_keys=None):
     # Load Scene Data
     all_params = dict(np.load(scene_path, allow_pickle=True))
-    all_params = {k: torch.tensor(all_params[k]).cuda().float() for k in all_params.keys()}
+    all_params = {k: _to_cuda_tensor(all_params[k]) for k in all_params.keys()}
 
     if optimize_keys is not None:
         keys = [k for k in all_params.keys() if k in optimize_keys]
@@ -218,12 +407,7 @@ def load_params(scene_path, optimize_keys=None):
         keys = [k for k in all_params.keys() if
                 k in ['means3D', 'rgb_colors', 'unnorm_rotations', 'log_scales', 'logit_opacities']]
 
-    params = all_params
-    for k in keys:
-        if not isinstance(all_params[k], torch.Tensor):
-            params[k] = torch.nn.Parameter(torch.tensor(all_params[k]).cuda().float().contiguous().requires_grad_(True))
-        else:
-            params[k] = torch.nn.Parameter(all_params[k].cuda().float().contiguous().requires_grad_(True))
+    params = _parameterize_keys(all_params, keys)
 
     all_w2cs = []
     all_gt_w2cs = []
@@ -247,37 +431,48 @@ def load_params_with_overlap(part_path, optimize_keys=None, next_part_path=None,
     # Load Scene Data
     all_params = dict(np.load(part_path, allow_pickle=True))
     next_part_params = dict(np.load(next_part_path, allow_pickle=True))
-    cat_gs_mask = (next_part_params['timestep'] > 0) & (next_part_params['timestep'] < overlap_bound//stride+1)
+    overlap_steps = overlap_bound // stride
+    frame_offset = int(np.max(all_params['timestep']))
+    cat_gs_mask = (next_part_params['timestep'] > 0) & (next_part_params['timestep'] < overlap_steps + 1)
     for k in ['rgb_colors', 'unnorm_rotations', 'log_scales', 'logit_opacities']:
         all_params[k] = np.vstack((all_params[k], next_part_params[k][cat_gs_mask]))
-    all_params['timestep'] = np.concatenate((all_params['timestep'], next_part_params['timestep'][cat_gs_mask]+all_params['timestep'][-1]))
+    all_params['timestep'] = np.concatenate((all_params['timestep'], next_part_params['timestep'][cat_gs_mask]+frame_offset))
 
-    cam_rot = F.normalize(torch.tensor(all_params['cam_unnorm_rots'][..., -1]))
-    cam_tran = torch.tensor(all_params['cam_trans'][..., -1])
-    base_w2c = torch.eye(4).float()
+    cam_rot = F.normalize(torch.tensor(all_params['cam_unnorm_rots'][..., -1], device='cuda').float())
+    cam_tran = torch.tensor(all_params['cam_trans'][..., -1], device='cuda').float()
+    base_w2c = torch.eye(4, device='cuda').float()
     base_w2c[:3, :3] = build_rotation(cam_rot)
     base_w2c[:3, 3] = cam_tran
     base_c2w = torch.linalg.inv(base_w2c)
+    base_c2w_np = base_c2w.detach().cpu().numpy()
     base_gt_w2c = all_params['gt_w2c_all_frames'][-1]
 
     next_part_means3D = next_part_params['means3D'][cat_gs_mask]
     next_part_means3D = np.hstack((next_part_means3D, np.ones((next_part_means3D.shape[0], 1)))).T # (4, k)
-    next_part_means3D = ((base_c2w @ next_part_means3D).T)[:, :3] # (k, 3)
+    next_part_means3D = ((base_c2w_np @ next_part_means3D).T)[:, :3] # (k, 3)
     all_params['means3D'] = np.vstack((all_params['means3D'], next_part_means3D))
 
-    for t_i in range(1, overlap_bound//stride+1):
-        cam_rot = F.normalize(torch.tensor(next_part_params['cam_unnorm_rots'][..., t_i]))
-        cam_tran = torch.tensor(next_part_params['cam_trans'][..., t_i])
-        rel_w2c = torch.eye(4).float()
+    all_params = _merge_dynamic_overlap_np(
+        all_params,
+        next_part_params,
+        overlap_steps,
+        frame_offset,
+        base_c2w_np,
+    )
+
+    for t_i in range(1, overlap_steps+1):
+        cam_rot = F.normalize(torch.tensor(next_part_params['cam_unnorm_rots'][..., t_i], device='cuda').float())
+        cam_tran = torch.tensor(next_part_params['cam_trans'][..., t_i], device='cuda').float()
+        rel_w2c = torch.eye(4, device='cuda').float()
         rel_w2c[:3, :3] = build_rotation(cam_rot)
         rel_w2c[:3, 3] = cam_tran
         rel_w2c = rel_w2c @ base_w2c
         rel_w2c_rot = rel_w2c[:3, :3].unsqueeze(0)
         rel_w2c_rot_quat = matrix_to_quaternion(rel_w2c_rot)
         rel_w2c_tran = rel_w2c[:3, 3]
-        rel_w2c_rot_quat = rel_w2c_rot_quat.numpy().reshape(1, 4, 1)
+        rel_w2c_rot_quat = rel_w2c_rot_quat.detach().cpu().numpy().reshape(1, 4, 1)
         all_params['cam_unnorm_rots'] = np.concatenate((all_params['cam_unnorm_rots'], rel_w2c_rot_quat), axis=2)
-        rel_w2c_tran = rel_w2c_tran.numpy().reshape(1, 3, 1)
+        rel_w2c_tran = rel_w2c_tran.detach().cpu().numpy().reshape(1, 3, 1)
         all_params['cam_trans'] = np.concatenate((all_params['cam_trans'], rel_w2c_tran), axis=2)
 
         gt_w2c = next_part_params['gt_w2c_all_frames'][t_i]
@@ -285,7 +480,7 @@ def load_params_with_overlap(part_path, optimize_keys=None, next_part_path=None,
         gt_w2c = gt_w2c.reshape(1, 4, 4)
         all_params['gt_w2c_all_frames'] = np.concatenate((all_params['gt_w2c_all_frames'], gt_w2c), axis=0)
 
-    all_params = {k: torch.tensor(all_params[k]).cuda().float() for k in all_params.keys()}
+    all_params = {k: _to_cuda_tensor(all_params[k]) for k in all_params.keys()}
 
     if optimize_keys is not None:
         keys = [k for k in all_params.keys() if k in optimize_keys]
@@ -293,12 +488,7 @@ def load_params_with_overlap(part_path, optimize_keys=None, next_part_path=None,
         keys = [k for k in all_params.keys() if
                 k in ['means3D', 'rgb_colors', 'unnorm_rotations', 'log_scales', 'logit_opacities']]
 
-    params = all_params
-    for k in keys:
-        if not isinstance(all_params[k], torch.Tensor):
-            params[k] = torch.nn.Parameter(torch.tensor(all_params[k]).cuda().float().contiguous().requires_grad_(True))
-        else:
-            params[k] = torch.nn.Parameter(all_params[k].cuda().float().contiguous().requires_grad_(True))
+    params = _parameterize_keys(all_params, keys)
 
     all_w2cs = []
     all_gt_w2cs = []
@@ -309,7 +499,7 @@ def load_params_with_overlap(part_path, optimize_keys=None, next_part_path=None,
         rel_w2c = torch.eye(4).cuda().float()
         rel_w2c[:3, :3] = build_rotation(cam_rot)
         rel_w2c[:3, 3] = cam_tran
-        all_w2cs.append(rel_w2c.cpu().numpy())
+        all_w2cs.append(rel_w2c.detach().cpu().numpy())
 
         gt_w2c = params['gt_w2c_all_frames'][t_i]
         # print(gt_w2c.shape)
@@ -396,6 +586,167 @@ def compute_min_scale_loss(params):
     return sum_of_row_min
 
 
+def compute_dynamic_min_scale_loss(dynamic_params):
+    if not has_dynamic_gaussians(dynamic_params):
+        return torch.zeros((), device="cuda")
+    row_min_values, _ = torch.min(torch.exp(dynamic_params["dyn_log_scales"]), dim=1)
+    return row_min_values.mean()
+
+
+def transform_dynamic_to_world(dynamic_params, time_idx, gaussians_grad):
+    if not has_dynamic_gaussians(dynamic_params):
+        return None, None
+
+    time_idx = int(time_idx)
+    obj_ids_all = dynamic_params["dyn_obj_ids"].long()
+    birth = dynamic_params["dyn_birth_time"].long()
+    visible = dynamic_params["dyn_obj_visible"].bool()
+    if time_idx >= visible.shape[1]:
+        return None, None
+    active = (birth <= time_idx) & visible[obj_ids_all, time_idx]
+    if not bool(active.any()):
+        return None, active
+
+    obj_ids = obj_ids_all[active]
+    if gaussians_grad:
+        local_pts = dynamic_params["dyn_means3D_canon"][active]
+        local_rots = dynamic_params["dyn_unnorm_rotations"][active]
+        obj_rots = F.normalize(dynamic_params["dyn_obj_unnorm_rots"][obj_ids, :, time_idx])
+        obj_trans = dynamic_params["dyn_obj_trans"][obj_ids, :, time_idx]
+    else:
+        local_pts = dynamic_params["dyn_means3D_canon"][active].detach()
+        local_rots = dynamic_params["dyn_unnorm_rotations"][active].detach()
+        obj_rots = F.normalize(dynamic_params["dyn_obj_unnorm_rots"][obj_ids, :, time_idx].detach())
+        obj_trans = dynamic_params["dyn_obj_trans"][obj_ids, :, time_idx].detach()
+
+    obj_rot_mats = build_rotation(obj_rots)
+    world_pts = torch.bmm(obj_rot_mats, local_pts.unsqueeze(-1)).squeeze(-1) + obj_trans
+    world_rots = quat_mult(obj_rots, F.normalize(local_rots))
+    return {
+        "means3D": world_pts,
+        "unnorm_rotations": world_rots,
+        "active_mask": active,
+    }, active
+
+
+def build_refine_rendervars(params, dynamic_params, time_idx, w2c=None, ba=False, gaussians_grad=True, camera_grad=False):
+    if ba:
+        transformed_gaussians = transform_to_frame(
+            params,
+            time_idx,
+            gaussians_grad=gaussians_grad,
+            camera_grad=camera_grad,
+        )
+        depth_w2c = torch.eye(4, dtype=torch.float32, device="cuda")
+    else:
+        transformed_gaussians = params
+        depth_w2c = w2c
+        if not torch.is_tensor(depth_w2c):
+            depth_w2c = torch.tensor(depth_w2c, dtype=torch.float32, device="cuda")
+        else:
+            depth_w2c = depth_w2c.to(device="cuda", dtype=torch.float32)
+
+    static_rendervar = transformed_params2rendervar(params, transformed_gaussians)
+    static_depth_sil_rendervar = transformed_params2depthplussilhouette(
+        params,
+        depth_w2c,
+        transformed_gaussians,
+    )
+    rendervar = static_rendervar
+    depth_sil_rendervar = static_depth_sil_rendervar
+
+    if has_dynamic_gaussians(dynamic_params):
+        if ba:
+            transformed_dynamic, active_dynamic = transform_dynamic_to_frame(
+                dynamic_params,
+                params,
+                time_idx,
+                gaussians_grad=gaussians_grad,
+                camera_grad=camera_grad,
+            )
+        else:
+            transformed_dynamic, active_dynamic = transform_dynamic_to_world(
+                dynamic_params,
+                time_idx,
+                gaussians_grad=gaussians_grad,
+            )
+        if transformed_dynamic is not None:
+            dynamic_rendervar = dynamic_params2rendervar(
+                dynamic_params,
+                transformed_dynamic,
+                active_dynamic,
+            )
+            dynamic_depth_sil_rendervar = dynamic_params2depthplussilhouette(
+                dynamic_params,
+                transformed_dynamic,
+                active_dynamic,
+                depth_w2c,
+            )
+            rendervar = merge_rendervars(rendervar, dynamic_rendervar)
+            depth_sil_rendervar = merge_rendervars(depth_sil_rendervar, dynamic_depth_sil_rendervar)
+
+    return rendervar, depth_sil_rendervar, static_rendervar, params["means3D"].shape[0]
+
+
+def deform_dynamic_objects(dynamic_params, pre_w2cs, after_c2ws):
+    if not has_dynamic_gaussians(dynamic_params) or "dyn_obj_trans" not in dynamic_params:
+        return dynamic_params
+
+    pre_w2cs = pre_w2cs.to(device="cuda", dtype=torch.float32)
+    after_c2ws = after_c2ws.to(device="cuda", dtype=torch.float32)
+    num_frames = min(dynamic_params["dyn_obj_trans"].shape[-1], pre_w2cs.shape[0], after_c2ws.shape[0])
+    if num_frames <= 0:
+        return dynamic_params
+
+    with torch.no_grad():
+        obj_trans = dynamic_params["dyn_obj_trans"].detach().clone()
+        obj_rots = dynamic_params["dyn_obj_unnorm_rots"].detach().clone()
+        for t_i in range(num_frames):
+            trans = obj_trans[:, :, t_i]
+            trans4 = torch.cat((trans, torch.ones(trans.shape[0], 1, device="cuda")), dim=1)
+            obj_camera = (pre_w2cs[t_i] @ trans4.T).T
+            obj_world = (after_c2ws[t_i] @ obj_camera.T).T[:, :3]
+            obj_trans[:, :, t_i] = obj_world
+
+            delta_rot = after_c2ws[t_i, :3, :3] @ pre_w2cs[t_i, :3, :3]
+            old_rots = build_rotation(F.normalize(obj_rots[:, :, t_i]))
+            new_rots = torch.matmul(delta_rot.unsqueeze(0), old_rots)
+            obj_rots[:, :, t_i] = matrix_to_quaternion(new_rots)
+
+    dynamic_params["dyn_obj_trans"] = torch.nn.Parameter(obj_trans.requires_grad_(True))
+    dynamic_params["dyn_obj_unnorm_rots"] = torch.nn.Parameter(obj_rots.requires_grad_(True))
+    return dynamic_params
+
+
+def make_refine_optimizer(params, dynamic_params, optimize_keys, static_lrs, dynamic_lrs):
+    param_groups = [
+        {'params': [v], 'name': k, 'lr': static_lrs[k]}
+        for k, v in params.items()
+        if k in optimize_keys
+    ]
+    if has_dynamic_gaussians(dynamic_params):
+        for key in DYNAMIC_TRAINABLE_KEYS:
+            if key in dynamic_params:
+                param_groups.append({
+                    'params': [dynamic_params[key]],
+                    'name': key,
+                    'lr': float(dynamic_lrs.get(key, static_lrs.get(_dynamic_to_static_lr_key(key), 0.0))),
+                })
+    return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+
+
+def _dynamic_to_static_lr_key(dynamic_key):
+    return {
+        "dyn_means3D_canon": "means3D",
+        "dyn_rgb_colors": "rgb_colors",
+        "dyn_unnorm_rotations": "unnorm_rotations",
+        "dyn_logit_opacities": "logit_opacities",
+        "dyn_log_scales": "log_scales",
+        "dyn_obj_unnorm_rots": "unnorm_rotations",
+        "dyn_obj_trans": "means3D",
+    }.get(dynamic_key, "")
+
+
 def compute_scene_radius(trajs):
     cam_centers = []
     for i in range(trajs.shape[0]):
@@ -467,7 +818,7 @@ def parse_args():
     )
     parser.add_argument(
         "--kitti_base_folder",
-        default=os.path.join(current_dir, "data", "kitti", "sequences"),
+        default="/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences",
         help="KITTI sequences root, only used when --dataset_type kitti.",
     )
     parser.add_argument(
@@ -564,12 +915,20 @@ if __name__ == "__main__":
     scene_name = args.scene_name
     dataset_type = args.dataset_type
     dataset_config, gradslam_data_cfg, image_folder_path, depth_folder_path = _load_dataset_settings(args)
+    dynamic_config_path = args.config_path or _default_config_path(dataset_type)
+    if dynamic_config_path is not None:
+        dynamic_4dgs_cfg = merge_dynamic_4dgs_config(
+            _load_experiment_config(dynamic_config_path).get("dynamic_4dgs", {})
+        )
+    else:
+        dynamic_4dgs_cfg = merge_dynamic_4dgs_config({})
 
     ba = args.ba
     if ba:
         optimize_keys = ['means3D', 'rgb_colors', 'unnorm_rotations', 'logit_opacities', 'log_scales', 'cam_trans', 'cam_unnorm_rots']
     else:
         optimize_keys = ['means3D', 'rgb_colors', 'unnorm_rotations', 'logit_opacities', 'log_scales']
+    load_optimize_keys = optimize_keys + DYNAMIC_TRAINABLE_KEYS
 
     overlap = args.overlap
     overlap_bound = args.overlap_bound
@@ -584,6 +943,7 @@ if __name__ == "__main__":
         cam_unnorm_rots=0.0000,
         cam_trans=0.000,
     )
+    dynamic_refine_lrs = dynamic_4dgs_cfg.get("lrs", {})
 
     structure_refine_lrs_decay1=dict(
         means3D=0.0001, # 0.0001 in euroc, 0.0008 in kitti
@@ -886,9 +1246,11 @@ if __name__ == "__main__":
         odo_scene_path = os.path.join(base_folder, odo_res_folder, 'params.npz')        
         if not is_last_part and overlap:
             next_part_path = os.path.join(base_folder, odo_res_folders[part_index+1], 'params.npz')
-            before_opt_w2cs, gt_w2cs, params = load_params_with_overlap(odo_scene_path, optimize_keys, next_part_path, overlap_bound, stride)
+            before_opt_w2cs, gt_w2cs, loaded_params = load_params_with_overlap(odo_scene_path, load_optimize_keys, next_part_path, overlap_bound, stride)
         else:
-            before_opt_w2cs, gt_w2cs, params = load_params(odo_scene_path, optimize_keys)
+            before_opt_w2cs, gt_w2cs, loaded_params = load_params(odo_scene_path, load_optimize_keys)
+
+        static_loaded_params, dynamic_params = split_static_dynamic_params(loaded_params)
 
         if dataset_type == 'kitti':
             gt_imgs, depths = load_imgs(image_folder_path, depth_folder_path, start_idx, end_idx + 1, stride)
@@ -907,15 +1269,15 @@ if __name__ == "__main__":
             )
             gt_imgs, depths = load_imgs_from_path_list(part_dataset.color_paths, part_dataset.depth_paths)
 
-        intrinsics = params['intrinsics'].cpu().numpy()
+        intrinsics = static_loaded_params['intrinsics'].cpu().numpy()
         assert intrinsics.shape == (3, 3)
-        variables = {'max_2D_radius': torch.zeros(params['means3D'].shape[0]).cuda().float(),
-                    'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
-                    'denom': torch.zeros(params['means3D'].shape[0]).cuda().float()}
+        variables = {'max_2D_radius': torch.zeros(static_loaded_params['means3D'].shape[0]).cuda().float(),
+                    'means2D_gradient_accum': torch.zeros(static_loaded_params['means3D'].shape[0]).cuda().float(),
+                    'denom': torch.zeros(static_loaded_params['means3D'].shape[0]).cuda().float()}
         variables['scene_radius'] = torch.tensor(30.0)/5.0
-        variables['timestep'] = params['timestep']
-        useless_params = {k: v for k, v in params.items() if k in ['intrinsics', 'org_height', 'org_width', 'w2c', 'gt_w2c_all_frames']}
-        params = {k: v for k, v in params.items() if k in optimize_keys}
+        variables['timestep'] = static_loaded_params['timestep']
+        useless_params = {k: v for k, v in static_loaded_params.items() if k in ['intrinsics', 'org_height', 'org_width', 'w2c', 'gt_w2c_all_frames', 'keyframe_time_indices']}
+        params = {k: v for k, v in static_loaded_params.items() if k in optimize_keys}
 
         if params['log_scales'].shape[1] == 1:
             if gaussians_distribution == 'anisotropic':
@@ -934,10 +1296,15 @@ if __name__ == "__main__":
 
                 w2c = before_opt_w2cs[i]
                 cam = setup_camera(color_gt.shape[2], color_gt.shape[1], intrinsics, w2c, depth_threshold=pixel_gs_depth_gamma*pixel_gs_scene_radius)
-                rendervar = transformed_params2rendervar(params, params)
-                w2c = torch.tensor(w2c, dtype=torch.float32, device='cuda')
-                depth_sil_rendervar = transformed_params2depthplussilhouette(params, w2c,
-                                                                         params)
+                rendervar, depth_sil_rendervar, _, _ = build_refine_rendervars(
+                    params,
+                    dynamic_params,
+                    i,
+                    w2c=w2c,
+                    ba=False,
+                    gaussians_grad=False,
+                    camera_grad=False,
+                )
                 im, radius, _, _ = Renderer(raster_settings=cam)(**rendervar)
                 # Render Depth & Silhouette
                 depth_sil, _, _, _ = Renderer(raster_settings=cam)(**depth_sil_rendervar)
@@ -976,6 +1343,7 @@ if __name__ == "__main__":
         every_gs_aft_c2ws = after_est_c2ws[variables['timestep'].to(torch.long)] # (n, 4, 4)
         gs_new_means3d = torch.bmm(every_gs_aft_c2ws, gs_camera.unsqueeze_(-1)).squeeze_(-1) # (n, 4)
         params['means3D'] = torch.nn.Parameter(gs_new_means3d[:, :3].cuda().float().contiguous().requires_grad_(True))
+        dynamic_params = deform_dynamic_objects(dynamic_params, pre_est_w2cs, after_est_c2ws)
 
 
         # save the pc when need to debug
@@ -1006,8 +1374,13 @@ if __name__ == "__main__":
                         params['cam_trans'][..., i] = rel_w2c_tran
 
         # structure refine 
-        param_groups = [{'params': [v], 'name': k, 'lr': structure_refine_lrs[k]} for k, v in params.items() if k in optimize_keys]
-        optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+        optimizer = make_refine_optimizer(
+            params,
+            dynamic_params,
+            optimize_keys,
+            structure_refine_lrs,
+            dynamic_refine_lrs,
+        )
 
         for i in tqdm(range(structure_refine_total_iters), 'Color refining...'):
 
@@ -1016,26 +1389,41 @@ if __name__ == "__main__":
             if not ba:
                 w2c = np.linalg.inv(optim_c2ws[index])
                 cam = setup_camera(color_gt.shape[2], color_gt.shape[1], intrinsics, w2c, depth_threshold=pixel_gs_depth_gamma*pixel_gs_scene_radius)
-                rendervar = transformed_params2rendervar(params, params)
+                rendervar, _, static_rendervar, static_count = build_refine_rendervars(
+                    params,
+                    dynamic_params,
+                    index,
+                    w2c=w2c,
+                    ba=False,
+                    gaussians_grad=True,
+                    camera_grad=False,
+                )
             else:
                 cam = setup_camera(color_gt.shape[2], color_gt.shape[1], intrinsics, np.eye(4), depth_threshold=pixel_gs_depth_gamma*pixel_gs_scene_radius)
-                transformed_gaussians = transform_to_frame(params, index,
-                                                    gaussians_grad=True,
-                                                    camera_grad=True)
-                rendervar = transformed_params2rendervar(params, transformed_gaussians)
+                rendervar, _, static_rendervar, static_count = build_refine_rendervars(
+                    params,
+                    dynamic_params,
+                    index,
+                    ba=True,
+                    gaussians_grad=True,
+                    camera_grad=True,
+                )
 
-            rendervar['means2D'].retain_grad()
+            static_rendervar['means2D'].retain_grad()
             im, radius, _, pixels, = Renderer(raster_settings=cam)(**rendervar)
-            variables['means2D'] = rendervar['means2D']  # Gradient only accum from color render for densification
+            static_radius = radius[:static_count]
+            static_pixels = pixels[:static_count]
+            variables['means2D'] = static_rendervar['means2D']  # Gradient only accum from color render for densification
             loss = 0.8 * l1_loss_v1(im, color_gt) + 0.2 * (1.0 - calc_ssim(im, color_gt))
 
             if use_min_scale_loss and gaussians_distribution == 'anisotropic' and i > min_scale_loss_warmup_iters:
                 scale_loss = compute_min_scale_loss(params)
+                scale_loss = scale_loss + compute_dynamic_min_scale_loss(dynamic_params)
                 loss += min_scale_loss_weight * scale_loss
             # print('Color_SSIM Loss: ' + str(loss), 'Scale Loss: ' + str(scale_loss))
 
-            seen = radius > 0
-            variables['max_2D_radius'][seen] = torch.max(radius[seen], variables['max_2D_radius'][seen])
+            seen = static_radius > 0
+            variables['max_2D_radius'][seen] = torch.max(static_radius[seen], variables['max_2D_radius'][seen])
             variables['seen'] = seen
 
             loss.backward()
@@ -1044,7 +1432,7 @@ if __name__ == "__main__":
 
                 if use_densify:
                     # params, variables = densify_with_bound(params, variables, optimizer, i, densify_dict, depth_filter_far, optim_c2ws)
-                    params, variables = densify_use_pixel_gs(params, variables, optimizer, i, densify_dict, pixels, split_explore_weight)
+                    params, variables = densify_use_pixel_gs(params, variables, optimizer, i, densify_dict, static_pixels, split_explore_weight)
                     if i <= densify_dict['stop_after'] and i % (structure_refine_total_iters//10) == 0:
                         Log("Number of Gaussians at iter {:05d}: ".format(i) + str(params['means3D'].shape[0]), tag='gaussian')
                 optimizer.step()
@@ -1067,18 +1455,25 @@ if __name__ == "__main__":
                 if not ba:
                     w2c = np.linalg.inv(optim_c2ws[i])
                     cam = setup_camera(color_gt.shape[2], color_gt.shape[1], intrinsics, w2c, depth_threshold=pixel_gs_depth_gamma*pixel_gs_scene_radius)
-                    rendervar = transformed_params2rendervar(params, params)
-                    w2c = torch.tensor(w2c, dtype=torch.float32, device='cuda')
-                    depth_sil_rendervar = transformed_params2depthplussilhouette(params, w2c,
-                                                                            params)
+                    rendervar, depth_sil_rendervar, _, _ = build_refine_rendervars(
+                        params,
+                        dynamic_params,
+                        i,
+                        w2c=w2c,
+                        ba=False,
+                        gaussians_grad=False,
+                        camera_grad=False,
+                    )
                 else:
                     cam = setup_camera(color_gt.shape[2], color_gt.shape[1], intrinsics, np.eye(4), depth_threshold=pixel_gs_depth_gamma*pixel_gs_scene_radius)
-                    transformed_gaussians = transform_to_frame(params, i,
-                                                    gaussians_grad=False,
-                                                    camera_grad=False)
-                    rendervar = transformed_params2rendervar(params, transformed_gaussians)
-                    depth_sil_rendervar = transformed_params2depthplussilhouette(params, torch.eye(4, dtype=torch.float32, device='cuda'),
-                                                                    transformed_gaussians)
+                    rendervar, depth_sil_rendervar, _, _ = build_refine_rendervars(
+                        params,
+                        dynamic_params,
+                        i,
+                        ba=True,
+                        gaussians_grad=False,
+                        camera_grad=False,
+                    )
 
                 im, radius, _, _ = Renderer(raster_settings=cam)(**rendervar)
                 # Render Depth & Silhouette
@@ -1113,6 +1508,8 @@ if __name__ == "__main__":
 
         for k, v in useless_params.items():
             params[k] = v
+        if dynamic_params:
+            params.update(dynamic_params)
         save_params(params, rendering_save_dir)
         print(pixel_gs_depth_gamma*pixel_gs_scene_radius)
 

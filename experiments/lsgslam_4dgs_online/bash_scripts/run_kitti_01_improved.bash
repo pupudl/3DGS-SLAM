@@ -1,8 +1,7 @@
 #!/bin/bash
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-code_path="$(cd "$script_dir/.." && pwd)"
-config_path="$code_path/configs/kitti/lsgslam_01_improved.py"
+code_path='/home/qiuyu/data/Projects/LSG-SLAM'
+config_path=$code_path'/configs/kitti/lsgslam_01_improved.py'
 
 scene_name='01'
 start=0

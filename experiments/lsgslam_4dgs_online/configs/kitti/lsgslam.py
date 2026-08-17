@@ -2,8 +2,6 @@ import os
 from os.path import join as p_join
 from datetime import datetime
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 scenes = ["01"]
 
 primary_device="cuda:0"
@@ -62,6 +60,14 @@ config = dict(
     opt_local_map=False,
     use_wandb=False,
     pixel_gs_depth_gamma=0.37,
+    dynamic_4dgs=dict(
+        enabled=True,
+        mask_root="",
+        num_iters=40,
+        min_component_area=64,
+        max_new_gaussians_per_component=1200,
+        association_dist_m=4.0,
+    ),
     wandb=dict(
         entity="",
         project="",
@@ -71,7 +77,7 @@ config = dict(
         eval_save_qual=True,
     ),
     data=dict(
-        basedir=os.path.join(PROJECT_ROOT, "data", "kitti", "sequences"),
+        basedir="/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences",
         # basedir="",
         gradslam_data_cfg=kitti_yaml,
         sequence=scene_name,

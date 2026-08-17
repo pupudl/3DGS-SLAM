@@ -19,8 +19,8 @@ kitti360_yaml = './configs/kitti360/kitti360.yaml'
 image_width = 1408
 image_height = 376
 
-start_idx = 2150
-end_idx = 2200
+start_idx = 2300
+end_idx = 2350
 stride = 2
 
 pose_init_method = "pnp_fused_icp"
@@ -54,11 +54,20 @@ config = dict(
     opt_local_map=False,
     use_wandb=False,
     pixel_gs_depth_gamma=0.37,
+    dynamic_4dgs=dict(
+        enabled=True,
+        mask_root="",
+        require_appearance_mask=True,
+        num_iters=100,
+        min_component_area=64,
+        max_new_gaussians_per_component=2400,
+        association_dist_m=4.0,
+    ),
     dynamic_mask=dict(
         enabled=True,
         output_subdir="dynamic_mask",
         fail_on_error=False,
-        require_lidar_residual=False,
+        require_lidar_residual=True,
         rigidmask=dict(
             enabled=True,
             repo_root=os.path.join(PROJECT_ROOT, "third_party", "rigidmask"),
@@ -100,9 +109,27 @@ config = dict(
             offload_after_use=True,
             require_appearance=True,
             use_mapping_render=True,
+            defer_fusion_until_appearance=True,
+        ),
+        fastsam=dict(
+            enabled=True,
+            repo_root="/home/qiuyu/data/Projects/LSG-SLAM/third_party/FastSAM",
+            checkpoint_path="/home/qiuyu/data/Projects/LSG-SLAM/checkpoints/FastSAM-x.pt",
+            source_image="anchor_rgb.png",
+            run_every=1,
+            imgsz=1024,
+            conf=0.4,
+            iou=0.9,
+            retina_masks=True,
+            save_visualization=True,
+            offload_after_use=False,
         ),
         fusion=dict(
             appearance_boost_alpha=0.5,
+            fastsam_enabled=True,
+            fastsam_min_overlap_fraction=0.2,
+            fastsam_min_score_mean=0.35,
+            fastsam_min_score_p90=0.55,
             save_diagnostics=True,
         ),
     ),
@@ -127,7 +154,7 @@ config = dict(
         eval_save_qual=True,
     ),
     data=dict(
-        basedir=os.path.join(PROJECT_ROOT, "data", "kitti360", "data_2d_raw"),
+        basedir="/home/qiuyu/data/Projects/LSG-SLAM/data/kitti360/data_2d_raw",
         gradslam_data_cfg=kitti360_yaml,
         sequence=scene_name,
         desired_image_height=image_height,
@@ -141,8 +168,6 @@ config = dict(
         use_gt_poses=False,
         forward_prop=True,
         num_iters=tracking_iters,
-        use_dynamic_mask=True,
-        dynamic_mask_min_static_ratio=0.05,
         use_sil_for_loss=True,
         sil_thres=0.99,
         use_l1=True,

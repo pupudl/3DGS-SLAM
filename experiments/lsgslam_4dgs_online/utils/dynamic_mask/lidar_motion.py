@@ -135,6 +135,7 @@ class LidarMotionProbe:
                     curr_nonground,
                     prev_nonground_xyzi,
                     curr_nonground_xyzi,
+                    prev_visible_xyzi,
                     curr_visible_xyzi,
                     filter_summary,
                 ) = self._filter_nonground_pair_with_xyzi(
@@ -159,6 +160,7 @@ class LidarMotionProbe:
                     **filter_summary,
                 }
                 image_path = self._image_path_for_time_idx(dataset, curr_time_idx, curr_frame_id)
+                prev_image_path = self._image_path_for_time_idx(dataset, prev_time_idx, prev_frame_id)
                 if self.cfg.get("save_static_projection_masks", True):
                     static_projection_summary = self._save_lidar_static_image_masks(
                         pair_dir,
@@ -167,6 +169,17 @@ class LidarMotionProbe:
                         image_path,
                     )
                     nonground_summary.update(static_projection_summary)
+                    prev_static_projection_summary = self._save_lidar_static_image_masks(
+                        pair_dir,
+                        prev_visible_xyzi,
+                        prev_nonground_xyzi,
+                        prev_image_path,
+                        output_filename="image_lidar_static_masks_prev.npz",
+                        output_prefix="prev_",
+                    )
+                    nonground_summary.update(
+                        {f"prev_target_{key}": value for key, value in prev_static_projection_summary.items()}
+                    )
                 #保存bev_residual_nonground_features.png和bev_features_nonground.png
                 if self.cfg.get("save_feature_residual", False):
                     #这个函数主要是为了保存bev_residual_nonground_features.png，只是顺带保存了bev_features_nonground.png和image_residual_nonground_features.png
@@ -182,6 +195,19 @@ class LidarMotionProbe:
                     )
                     nonground_summary.update(
                         {f"nonground_{k}": v for k, v in feature_residual_summary.items()}
+                    )
+                    prev_feature_residual_summary = self._save_bev_feature_residual(
+                        pair_dir,
+                        curr_nonground,
+                        prev_nonground,
+                        filename="bev_residual_nonground_features_prev.png",
+                        mask_filename="bev_features_nonground_prev.png",
+                        curr_xyzi=prev_nonground_xyzi,
+                        image_path=prev_image_path,
+                        projection_filename="image_residual_nonground_features_prev.png",
+                    )
+                    nonground_summary.update(
+                        {f"prev_target_nonground_{k}": v for k, v in prev_feature_residual_summary.items()}
                     )
 
             if self.cfg.get("save_npz", True):
@@ -323,6 +349,7 @@ class LidarMotionProbe:
             curr_bev[curr_keep],
             prev_xyzi[prev_keep],
             curr_xyzi[curr_keep],
+            prev_xyzi[prev_bev_visible],
             curr_xyzi[curr_bev_visible],
             summary,
         )
@@ -446,6 +473,8 @@ class LidarMotionProbe:
         curr_visible_xyzi,
         curr_nonground_xyzi,
         image_path,
+        output_filename="image_lidar_static_masks.npz",
+        output_prefix="",
     ):
         if image_path is None or not os.path.isfile(image_path):
             return {
@@ -511,10 +540,10 @@ class LidarMotionProbe:
             static_exclusion_mask = above_range_mask
             if self._save_visualizations():
                 outputs = {
-                    "image_lidar_visible_mask.png": visible_mask,
-                    "image_lidar_nonground_mask.png": nonground_mask,
-                    "image_lidar_above_range_mask.png": above_range_mask,
-                    "image_lidar_static_exclusion_mask.png": static_exclusion_mask,
+                    f"{output_prefix}image_lidar_visible_mask.png": visible_mask,
+                    f"{output_prefix}image_lidar_nonground_mask.png": nonground_mask,
+                    f"{output_prefix}image_lidar_above_range_mask.png": above_range_mask,
+                    f"{output_prefix}image_lidar_static_exclusion_mask.png": static_exclusion_mask,
                 }
                 for filename, mask in outputs.items():
                     cv2.imwrite(
@@ -522,7 +551,7 @@ class LidarMotionProbe:
                         mask.astype(np.uint8) * 255,
                     )
 
-            out_npz = os.path.join(pair_dir, "image_lidar_static_masks.npz")
+            out_npz = os.path.join(pair_dir, output_filename)
             np.savez_compressed(
                 out_npz,
                 visible_mask=visible_mask,

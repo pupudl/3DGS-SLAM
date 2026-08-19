@@ -29,6 +29,7 @@ def _parse_perspective_file(calibration_path):
     p_rect_00 = values["P_rect_00"].reshape(3, 4)
     p_rect_01 = values["P_rect_01"].reshape(3, 4)
     fx = float(p_rect_00[0, 0])
+    fy = float(p_rect_00[1, 1])
     cx = float(p_rect_00[0, 2])
     cy = float(p_rect_00[1, 2])
     tx0 = float(p_rect_00[0, 3] / p_rect_00[0, 0])
@@ -36,6 +37,7 @@ def _parse_perspective_file(calibration_path):
     baseline = abs(tx1 - tx0)
     return {
         "fx": fx,
+        "fy": fy,
         "cx": cx,
         "cy": cy,
         "baseline": baseline,
@@ -462,6 +464,16 @@ class RigidMaskFrontendProbe:
     ):
         os.makedirs(pair_dir, exist_ok=True)
         raw_arrays = {key: value.copy() for key, value in raw_arrays.items()}
+        if self.cfg.get("save_raw_tensors", True) and target_disp_input is not None:
+            target_disp_np = target_disp_input[0, 0].detach().cpu().numpy().astype(np.float32)
+            target_depth_metric_t, target_valid_disp_t = _compute_metric_depth_from_disp(
+                target_disp_input[0, 0],
+                self.calib,
+                min_disp=self.depth_mask_cfg.get("min_disp", 1e-6),
+            )
+            raw_arrays["disp_input_full"] = target_disp_np
+            raw_arrays["depth_metric_input_full"] = target_depth_metric_t.detach().cpu().numpy().astype(np.float32)
+            raw_arrays["valid_disp_input_full"] = target_valid_disp_t.detach().cpu().numpy().astype(np.uint8)
 
         depth_mask_summary = {
             "enabled": bool(self.depth_mask_cfg.get("enabled", False)),
@@ -610,6 +622,14 @@ class RigidMaskFrontendProbe:
             "cost_shape": list(results["cost_shape"]),
             "rot": results["rot"][0].detach().cpu().tolist(),
             "trans": results["trans"][0].detach().cpu().tolist(),
+            "calibration": {
+                "fx": float(self.calib["fx"]),
+                "fy": float(self.calib.get("fy", self.calib["fx"])),
+                "cx": float(self.calib["cx"]),
+                "cy": float(self.calib["cy"]),
+                "baseline": float(self.calib["baseline"]),
+            },
+            "image_shape": list(target_rgb_orig.shape[:2]),
             "depth_mask": depth_mask_summary,
             "lidar_pair_name": f"{int(counterpart_frame_id):010d}_{int(target_frame_id):010d}"
             if target_role == "current"
@@ -816,14 +836,15 @@ class RigidMaskFrontendProbe:
             None,
         ]
         disp_input = self._load_disp_input(reference_frame_id)
+        need_target_depth_tensors = self.cfg.get("save_raw_tensors", True) or self.depth_mask_cfg.get("enabled", False)
         depth_mask_disp_input = (
             self._load_disp_input(curr_frame_id)
-            if self.depth_mask_cfg.get("enabled", False)
+            if need_target_depth_tensors
             else None
         )
         reference_depth_mask_disp_input = (
-            self._load_disp_input(reference_frame_id)
-            if self.depth_mask_cfg.get("enabled", False)
+            disp_input
+            if need_target_depth_tensors
             else None
         )
 

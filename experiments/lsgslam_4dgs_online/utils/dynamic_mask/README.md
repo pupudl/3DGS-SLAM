@@ -27,6 +27,10 @@ Flow:
 5. `fusion.process_pair_dir()` runs once per target directory and fuses
    geometry, appearance, LiDAR residual scores, and optional FastSAM instance
    candidates into target-specific `dynamic_score.png` and `dynamic_mask.png`.
+   An optional SE(3) static-veto pass can then remove connected components
+   whose flow/depth correspondences are well explained by the SLAM tracking
+   background camera motion. If tracking poses are unavailable, it can fall
+   back to fitting the background from non-dynamic pixels.
 
 Default output location:
 
@@ -92,6 +96,28 @@ config["dynamic_mask"]["fusion"]["fastsam_enabled"] = True
 
 Use `config["dynamic_mask"]["require_fastsam"] = True` only when a frame should
 be skipped if FastSAM inference is unavailable.
+
+To remove static false positives from the fused dynamic mask, enable the
+component-level SE(3) veto. With `prefer_slam_pose=True`, the filter uses
+`w2c_counterpart @ inv(w2c_target)` from `params["cam_unnorm_rots"]` and
+`params["cam_trans"]` as the background SE(3):
+
+```python
+config["dynamic_mask"]["fusion"]["se3_static_veto"] = {
+    "enabled": True,
+    "prefer_slam_pose": True,
+    "fallback_to_background_pnp": True,
+    "bg_median_px": 3.0,
+    "bg_inlier_ratio": 0.70,
+    "rel_angle_deg": 1.5,
+    "rel_trans_m": 0.15,
+}
+```
+
+When `save_diagnostics=True`, the filter writes `se3_static_veto_mask.png`,
+`se3_static_keep_mask.png`, and `se3_component_labels.png` under the pair's
+`filters/` directory. Per-component decisions are recorded in
+`metadata/dynamic_fusion_summary.json`.
 
 This package intentionally does not include `depth_probe`, gaussian
 anomaly/prune, or `intersect_depth_gaussian_masks.py`.

@@ -19,8 +19,8 @@ kitti360_yaml = './configs/kitti360/kitti360.yaml'
 image_width = 1408
 image_height = 376
 
-start_idx = 2300
-end_idx = 2350
+start_idx = 7000
+end_idx = 7050
 stride = 2
 
 pose_init_method = "pnp_fused_icp"
@@ -62,6 +62,12 @@ config = dict(
         min_component_area=64,
         max_new_gaussians_per_component=2400,
         association_dist_m=4.0,
+        rigidmask_pose_init=dict(
+            enabled=True,
+            use_rotation=True,
+            use_translation=True,
+            max_translation_residual_m=5.0,
+        ),
     ),
     dynamic_mask=dict(
         enabled=True,
@@ -97,6 +103,8 @@ config = dict(
             compute_nonground_residual=True,
             save_visualizations=False,
             save_nonground_visualizations=False,
+            save_lidar_se3_points=True,
+            lidar_se3_points_filename="lidar_se3_points.npz",
         ),
         appearance=dict(
             enabled=True,
@@ -130,6 +138,45 @@ config = dict(
             fastsam_min_overlap_fraction=0.2,
             fastsam_min_score_mean=0.35,
             fastsam_min_score_p90=0.55,
+            lidar_se3_static_veto=dict(
+                enabled=True,
+                min_component_area=80,
+                min_lidar_points=25,
+                min_reference_points=200,
+                use_nonground_only=True,
+                fallback_to_visible_points=True,
+                bg_inlier_dist_m=0.35,
+                bg_inlier_ratio=0.65,
+                bg_median_dist_m=0.25,
+                object_icp=dict(
+                    enabled=True,
+                    min_points=30,
+                    max_corr_m=0.75,
+                    min_fitness=0.25,
+                    max_rmse_m=0.40,
+                    rel_angle_deg=2.0,
+                    rel_trans_m=0.25,
+                ),
+            ),
+            se3_static_veto=dict(
+                enabled=True,
+                min_component_area=80,
+                min_valid_points=50,
+                bg_inlier_px=3.0,
+                bg_inlier_ratio=0.70,
+                bg_median_px=3.0,
+                rel_angle_deg=1.5,
+                rel_trans_m=0.15,
+                prefer_slam_pose=True,
+                fallback_to_background_pnp=True,
+            ),
+            component_pose_init=dict(
+                enabled=True,
+                min_component_area=64,
+                min_valid_points=50,
+                min_inlier_ratio=0.20,
+                max_reproj_median_px=8.0,
+            ),
             save_diagnostics=True,
         ),
     ),

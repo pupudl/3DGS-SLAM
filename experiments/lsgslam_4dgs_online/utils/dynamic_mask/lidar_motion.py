@@ -180,6 +180,21 @@ class LidarMotionProbe:
                     nonground_summary.update(
                         {f"prev_target_{key}": value for key, value in prev_static_projection_summary.items()}
                     )
+                if self.cfg.get("save_lidar_se3_points", True):
+                    lidar_se3_summary = self._save_lidar_se3_points(
+                        pair_dir,
+                        prev_vis,
+                        curr_vis,
+                        prev_visible_xyzi,
+                        curr_visible_xyzi,
+                        prev_nonground,
+                        curr_nonground,
+                        prev_nonground_xyzi,
+                        curr_nonground_xyzi,
+                        image_path,
+                        prev_image_path,
+                    )
+                    nonground_summary.update(lidar_se3_summary)
                 #保存bev_residual_nonground_features.png和bev_features_nonground.png
                 if self.cfg.get("save_feature_residual", False):
                     #这个函数主要是为了保存bev_residual_nonground_features.png，只是顺带保存了bev_features_nonground.png和image_residual_nonground_features.png
@@ -578,6 +593,108 @@ class LidarMotionProbe:
                 "static_projection_status": "skipped_error",
                 "static_projection_image_path": image_path,
                 "static_projection_error": str(exc),
+            }
+
+    def _save_lidar_se3_points(
+        self,
+        pair_dir,
+        prev_visible_bev,
+        curr_visible_bev,
+        prev_visible_xyzi,
+        curr_visible_xyzi,
+        prev_nonground_bev,
+        curr_nonground_bev,
+        prev_nonground_xyzi,
+        curr_nonground_xyzi,
+        image_path,
+        prev_image_path,
+    ):
+        if image_path is None or not os.path.isfile(image_path):
+            return {
+                "lidar_se3_points_status": "skipped_missing_image",
+                "lidar_se3_points_image_path": image_path or "",
+            }
+        if prev_image_path is None or not os.path.isfile(prev_image_path):
+            return {
+                "lidar_se3_points_status": "skipped_missing_prev_image",
+                "lidar_se3_points_image_path": image_path or "",
+                "lidar_se3_points_prev_image_path": prev_image_path or "",
+            }
+        try:
+            import cv2
+        except ImportError as exc:
+            return {
+                "lidar_se3_points_status": "skipped_missing_cv2",
+                "lidar_se3_points_error": str(exc),
+            }
+
+        try:
+            image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"Could not read image: {image_path}")
+            prev_image = cv2.imread(prev_image_path, cv2.IMREAD_COLOR)
+            if prev_image is None:
+                raise ValueError(f"Could not read image: {prev_image_path}")
+
+            curr_visible_uv, curr_visible_valid, curr_visible_depth = self._project_velodyne_to_image(
+                curr_visible_xyzi[:, :3],
+                image.shape,
+            )
+            curr_nonground_uv, curr_nonground_valid, curr_nonground_depth = self._project_velodyne_to_image(
+                curr_nonground_xyzi[:, :3],
+                image.shape,
+            )
+            prev_visible_uv, prev_visible_valid, prev_visible_depth = self._project_velodyne_to_image(
+                prev_visible_xyzi[:, :3],
+                prev_image.shape,
+            )
+            prev_nonground_uv, prev_nonground_valid, prev_nonground_depth = self._project_velodyne_to_image(
+                prev_nonground_xyzi[:, :3],
+                prev_image.shape,
+            )
+            filename = self.cfg.get("lidar_se3_points_filename", "lidar_se3_points.npz")
+            out_npz = os.path.join(pair_dir, filename)
+            np.savez_compressed(
+                out_npz,
+                image_shape=np.asarray(image.shape[:2], dtype=np.int32),
+                curr_image_shape=np.asarray(image.shape[:2], dtype=np.int32),
+                prev_image_shape=np.asarray(prev_image.shape[:2], dtype=np.int32),
+                prev_visible_bev=prev_visible_bev.astype(np.float32),
+                curr_visible_bev=curr_visible_bev.astype(np.float32),
+                prev_visible_xyzi=prev_visible_xyzi.astype(np.float32),
+                curr_visible_xyzi=curr_visible_xyzi.astype(np.float32),
+                curr_visible_uv=curr_visible_uv.astype(np.float32),
+                curr_visible_depth=curr_visible_depth.astype(np.float32),
+                curr_visible_valid_projection=curr_visible_valid,
+                prev_visible_uv=prev_visible_uv.astype(np.float32),
+                prev_visible_depth=prev_visible_depth.astype(np.float32),
+                prev_visible_valid_projection=prev_visible_valid,
+                prev_nonground_bev=prev_nonground_bev.astype(np.float32),
+                curr_nonground_bev=curr_nonground_bev.astype(np.float32),
+                prev_nonground_xyzi=prev_nonground_xyzi.astype(np.float32),
+                curr_nonground_xyzi=curr_nonground_xyzi.astype(np.float32),
+                curr_nonground_uv=curr_nonground_uv.astype(np.float32),
+                curr_nonground_depth=curr_nonground_depth.astype(np.float32),
+                curr_nonground_valid_projection=curr_nonground_valid,
+                prev_nonground_uv=prev_nonground_uv.astype(np.float32),
+                prev_nonground_depth=prev_nonground_depth.astype(np.float32),
+                prev_nonground_valid_projection=prev_nonground_valid,
+            )
+            return {
+                "lidar_se3_points_status": "ok",
+                "lidar_se3_points_npz": out_npz,
+                "lidar_se3_points_visible_points": int(np.count_nonzero(curr_visible_valid)),
+                "lidar_se3_points_nonground_points": int(np.count_nonzero(curr_nonground_valid)),
+                "lidar_se3_points_prev_visible_points": int(np.count_nonzero(prev_visible_valid)),
+                "lidar_se3_points_prev_nonground_points": int(np.count_nonzero(prev_nonground_valid)),
+                "lidar_se3_points_reference_visible_points": int(prev_visible_bev.shape[0]),
+                "lidar_se3_points_reference_nonground_points": int(prev_nonground_bev.shape[0]),
+            }
+        except Exception as exc:
+            return {
+                "lidar_se3_points_status": "skipped_error",
+                "lidar_se3_points_image_path": image_path,
+                "lidar_se3_points_error": str(exc),
             }
 
     #保存bev_overlay.png和bev_overlay_nonground.png

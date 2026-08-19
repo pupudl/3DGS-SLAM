@@ -20,7 +20,7 @@ scene_names=(
 "${KITTI360_SCENE:-2013_05_28_drive_0000_sync},${KITTI360_START:-0},${KITTI360_END:--1},${KITTI360_STRIDE:-2},${KITTI360_WIDTH:-1408},${KITTI360_HEIGHT:-376},${KITTI360_YAML:-./configs/kitti360/kitti360.yaml}"
 )
 
-step="${KITTI360_STEP:-200}"
+step="${KITTI360_STEP:-50}"
 
 for j in 0;
 do 

@@ -76,6 +76,8 @@ DEFAULT_DYNAMIC_MASK_CFG = {
         "static_projection_point_radius": 3,
         "static_projection_top_row_percentile": 0.1,
         "static_projection_top_row_margin_px": 8.0,
+        "save_lidar_se3_points": True,
+        "lidar_se3_points_filename": "lidar_se3_points.npz",
         "save_feature_residual": True,
         "save_feature_residual_image_projection": True,
         "save_feature_residual_projection_npz": True,
@@ -173,6 +175,68 @@ DEFAULT_DYNAMIC_MASK_CFG = {
         "fastsam_min_score_p90": 0.55,
         "fastsam_min_area_cells": 32,
         "fastsam_max_area_fraction": 0.80,
+        "lidar_se3_static_veto": {
+            "enabled": False,
+            "filename": "lidar_se3_points.npz",
+            "use_nonground_only": True,
+            "fallback_to_visible_points": True,
+            "min_component_area": 80,
+            "max_components": 64,
+            "min_lidar_points": 25,
+            "min_reference_points": 200,
+            "component_association_radius_px": 2.0,
+            "bg_inlier_dist_m": 0.35,
+            "bg_inlier_ratio": 0.65,
+            "bg_median_dist_m": 0.25,
+            "object_icp": {
+                "enabled": True,
+                "min_points": 30,
+                "max_points": 1500,
+                "local_margin_m": 1.0,
+                "max_corr_m": 0.75,
+                "max_iteration": 30,
+                "min_fitness": 0.25,
+                "max_rmse_m": 0.40,
+                "rel_angle_deg": 2.0,
+                "rel_trans_m": 0.25,
+                "median_dist_m": 0.35,
+                "bg_vs_obj_median_ratio": 1.20,
+            },
+        },
+        "se3_static_veto": {
+            "enabled": False,
+            "min_component_area": 80,
+            "min_valid_points": 50,
+            "min_bg_points": 200,
+            "max_bg_points": 8000,
+            "max_obj_points": 3000,
+            "min_depth_m": 0.1,
+            "max_depth_m": 80.0,
+            "pnp_reproj_error_px": 4.0,
+            "bg_inlier_px": 3.0,
+            "bg_inlier_ratio": 0.70,
+            "bg_median_px": 3.0,
+            "obj_min_inlier_ratio": 0.35,
+            "rel_angle_deg": 1.5,
+            "rel_trans_m": 0.15,
+            "bg_vs_obj_median_ratio": 1.25,
+            "prefer_slam_pose": True,
+            "fallback_to_background_pnp": True,
+        },
+        "component_pose_init": {
+            "enabled": True,
+            "min_component_area": 64,
+            "max_components": 32,
+            "min_valid_points": 50,
+            "max_obj_points": 3000,
+            "min_depth_m": 0.1,
+            "max_depth_m": 80.0,
+            "pnp_reproj_error_px": 4.0,
+            "pnp_confidence": 0.995,
+            "pnp_iterations": 100,
+            "min_inlier_ratio": 0.20,
+            "max_reproj_median_px": 8.0,
+        },
         "save_diagnostics": False,
         "organize_outputs": True,
     },
@@ -202,6 +266,76 @@ def _resolve_project_path(path, project_root):
     if os.path.isabs(path):
         return path
     return os.path.join(project_root, path)
+
+
+def _quaternion_to_rotation_numpy(quat):
+    q = quat.detach().float().reshape(-1).cpu()
+    if q.numel() != 4:
+        return None
+    norm = torch.linalg.norm(q)
+    if float(norm.item()) <= 1e-12:
+        return None
+    q = (q / norm).numpy()
+    r, x, y, z = [float(value) for value in q]
+    return [
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - r * z), 2.0 * (x * z + r * y)],
+        [2.0 * (x * y + r * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - r * x)],
+        [2.0 * (x * z - r * y), 2.0 * (y * z + r * x), 1.0 - 2.0 * (x * x + y * y)],
+    ]
+
+
+def _camera_w2c_numpy_from_params(params, time_idx):
+    if params is None or "cam_unnorm_rots" not in params or "cam_trans" not in params:
+        return None
+    try:
+        num_frames = int(params["cam_unnorm_rots"].shape[-1])
+        time_idx = int(time_idx)
+        if time_idx < 0 or time_idx >= num_frames:
+            return None
+        rot = _quaternion_to_rotation_numpy(params["cam_unnorm_rots"][..., time_idx])
+        if rot is None:
+            return None
+        tran = params["cam_trans"][..., time_idx].detach().float().reshape(-1).cpu().numpy()
+        if tran.shape[0] != 3:
+            return None
+    except Exception:
+        return None
+    import numpy as np
+
+    w2c = np.eye(4, dtype=np.float64)
+    w2c[:3, :3] = np.asarray(rot, dtype=np.float64)
+    w2c[:3, 3] = tran.astype(np.float64)
+    return w2c
+
+
+def _slam_background_transform_for_target(params, target_record):
+    if params is None or target_record is None:
+        return None
+    target_time_idx = target_record.get("target_time_idx")
+    if target_time_idx is None:
+        return None
+    role = str(target_record.get("target_role", "current")).strip().lower()
+    target_time_idx = int(target_time_idx)
+    if role in ("current", "curr", "t"):
+        counterpart_time_idx = target_time_idx - 1
+    elif role in ("previous", "prev", "reference", "t-1"):
+        counterpart_time_idx = target_time_idx + 1
+    else:
+        return None
+    target_w2c = _camera_w2c_numpy_from_params(params, target_time_idx)
+    counterpart_w2c = _camera_w2c_numpy_from_params(params, counterpart_time_idx)
+    if target_w2c is None or counterpart_w2c is None:
+        return None
+    import numpy as np
+
+    target_to_counterpart = counterpart_w2c @ np.linalg.inv(target_w2c)
+    return {
+        "source": "slam_tracking_pose",
+        "target_time_idx": int(target_time_idx),
+        "counterpart_time_idx": int(counterpart_time_idx),
+        "target_role": role,
+        "target_to_counterpart": target_to_counterpart.tolist(),
+    }
 
 
 class DynamicMaskManager:
@@ -417,7 +551,7 @@ class DynamicMaskManager:
                 "fusion_status": "deferred",
             }
 
-        target_results = self._process_target_pair_dirs(target_records)
+        target_results = self._process_target_pair_dirs(target_records, params=params)
         if not target_results or not target_results.get("current", {}).get("fusion_ok", False):
             return {
                 "status": "skipped",
@@ -581,7 +715,7 @@ class DynamicMaskManager:
                 "fusion_status": "disabled",
             }
 
-        target_results = self._process_target_pair_dirs(target_records)
+        target_results = self._process_target_pair_dirs(target_records, params=params)
         if not target_results or not target_results.get("current", {}).get("fusion_ok", False):
             return {
                 "status": "skipped",
@@ -712,8 +846,9 @@ class DynamicMaskManager:
         data_cfg.setdefault("basedir", getattr(self.dataset, "basedir", None) or getattr(self.dataset, "input_folder", ""))
         return data_cfg
 
-    def _process_pair_dir(self, pair_dir):
+    def _process_pair_dir(self, pair_dir, params=None, target_record=None):
         fusion_cfg = self.cfg["fusion"]
+        slam_background_transform = _slam_background_transform_for_target(params, target_record)
         return process_pair_dir(
             pair_dir=pair_dir,
             mask_percentile=fusion_cfg["mask_percentile"],
@@ -761,6 +896,10 @@ class DynamicMaskManager:
             fastsam_min_score_p90=fusion_cfg.get("fastsam_min_score_p90", 0.55),
             fastsam_min_area_cells=fusion_cfg.get("fastsam_min_area_cells", 32),
             fastsam_max_area_fraction=fusion_cfg.get("fastsam_max_area_fraction", 0.80),
+            lidar_se3_static_veto=fusion_cfg.get("lidar_se3_static_veto", {}),
+            se3_static_veto=fusion_cfg.get("se3_static_veto", {}),
+            component_pose_init=fusion_cfg.get("component_pose_init", {}),
+            slam_background_transform=slam_background_transform,
             save_diagnostics=fusion_cfg.get("save_diagnostics", False),
             organize_outputs=fusion_cfg.get("organize_outputs", True),
         )
@@ -836,12 +975,12 @@ class DynamicMaskManager:
             },
         ]
 
-    def _process_target_pair_dirs(self, target_records):
+    def _process_target_pair_dirs(self, target_records, params=None):
         results = {}
         for target in target_records:
             role = str(target.get("target_role", "current"))
             pair_dir = Path(target["pair_dir"])
-            fusion_summary = self._process_pair_dir(pair_dir)
+            fusion_summary = self._process_pair_dir(pair_dir, params=params, target_record=target)
             mask_path = find_pair_file(pair_dir, "dynamic_mask.png")
             summary_path = find_pair_file(pair_dir, "dynamic_fusion_summary.json")
             results[role] = {

@@ -5,6 +5,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .lidar_se3_filter import refine_mask_with_lidar_se3_static_veto
+from .se3_filter import estimate_component_motion_poses, refine_mask_with_se3_static_veto
+
 
 PAIR_OUTPUT_GROUPS = {
     "inputs": {
@@ -32,6 +35,12 @@ PAIR_OUTPUT_GROUPS = {
         "lidar_static_exclusion_mask.png",
         "lidar_above_range_mask.png",
         "lidar_visible_mask.png",
+        "lidar_se3_static_veto_mask.png",
+        "lidar_se3_static_keep_mask.png",
+        "lidar_se3_component_labels.png",
+        "se3_static_veto_mask.png",
+        "se3_static_keep_mask.png",
+        "se3_component_labels.png",
     },
     "dynamic": {
         "dynamic_score.png",
@@ -54,6 +63,7 @@ PAIR_OUTPUT_GROUPS = {
     "metadata": {
         "rigidmask_frontend_summary.json",
         "fastsam_summary.json",
+        "dynamic_component_poses.json",
         "dynamic_fusion_summary.json",
     },
 }
@@ -975,6 +985,10 @@ def process_pair_dir(
     fastsam_min_score_p90=0.55,
     fastsam_min_area_cells=32,
     fastsam_max_area_fraction=0.80,
+    lidar_se3_static_veto=None,
+    se3_static_veto=None,
+    component_pose_init=None,
+    slam_background_transform=None,
     save_diagnostics=False,
     organize_outputs=True,
 ):
@@ -1057,6 +1071,7 @@ def process_pair_dir(
         "enabled": bool(lidar_static_mask_enabled),
         "status": "disabled",
     }
+    lidar_se3_static_veto_enabled = bool((lidar_se3_static_veto or {}).get("enabled", False))
     lidar_static_exclusion_mask = None
     lidar_above_range_mask = None
     lidar_visible_mask = None
@@ -1273,8 +1288,70 @@ def process_pair_dir(
         if fastsam_instance_mask is not None:
             fastsam_instance_mask = fastsam_instance_mask * final_mask_filter.astype(np.float32)
 
+    lidar_se3_static_veto_summary = {
+        "enabled": lidar_se3_static_veto_enabled,
+        "status": "disabled",
+    }
+    lidar_se3_static_veto_diagnostics = {}
+    if lidar_se3_static_veto_enabled:
+        lidar_pair_dir = lidar_projection.get("pair_dir") if lidar_projection is not None else None
+        if lidar_pair_dir is None:
+            lidar_pair_dir, _lidar_pair_load_error = find_lidar_motion_pair_dir_for_pair(
+                pair_dir,
+                summary,
+                lidar_motion_subdir,
+            )
+        mask_before_lidar_se3 = mask.copy()
+        mask, lidar_se3_static_veto_summary, lidar_se3_static_veto_diagnostics = refine_mask_with_lidar_se3_static_veto(
+            mask,
+            lidar_pair_dir,
+            cfg=lidar_se3_static_veto,
+            target_role=summary.get("target_role", summary.get("cost_coordinate_frame", "current")),
+        )
+        if lidar_se3_static_veto_summary.get("status") == "ok":
+            veto_mask = lidar_se3_static_veto_diagnostics.get("veto_mask")
+            if veto_mask is not None:
+                score[veto_mask.astype(bool)] = 0.0
+                if fastsam_instance_mask is not None:
+                    fastsam_instance_mask = fastsam_instance_mask * (~veto_mask.astype(bool)).astype(np.float32)
+        else:
+            mask = mask_before_lidar_se3
+
+    se3_static_veto_summary = {
+        "enabled": bool((se3_static_veto or {}).get("enabled", False)),
+        "status": "disabled",
+    }
+    se3_static_veto_diagnostics = {}
+    if (se3_static_veto or {}).get("enabled", False):
+        mask_before_se3 = mask.copy()
+        mask, se3_static_veto_summary, se3_static_veto_diagnostics = refine_mask_with_se3_static_veto(
+            mask,
+            arrays,
+            summary,
+            cfg=se3_static_veto,
+            background_transform=slam_background_transform,
+        )
+        if se3_static_veto_summary.get("status") == "ok":
+            veto_mask = se3_static_veto_diagnostics.get("veto_mask")
+            if veto_mask is not None:
+                score[veto_mask.astype(bool)] = 0.0
+                if fastsam_instance_mask is not None:
+                    fastsam_instance_mask = fastsam_instance_mask * (~veto_mask.astype(bool)).astype(np.float32)
+        else:
+            mask = mask_before_se3
+
     score_full = resize_to_image(score, preview_shape)
     mask_full = resize_to_image(mask, preview_shape)
+
+    component_pose_summary = estimate_component_motion_poses(
+        mask_full,
+        arrays,
+        summary,
+        cfg=component_pose_init,
+    )
+    if component_pose_summary.get("enabled", False):
+        with open(pair_output_path(pair_dir, "dynamic_component_poses.json", organize_outputs), "w", encoding="utf-8") as handle:
+            json.dump(component_pose_summary, handle, indent=2)
 
     save_gray_image(pair_output_path(pair_dir, "dynamic_score.png", organize_outputs), score_full)
     save_gray_image(pair_output_path(pair_dir, "dynamic_mask.png", organize_outputs), mask_full)
@@ -1322,6 +1399,38 @@ def process_pair_dir(
                 pair_output_path(pair_dir, "fastsam_instance_mask.png", organize_outputs),
                 resize_to_image(fastsam_instance_mask, preview_shape),
             )
+        if lidar_se3_static_veto_diagnostics:
+            if "veto_mask" in lidar_se3_static_veto_diagnostics:
+                save_gray_image(
+                    pair_output_path(pair_dir, "lidar_se3_static_veto_mask.png", organize_outputs),
+                    resize_to_image(lidar_se3_static_veto_diagnostics["veto_mask"], preview_shape),
+                )
+            if "kept_mask" in lidar_se3_static_veto_diagnostics:
+                save_gray_image(
+                    pair_output_path(pair_dir, "lidar_se3_static_keep_mask.png", organize_outputs),
+                    resize_to_image(lidar_se3_static_veto_diagnostics["kept_mask"], preview_shape),
+                )
+            if "component_labels" in lidar_se3_static_veto_diagnostics:
+                save_gray_image(
+                    pair_output_path(pair_dir, "lidar_se3_component_labels.png", organize_outputs),
+                    resize_to_image(lidar_se3_static_veto_diagnostics["component_labels"], preview_shape),
+                )
+        if se3_static_veto_diagnostics:
+            if "veto_mask" in se3_static_veto_diagnostics:
+                save_gray_image(
+                    pair_output_path(pair_dir, "se3_static_veto_mask.png", organize_outputs),
+                    resize_to_image(se3_static_veto_diagnostics["veto_mask"], preview_shape),
+                )
+            if "kept_mask" in se3_static_veto_diagnostics:
+                save_gray_image(
+                    pair_output_path(pair_dir, "se3_static_keep_mask.png", organize_outputs),
+                    resize_to_image(se3_static_veto_diagnostics["kept_mask"], preview_shape),
+                )
+            if "component_labels" in se3_static_veto_diagnostics:
+                save_gray_image(
+                    pair_output_path(pair_dir, "se3_component_labels.png", organize_outputs),
+                    resize_to_image(se3_static_veto_diagnostics["component_labels"], preview_shape),
+                )
     if appearance_score is not None and similarity_score is not None:
         save_gray_image(
             pair_output_path(pair_dir, "appearance_score.png", organize_outputs),
@@ -1352,6 +1461,15 @@ def process_pair_dir(
         "fastsam_fusion": {
             **fastsam_load_summary,
             "refinement": fastsam_refine_summary,
+        },
+        "lidar_se3_static_veto": lidar_se3_static_veto_summary,
+        "se3_static_veto": se3_static_veto_summary,
+        "component_pose_init": {
+            "enabled": bool(component_pose_summary.get("enabled", False)),
+            "status": component_pose_summary.get("status", "disabled"),
+            "num_components": int(component_pose_summary.get("num_components", 0)),
+            "num_ok": int(component_pose_summary.get("num_ok", 0)),
+            "filename": "dynamic_component_poses.json",
         },
         "force_empty_mask": force_empty_mask,
         "force_empty_mask_pre_lidar": force_empty_pre_lidar,

@@ -1,0 +1,329 @@
+import os
+from os.path import join as p_join
+from datetime import datetime
+
+EXPERIMENT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(EXPERIMENT_ROOT))
+PROJECT_ROOT = EXPERIMENT_ROOT
+
+
+def _project_path(*parts):
+    for root in (EXPERIMENT_ROOT, REPO_ROOT):
+        path = os.path.join(root, *parts)
+        if os.path.exists(path):
+            return path
+    return os.path.join(EXPERIMENT_ROOT, *parts)
+
+scenes = ["01"]
+
+primary_device="cuda:0"
+seed = 0
+scene_name = '00'
+
+map_every = 1
+keyframe_every = 1
+mapping_window_size = 24 #default: 24
+
+tracking_iters = 100
+mapping_iters = 100
+
+kitti_yaml = './configs/kitti/kitti00-02.yaml'
+image_width = 1241
+image_height = 376
+
+start_idx = 200
+end_idx = 250
+stride = 2
+
+pose_init_method = "pnp_fused_icp"
+#pose_init_method = "pnp_icp"
+
+group_name = "kitti00-new"
+# ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+# run_name = f"{scene_name}_{seed}"
+# run_name = f"{scene_name}"
+run_name = f"{scene_name}_{start_idx}_{end_idx}_{stride}"
+# run_name = run_name + '_' + ts
+
+config = dict(
+    workdir=os.path.join("results", group_name),
+    run_name=run_name,
+    scene_path=f'',
+    seed=seed,
+    primary_device=primary_device,
+    map_every=map_every, # Mapping every nth frame
+    keyframe_every=keyframe_every, # Keyframe every nth frame
+    mapping_window_size=mapping_window_size, # Mapping window size
+    report_global_progress_every=500, # Report Global Progress every nth frame
+    eval_every=1, # Evaluate every nth frame (at end of SLAM)
+    scene_radius_depth_ratio=3, # Max First Frame Depth to Scene Radius Ratio (For Pruning/Densification)
+    mean_sq_dist_method="projective", # ["projective", "knn"] (Type of Mean Squared Distance Calculation for Scale of Gaussians)
+    gaussian_distribution="anisotropic", # ["isotropic", "anisotropic"] (Isotropic -> Spherical Covariance, Anisotropic -> Ellipsoidal Covariance)
+    report_iter_progress=False,
+    load_checkpoint=False,
+    checkpoint_time_idx=0,
+    save_checkpoints=False, # Save Checkpoints
+    checkpoint_interval=100, # Checkpoint Interval
+    pose_init_method=pose_init_method,
+    use_warp_loss=True,
+    weight_warp=10,
+    # weight_warp=100,
+    use_grad_mask=False,
+    opt_local_map=False,
+    use_wandb=False,
+    pixel_gs_depth_gamma=0.37,
+    dynamic_4dgs=dict(
+        enabled=True,
+        mask_root="",
+        require_appearance_mask=True,
+        num_iters=100,
+        window=dict(
+            min_score=0.05,
+            use_mask_confidence=True,
+            weight_power=1.0,
+            weight_epsilon=1e-8,
+        ),
+        min_component_area=64,
+        max_new_gaussians_per_component=2400,
+        association_dist_m=4.0,
+        rigidmask_pose_init=dict(
+            enabled=True,
+            use_rotation=True,
+            use_translation=True,
+            max_translation_residual_m=5.0,
+        ),
+    ),
+    dynamic_mask=dict(
+        enabled=True,
+        output_subdir="dynamic_mask",
+        minimal_storage=True,
+        fail_on_error=False,
+        require_lidar_residual=True,
+        rigidmask=dict(
+            enabled=True,
+            repo_root=_project_path("third_party", "rigidmask"),
+            checkpoint_path=_project_path("third_party", "rigidmask", "weights", "rigidmask-kitti", "weights.pth"),
+            calibration_path=os.path.join(_project_path("data", "kitti", "sequences"), scene_name, "calib.txt"),
+            disparity_dir="disparity_sceneflow",
+            sensor="stereo",
+            use_opencv_essential_mat=True,
+            save_raw_tensors=True,
+            save_visualizations=False,
+            save_input_rgbs=True,
+            depth_mask=dict(
+                enabled=True,
+                min_depth_m=0.5,
+                max_depth_m=30.0,
+                mask_sky=True,
+                apply_stage="post_dynamic_mask",
+                save_visualizations=False,
+                save_raw_tensors=True,
+            ),
+        ),
+        lidar_residual=dict(
+            enabled=True,
+            gndnet_repo_root=_project_path("third_party", "GndNet"),
+            gndnet_checkpoint_path=_project_path("third_party", "GndNet", "trained_models", "checkpoint.pth.tar"),
+            gndnet_config_path=_project_path("third_party", "GndNet", "config", "config_kittiSem.yaml"),
+            compute_nonground_residual=True,
+            save_visualizations=False,
+            save_nonground_visualizations=False,
+            save_lidar_se3_points=True,
+            lidar_se3_points_filename="lidar_se3_points.npz",
+        ),
+        appearance=dict(
+            enabled=True,
+            checkpoint_path=_project_path("checkpoints", "dinov2_reg_small_finetuned.pth"),
+            output_subdir="appearance_similarity",
+            save_raw_tensors=True,
+            save_feature_tensors=False,
+            save_visualizations=False,
+            save_input_rgbs=False,
+            offload_after_use=True,
+            require_appearance=True,
+            use_mapping_render=True,
+            defer_fusion_until_appearance=True,
+        ),
+        fastsam=dict(
+            enabled=True,
+            mode="precomputed",
+            precomputed_subdir="fastsam_masks",
+            require_precomputed=True,
+            run_every=1,
+        ),
+        fusion=dict(
+            appearance_boost_alpha=0.5,
+            fastsam_enabled=True,
+            fastsam_min_overlap_fraction=0.2,
+            fastsam_min_score_mean=0.35,
+            fastsam_min_score_p90=0.55,
+            lidar_se3_static_veto=dict(
+                enabled=True,
+                min_component_area=80,
+                min_lidar_points=25,
+                min_reference_points=200,
+                use_nonground_only=True,
+                fallback_to_visible_points=True,
+                bg_inlier_dist_m=0.25,
+                bg_inlier_ratio=0.85,
+                bg_median_dist_m=0.15,
+                bg_p90_dist_m=0.35,
+                object_icp=dict(
+                    enabled=True,
+                    min_points=30,
+                    max_corr_m=0.50,
+                    min_fitness=0.45,
+                    max_rmse_m=0.25,
+                    median_dist_m=0.20,
+                    rel_angle_deg=1.0,
+                    rel_trans_m=0.10,
+                    bg_vs_obj_median_ratio=0.80,
+                ),
+            ),
+            se3_static_veto=dict(
+                enabled=True,
+                min_component_area=80,
+                min_valid_points=50,
+                bg_inlier_px=3.0,
+                bg_inlier_ratio=0.70,
+                bg_median_px=3.0,
+                rel_angle_deg=1.5,
+                rel_trans_m=0.15,
+                prefer_slam_pose=True,
+                fallback_to_background_pnp=True,
+                edge_guard_enabled=True,
+                edge_guard_min_static_edge_iou=0.45,
+                edge_guard_max_static_symdiff_ratio=0.10,
+                edge_guard_splat_radius=1,
+                edge_guard_edge_width=2,
+            ),
+            component_pose_init=dict(
+                enabled=True,
+                min_component_area=64,
+                min_valid_points=50,
+                min_inlier_ratio=0.20,
+                max_reproj_median_px=8.0,
+            ),
+            save_diagnostics=True,
+        ),
+    ),
+    sky_mask=dict(
+        enabled=True,
+        backend="precomputed_png",
+        precomputed_subdir="sky_masks",
+        allow_missing_mask=False,
+        save_mask_vis=False,
+        cache_predictions=False,
+    ),
+    wandb=dict(
+        entity="",
+        project="",
+        group=group_name,
+        name=run_name,
+        save_qual=False,
+        eval_save_qual=True,
+    ),
+    data=dict(
+        basedir=_project_path("data", "kitti", "sequences"),
+        # basedir="",
+        gradslam_data_cfg=kitti_yaml,
+        sequence=scene_name,
+        desired_image_height=image_height,
+        desired_image_width=image_width,
+        start=start_idx,
+        end=end_idx,
+        stride=stride,
+        num_frames=-1,
+    ),
+    tracking=dict(
+        use_gt_poses=False, # Use GT Poses for Tracking
+        forward_prop=True, # Forward Propagate Poses
+        num_iters=tracking_iters,
+        use_sil_for_loss=True,
+        sil_thres=0.99,
+        use_l1=True,
+        ignore_outlier_depth_loss=False,
+        icp_corr_threshold=0.5,
+        fused_lidar_max_points=120000,
+        lidar_min_forward_m=0.0,
+        lidar_max_forward_m=0.0,
+        loss_weights=dict(
+            im=1.0,
+            depth=0.2,
+        ),
+        lrs=dict(
+            means3D=0.0,
+            rgb_colors=0.0,
+            unnorm_rotations=0.0,
+            logit_opacities=0.0,
+            log_scales=0.0,
+            cam_unnorm_rots=0.0004,
+            cam_trans=0.002,
+        ),
+    ),
+    mapping=dict(
+        num_iters=mapping_iters,
+        covisibility=dict(
+            min_score=0.10,
+            relative_score_ratio=0.40,
+            sample_pixels=1600,
+            depth_abs_tolerance=0.20,
+            depth_rel_tolerance=0.05,
+            edge=20,
+            weight_power=1.0,
+            weight_epsilon=1e-8,
+        ),
+        add_new_gaussians=True,
+        sil_thres=0.5, # For Addition of new Gaussians
+        use_l1=True,
+        use_sil_for_loss=False,
+        ignore_outlier_depth_loss=False,
+        loss_weights=dict(
+            im=0.5,
+            depth=1.0,
+        ),
+        lrs=dict(
+            means3D=0.0001,
+            rgb_colors=0.0025,
+            unnorm_rotations=0.001,
+            logit_opacities=0.05,
+            log_scales=0.001,
+            cam_unnorm_rots=0.0000,
+            cam_trans=0.0000,
+        ),
+        prune_gaussians=True, # Prune Gaussians during Mapping
+        pruning_dict=dict( # Needs to be updated based on the number of mapping iterations
+            start_after=0,
+            remove_big_after=0,
+            stop_after=20,
+            prune_every=20,
+            removal_opacity_threshold=0.005,
+            final_removal_opacity_threshold=0.005,
+            reset_opacities=False,
+            reset_opacities_every=500, # Doesn't consider iter 0
+        ),
+        use_gaussian_splatting_densification=False, # Use Gaussian Splatting-based Densification during Mapping
+        densify_dict=dict( # Needs to be updated based on the number of mapping iterations
+            start_after=500,
+            remove_big_after=3000,
+            stop_after=5000,
+            densify_every=100,
+            grad_thresh=0.0002,
+            num_to_split_into=2,
+            removal_opacity_threshold=0.005,
+            final_removal_opacity_threshold=0.005,
+            reset_opacities_every=3000, # Doesn't consider iter 0
+        ),
+    ),
+    viz=dict(
+        render_mode='centers', # ['color', 'depth' or 'centers']
+        offset_first_viz_cam=True, # Offsets the view camera back by 0.5 units along the view direction (For Final Recon Viz)
+        show_sil=False, # Show Silhouette instead of RGB
+        visualize_cams=True, # Visualize Camera Frustums and Trajectory
+        viz_w=2560, viz_h=1600, # 2560*1600 default: viz_w=600, viz_h=340,
+        viz_near=0.01, viz_far=100.0,
+        view_scale=2,
+        viz_fps=5, # FPS for Online Recon Viz
+        enter_interactive_post_online=False, # Enter Interactive Mode after Online Recon Viz
+    ),
+)

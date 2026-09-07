@@ -1,0 +1,14 @@
+name: lsgslam
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - defaults
+dependencies:
+  - python=3.10
+  - aria2
+  - ninja
+  - opencv
+  - numpy=1.26.4
+prefix: /home/qiuyu/miniconda3/envs/lsgslam

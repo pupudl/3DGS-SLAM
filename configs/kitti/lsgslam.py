@@ -19,8 +19,8 @@ kitti_yaml = './configs/kitti/kitti00-02.yaml'
 image_width = 1241
 image_height = 376
 
-start_idx = 200
-end_idx = 250
+start_idx = 50
+end_idx = 100
 stride = 2
 
 pose_init_method = "pnp_fused_icp"

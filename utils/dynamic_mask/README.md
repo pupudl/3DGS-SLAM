@@ -18,10 +18,11 @@ Flow:
    extra evidence rather than a hard dependency by default, so frame `0` and
    frames with missing LiDAR projections still produce geometry/appearance
    masks.
-3. `AppearanceSimilarityProbe` compares the mapping render pair for frame `t`
-   with the RGB frame, matching the `stage1_feature_probe` similarity input
-   used by the experiment branch. If a render pair is unavailable, it falls back
-   to rendering frame `t` directly.
+3. `AppearanceSimilarityProbe` compares the pre-mapping static-map render for
+   frame `t` with that frame's RGB image. For `t > 0`, this render is produced
+   from the static map built before the current frame is densified or optimized,
+   so current-frame dynamic content is not explained away by new Gaussians. If a
+   render pair is unavailable, it falls back to rendering frame `t` directly.
 4. `fusion.process_pair_dir()` fuses geometry, appearance, and LiDAR residual
    scores into `dynamic_score.png` and `dynamic_mask.png`.
 

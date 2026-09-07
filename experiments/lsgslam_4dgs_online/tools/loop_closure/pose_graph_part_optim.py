@@ -7,6 +7,7 @@ import cv2
 import copy
 import time
 import math
+import re
 import matplotlib.pyplot as plt
 import gtsam
 import csv
@@ -23,8 +24,18 @@ import torchvision.transforms as transforms
 import rich
 from PIL import Image
 from importlib.machinery import SourceFileLoader
-current_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../")
+current_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../"))
+repo_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.append(current_dir)
+
+
+def _project_path(*parts):
+    for root in (current_dir, repo_root):
+        path = os.path.join(root, *parts)
+        if os.path.exists(path):
+            return path
+    return os.path.join(current_dir, *parts)
+
 from natsort import natsorted
 from matplotlib.animation import FFMpegWriter
 from utils.slam_external import build_rotation, calc_ssim, calc_psnr, densify, densify_with_bound, densify_use_pixel_gs
@@ -818,7 +829,7 @@ def parse_args():
     )
     parser.add_argument(
         "--kitti_base_folder",
-        default="/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences",
+        default=_project_path("data", "kitti", "sequences"),
         help="KITTI sequences root, only used when --dataset_type kitti.",
     )
     parser.add_argument(
@@ -1014,13 +1025,24 @@ if __name__ == "__main__":
     res_folders = os.listdir(base_folder)
     odo_res_folders = []
     loop_res_folders = []
+    skipped_odo_res_folders = []
+    scene_chunk_pattern = re.compile(rf"^{re.escape(scene_name)}_(\d+)_(\d+)_(\d+)$")
     for res_folder in res_folders:
         if scene_name not in res_folder:
             continue
         if 'loop' in res_folder:
             loop_res_folders.append(res_folder)
         else:
-            odo_res_folders.append(res_folder)
+            if scene_chunk_pattern.match(res_folder) is None:
+                skipped_odo_res_folders.append(res_folder)
+                continue
+            params_path = os.path.join(base_folder, res_folder, 'params.npz')
+            if os.path.exists(params_path):
+                odo_res_folders.append(res_folder)
+            else:
+                skipped_odo_res_folders.append(res_folder)
+    if skipped_odo_res_folders:
+        print("Skip invalid or incomplete odometry folders:", skipped_odo_res_folders)
     
     if len(loop_res_folders) == 0:
         raise RuntimeError(

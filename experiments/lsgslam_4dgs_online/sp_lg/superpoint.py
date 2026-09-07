@@ -40,8 +40,26 @@
 # --------------------------------------------------------------------*/
 # %BANNER_END%
 
+from pathlib import Path
+
 import torch
 from torch import nn
+
+
+def _find_weight_file(filename):
+    sp_lg_dir = Path(__file__).resolve().parents[3] / "sp_lg"
+    candidates = [
+        sp_lg_dir / filename,
+        Path(__file__).resolve().parent / filename,
+        Path.cwd() / "sp_lg" / filename,
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"Could not find {filename}. Tried: "
+        + ", ".join(str(path) for path in candidates)
+    )
 
 
 def simple_nms(scores, nms_radius: int):
@@ -136,8 +154,8 @@ class SuperPoint(nn.Module):
         # url = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"
         # self.load_state_dict(torch.hub.load_state_dict_from_url(url))
 
-        ckpt = 'sp_lg/superpoint_v1.pth'
-        checkpoint = torch.load(ckpt)
+        ckpt = _find_weight_file('superpoint_v1.pth')
+        checkpoint = torch.load(str(ckpt))
         self.load_state_dict(checkpoint)
 
         mk = self.config['max_num_keypoints']

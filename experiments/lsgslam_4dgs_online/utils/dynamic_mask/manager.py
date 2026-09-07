@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 from pathlib import Path
 
 import cv2
@@ -17,6 +18,7 @@ from .rigidmask_frontend import RigidMaskFrontendProbe
 DEFAULT_DYNAMIC_MASK_CFG = {
     "enabled": False,
     "output_subdir": "dynamic_mask",
+    "minimal_storage": False,
     "fail_on_error": False,
     "require_lidar_residual": False,
     "require_fastsam": False,
@@ -185,22 +187,23 @@ DEFAULT_DYNAMIC_MASK_CFG = {
             "min_lidar_points": 25,
             "min_reference_points": 200,
             "component_association_radius_px": 2.0,
-            "bg_inlier_dist_m": 0.35,
-            "bg_inlier_ratio": 0.65,
-            "bg_median_dist_m": 0.25,
+            "bg_inlier_dist_m": 0.25,
+            "bg_inlier_ratio": 0.85,
+            "bg_median_dist_m": 0.15,
+            "bg_p90_dist_m": 0.35,
             "object_icp": {
                 "enabled": True,
                 "min_points": 30,
                 "max_points": 1500,
                 "local_margin_m": 1.0,
-                "max_corr_m": 0.75,
+                "max_corr_m": 0.50,
                 "max_iteration": 30,
-                "min_fitness": 0.25,
-                "max_rmse_m": 0.40,
-                "rel_angle_deg": 2.0,
-                "rel_trans_m": 0.25,
-                "median_dist_m": 0.35,
-                "bg_vs_obj_median_ratio": 1.20,
+                "min_fitness": 0.45,
+                "max_rmse_m": 0.25,
+                "rel_angle_deg": 1.0,
+                "rel_trans_m": 0.10,
+                "median_dist_m": 0.20,
+                "bg_vs_obj_median_ratio": 0.80,
             },
         },
         "se3_static_veto": {
@@ -222,6 +225,11 @@ DEFAULT_DYNAMIC_MASK_CFG = {
             "bg_vs_obj_median_ratio": 1.25,
             "prefer_slam_pose": True,
             "fallback_to_background_pnp": True,
+            "edge_guard_enabled": True,
+            "edge_guard_min_static_edge_iou": 0.45,
+            "edge_guard_max_static_symdiff_ratio": 0.10,
+            "edge_guard_splat_radius": 1,
+            "edge_guard_edge_width": 2,
         },
         "component_pose_init": {
             "enabled": True,
@@ -240,6 +248,13 @@ DEFAULT_DYNAMIC_MASK_CFG = {
         "save_diagnostics": False,
         "organize_outputs": True,
     },
+}
+
+MINIMAL_PAIR_KEEP_FILES = {
+    "dynamic_mask.png",
+    "dynamic_score.png",
+    "dynamic_fusion_summary.json",
+    "dynamic_component_poses.json",
 }
 
 
@@ -341,6 +356,9 @@ def _slam_background_transform_for_target(params, target_record):
 class DynamicMaskManager:
     def __init__(self, cfg, data_cfg, dataset, output_dir, project_root, device):
         self.cfg = _deep_merge(DEFAULT_DYNAMIC_MASK_CFG, cfg or {})
+        self.minimal_storage = bool(self.cfg.get("minimal_storage", False))
+        if self.minimal_storage:
+            self._apply_minimal_storage_defaults()
         self.enabled = bool(self.cfg.get("enabled", False))
         self.fail_on_error = bool(self.cfg.get("fail_on_error", False))
         self.require_lidar_residual = bool(self.cfg.get("require_lidar_residual", False))
@@ -374,6 +392,19 @@ class DynamicMaskManager:
         if self.enabled:
             os.makedirs(self.root_dir, exist_ok=True)
             self._write_config_snapshot(data_cfg)
+
+    def _apply_minimal_storage_defaults(self):
+        self.cfg["rigidmask"]["save_visualizations"] = False
+        self.cfg["rigidmask"]["depth_mask"]["save_visualizations"] = False
+        self.cfg["lidar_residual"]["save_npz"] = False
+        self.cfg["lidar_residual"]["save_visualizations"] = False
+        self.cfg["lidar_residual"]["save_nonground_visualizations"] = False
+        self.cfg["lidar_residual"]["save_feature_mask_visualization"] = False
+        self.cfg["appearance"]["save_feature_tensors"] = False
+        self.cfg["appearance"]["save_visualizations"] = False
+        self.cfg["appearance"]["save_input_rgbs"] = False
+        self.cfg["fastsam"]["save_visualization"] = False
+        self.cfg["fusion"]["save_diagnostics"] = False
 
     def run_for_frame(self, time_idx, num_frames, params, sky_mask=None):
         if not self.enabled:
@@ -564,6 +595,7 @@ class DynamicMaskManager:
                 "fastsam_status": self._targets_status(fastsam_results),
                 "fusion_status": "skipped",
             }
+        self._compact_storage_after_fusion(target_records, target_results, time_idx, num_frames)
 
         return {
             "status": "ok" if all(item.get("fusion_ok", False) for item in target_results.values()) else "partial",
@@ -731,6 +763,7 @@ class DynamicMaskManager:
                 "fastsam_status": self._targets_status(fastsam_results),
                 "fusion_status": "skipped",
             }
+        self._compact_storage_after_fusion(target_records, target_results, time_idx, num_frames)
         return {
             "status": "ok" if all(item.get("fusion_ok", False) for item in target_results.values()) else "partial",
             "curr_frame_id": curr_frame_id,
@@ -995,6 +1028,81 @@ class DynamicMaskManager:
             if fusion_summary is None:
                 results[role]["reason"] = "fusion_returned_none"
         return results
+
+    def _compact_storage_after_fusion(self, target_records, target_results, time_idx, num_frames):
+        if not self.minimal_storage:
+            return
+        for target in target_records:
+            role = str(target.get("target_role", "current"))
+            if target_results.get(role, {}).get("fusion_ok", False):
+                self._compact_pair_dir(Path(target["pair_dir"]))
+        if target_results and all(item.get("fusion_ok", False) for item in target_results.values()):
+            self._compact_lidar_dirs(target_records)
+            self._compact_appearance_dirs(time_idx, num_frames)
+
+    def _compact_pair_dir(self, pair_dir):
+        if not pair_dir.is_dir():
+            return
+        for path in list(pair_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            if path.name in MINIMAL_PAIR_KEEP_FILES:
+                continue
+            self._remove_path(path)
+        self._remove_empty_dirs(pair_dir)
+
+    def _compact_lidar_dirs(self, target_records):
+        lidar_root = Path(self.lidar_output_dir)
+        if not lidar_root.is_dir():
+            return
+        pair_names = set()
+        for target in target_records:
+            role = str(target.get("target_role", "current")).strip().lower()
+            target_frame_id = target.get("target_frame_id")
+            counterpart_frame_id = target.get("counterpart_frame_id")
+            if target_frame_id is None or counterpart_frame_id is None:
+                continue
+            if role in ("current", "curr", "t"):
+                pair_names.add(f"{counterpart_frame_id}_{target_frame_id}")
+            else:
+                pair_names.add(f"{target_frame_id}_{counterpart_frame_id}")
+        for pair_name in pair_names:
+            self._remove_path(lidar_root / pair_name)
+
+    def _compact_appearance_dirs(self, time_idx, num_frames):
+        appearance_root = Path(self.appearance_output_dir)
+        if not appearance_root.is_dir():
+            return
+        keep_from_time_idx = int(time_idx)
+        if int(time_idx) >= int(num_frames) - 1:
+            keep_from_time_idx = int(time_idx) + 1
+        for frame_dir in appearance_root.iterdir():
+            if not frame_dir.is_dir():
+                continue
+            try:
+                frame_time_idx = int(frame_dir.name.split("_", 1)[0])
+            except (IndexError, ValueError):
+                continue
+            if frame_time_idx < keep_from_time_idx:
+                self._remove_path(frame_dir)
+
+    @staticmethod
+    def _remove_path(path):
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except OSError as exc:
+            print(f"Dynamic mask minimal-storage cleanup skipped {path}: {exc}")
+
+    @staticmethod
+    def _remove_empty_dirs(root):
+        for path in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda item: len(item.parts), reverse=True):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
 
     def _save_appearance_for_frame(self, time_idx, frame_id, params, curr_data, render_pair):
         appearance = self._ensure_appearance()

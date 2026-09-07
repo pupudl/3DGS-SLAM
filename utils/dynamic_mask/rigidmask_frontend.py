@@ -199,13 +199,39 @@ def _normalize_depth_mask_apply_stage(depth_mask_cfg):
     return aliases[stage]
 
 
+def _frame_name_variants(frame_id):
+    raw = str(frame_id)
+    variants = [raw]
+    try:
+        frame_int = int(frame_id)
+    except (TypeError, ValueError):
+        frame_int = None
+    if frame_int is not None:
+        variants.extend([f"{frame_int:06d}", f"{frame_int:010d}", str(frame_int)])
+    deduped = []
+    for value in variants:
+        if value not in deduped:
+            deduped.append(value)
+    return deduped
+
+
+def _find_frame_file(directory, frame_id, suffix):
+    for frame_name in _frame_name_variants(frame_id):
+        path = os.path.join(directory, f"{frame_name}{suffix}")
+        if os.path.exists(path):
+            return path
+    return None
+
+
 class RigidMaskFrontendProbe:
     def __init__(self, probe_cfg, data_cfg):
         self.cfg = probe_cfg
         self.data_cfg = data_cfg
         self.sequence = data_cfg["sequence"]
         self.sequence_dir = os.path.join(data_cfg["basedir"], self.sequence)
-        self.image_dir = os.path.join(self.sequence_dir, "image_00", "data_rect")
+        kitti360_image_dir = os.path.join(self.sequence_dir, "image_00", "data_rect")
+        kitti_image_dir = os.path.join(self.sequence_dir, "image_2")
+        self.image_dir = kitti360_image_dir if os.path.isdir(kitti360_image_dir) else kitti_image_dir
         self.disp_dir = os.path.join(self.sequence_dir, probe_cfg.get("disparity_dir", "disparity_sceneflow"))
         self.calib = _parse_perspective_file(probe_cfg["calibration_path"])
         self.run_every = int(probe_cfg.get("run_every", 1))
@@ -290,11 +316,11 @@ class RigidMaskFrontendProbe:
         return (time_idx % self.run_every) == 0
 
     def _load_disp_input(self, frame_id):
-        npy_path = os.path.join(self.disp_dir, f"{int(frame_id):010d}.npy")
-        png_path = os.path.join(self.disp_dir, f"{int(frame_id):010d}.png")
-        if os.path.exists(npy_path):
+        npy_path = _find_frame_file(self.disp_dir, frame_id, ".npy")
+        png_path = _find_frame_file(self.disp_dir, frame_id, ".png")
+        if npy_path is not None:
             disp = np.load(npy_path).astype(np.float32)
-        elif os.path.exists(png_path):
+        elif png_path is not None:
             disp = cv2.imread(png_path, cv2.IMREAD_UNCHANGED)
             if disp is None:
                 raise FileNotFoundError(f"Failed to read disparity file: {png_path}")
@@ -449,9 +475,9 @@ class RigidMaskFrontendProbe:
         pair_dir = os.path.join(output_root, pair_name)
         os.makedirs(pair_dir, exist_ok=True)
 
-        left_path = os.path.join(self.image_dir, f"{int(curr_frame_id):010d}.png")
-        right_path = os.path.join(self.image_dir, f"{int(next_frame_id):010d}.png")
-        if not os.path.exists(left_path) or not os.path.exists(right_path):
+        left_path = _find_frame_file(self.image_dir, curr_frame_id, ".png")
+        right_path = _find_frame_file(self.image_dir, next_frame_id, ".png")
+        if left_path is None or right_path is None:
             return {"status": "skipped", "reason": "missing_image", "pair_name": pair_name}
 
         prev_rgb_orig = cv2.imread(left_path)[:, :, ::-1]

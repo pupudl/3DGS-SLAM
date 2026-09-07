@@ -1,6 +1,8 @@
 import sys
 import os
 
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+
 base_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../")
 sys.path.append(base_dir)
 base_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../third_party/IGEV-Stereo")
@@ -14,7 +16,6 @@ from third_party.TransVPR.blocks import POOL
 # sys.path.append('core')
 DEVICE = 'cuda'
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import argparse
 import glob
 import numpy as np
@@ -30,15 +31,30 @@ import csv
 import trimesh
 import shutil
 
+experiment_root = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../"))
+repo_root = os.path.dirname(os.path.dirname(experiment_root))
 
-# sequences = [str(i).zfill(2) for i in range(11, 22)]
-sequences = ['02']
+
+def _project_path(*parts):
+    for root in (experiment_root, repo_root):
+        path = os.path.join(root, *parts)
+        if os.path.exists(path):
+            return path
+    return os.path.join(experiment_root, *parts)
+
+
+env_sequences = os.environ.get("KITTI_SEQUENCE") or os.environ.get("KITTI_SCENE")
+if env_sequences:
+    sequences = [seq.strip().zfill(2) for seq in env_sequences.split(",") if seq.strip()]
+else:
+    # sequences = [str(i).zfill(2) for i in range(11, 22)]
+    sequences = ['06']
 print(sequences)
 
-image_folder = "/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/sequences" # path to kitti dataset
-pose_folder = '/home/qiuyu/data/Projects/LSG-SLAM/data/kitti/poses' # path to kitti pose files
-igev_kitti_model_path = '/home/qiuyu/data/Projects/LSG-SLAM/third_party/IGEV-Stereo/pretrained_models/kitti15.pth'
-vpr_model_path = '/home/qiuyu/data/Projects/LSG-SLAM/third_party/TransVPR/TransVPR_MSLS.pth'
+image_folder = _project_path("data", "kitti", "sequences") # path to kitti dataset
+pose_folder = _project_path("data", "kitti", "poses") # path to kitti pose files
+igev_kitti_model_path = _project_path("third_party", "IGEV-Stereo", "pretrained_models", "kitti15.pth")
+vpr_model_path = _project_path("third_party", "TransVPR", "TransVPR_MSLS.pth")
 
 for sequence in sequences:
     print(sequence)

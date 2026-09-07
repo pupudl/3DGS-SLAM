@@ -24,6 +24,11 @@ DEFAULT_SE3_STATIC_VETO_CFG = {
     "bg_vs_obj_median_ratio": 1.25,
     "prefer_slam_pose": True,
     "fallback_to_background_pnp": True,
+    "edge_guard_enabled": True,
+    "edge_guard_min_static_edge_iou": 0.45,
+    "edge_guard_max_static_symdiff_ratio": 0.10,
+    "edge_guard_splat_radius": 1,
+    "edge_guard_edge_width": 2,
     "seed": 0,
 }
 
@@ -228,6 +233,131 @@ def _reprojection_errors(points3d, points2d, K, model):
     diff = projected[valid] - points2d[valid].astype(np.float32)
     errors[valid] = np.linalg.norm(diff, axis=1)
     return errors
+
+
+def _project_points_with_model(points3d, K, model, target_shape):
+    R = model["R"]
+    t = model["t"]
+    cam = (R @ points3d.astype(np.float64).T).T + t[None, :]
+    z = cam[:, 2]
+    valid = np.isfinite(cam).all(axis=1) & (z > 1e-6)
+    projected = np.full((points3d.shape[0], 2), np.nan, dtype=np.float32)
+    projected[valid, 0] = (K[0, 0] * cam[valid, 0] / z[valid]) + K[0, 2]
+    projected[valid, 1] = (K[1, 1] * cam[valid, 1] / z[valid]) + K[1, 2]
+
+    h, w = target_shape
+    valid &= (
+        np.isfinite(projected).all(axis=1)
+        & (projected[:, 0] >= 0.0)
+        & (projected[:, 0] <= float(w - 1))
+        & (projected[:, 1] >= 0.0)
+        & (projected[:, 1] <= float(h - 1))
+    )
+    return projected, valid
+
+
+def _splat_points_to_mask(points2d, target_shape, radius):
+    mask = np.zeros(target_shape, dtype=np.uint8)
+    if points2d.size == 0:
+        return mask.astype(bool)
+
+    h, w = target_shape
+    pts = np.rint(points2d).astype(np.int32)
+    valid = (
+        (pts[:, 0] >= 0)
+        & (pts[:, 0] < w)
+        & (pts[:, 1] >= 0)
+        & (pts[:, 1] < h)
+    )
+    pts = pts[valid]
+    if pts.size == 0:
+        return mask.astype(bool)
+
+    mask[pts[:, 1], pts[:, 0]] = 1
+    radius = max(int(radius), 0)
+    if radius > 0:
+        size = radius * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return mask.astype(bool)
+
+
+def _binary_edge(mask, width):
+    mask = np.asarray(mask, dtype=bool)
+    if not np.any(mask):
+        return np.zeros_like(mask, dtype=bool)
+    width = max(int(width), 1)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    eroded = mask.astype(np.uint8)
+    for _ in range(width):
+        eroded = cv2.erode(eroded, kernel, iterations=1)
+    return mask & (~eroded.astype(bool))
+
+
+def _counterpart_region_agreement(points3d, flow_points2d, K, model, target_shape, cfg):
+    flow_region = _splat_points_to_mask(
+        flow_points2d,
+        target_shape,
+        int(cfg.get("edge_guard_splat_radius", 1)),
+    )
+    pose_points2d, pose_valid = _project_points_with_model(points3d, K, model, target_shape)
+    pose_region = _splat_points_to_mask(
+        pose_points2d[pose_valid],
+        target_shape,
+        int(cfg.get("edge_guard_splat_radius", 1)),
+    )
+
+    union = flow_region | pose_region
+    union_pixels = int(np.count_nonzero(union))
+    if union_pixels <= 0:
+        return {
+            "status": "invalid_empty_regions",
+            "pose_projected_points": int(np.count_nonzero(pose_valid)),
+            "union_pixels": 0,
+        }
+
+    intersection_pixels = int(np.count_nonzero(flow_region & pose_region))
+    flow_only_pixels = int(np.count_nonzero(flow_region & (~pose_region)))
+    pose_only_pixels = int(np.count_nonzero(pose_region & (~flow_region)))
+    symdiff_pixels = flow_only_pixels + pose_only_pixels
+    region_iou = float(intersection_pixels / max(union_pixels, 1))
+    symdiff_ratio = float(symdiff_pixels / max(union_pixels, 1))
+
+    edge_width = int(cfg.get("edge_guard_edge_width", 2))
+    flow_edge = _binary_edge(flow_region, edge_width)
+    pose_edge = _binary_edge(pose_region, edge_width)
+    edge_union = flow_edge | pose_edge
+    edge_union_pixels = int(np.count_nonzero(edge_union))
+    edge_intersection_pixels = int(np.count_nonzero(flow_edge & pose_edge))
+    edge_iou = None
+    if edge_union_pixels > 0:
+        edge_iou = float(edge_intersection_pixels / edge_union_pixels)
+
+    min_edge_iou = float(cfg.get("edge_guard_min_static_edge_iou", 0.45))
+    max_symdiff_ratio = float(cfg.get("edge_guard_max_static_symdiff_ratio", 0.10))
+    edge_ok = edge_iou is None or edge_iou >= min_edge_iou
+    symdiff_ok = symdiff_ratio <= max_symdiff_ratio
+    static_safe = bool(edge_ok and symdiff_ok)
+    return {
+        "status": "static_consistent" if static_safe else "reject_static",
+        "region_iou": region_iou,
+        "edge_iou": edge_iou,
+        "symdiff_ratio": symdiff_ratio,
+        "flow_only_pixels": flow_only_pixels,
+        "pose_only_pixels": pose_only_pixels,
+        "intersection_pixels": intersection_pixels,
+        "union_pixels": union_pixels,
+        "edge_intersection_pixels": edge_intersection_pixels,
+        "edge_union_pixels": edge_union_pixels,
+        "pose_projected_points": int(np.count_nonzero(pose_valid)),
+        "thresholds": {
+            "min_static_edge_iou": min_edge_iou,
+            "max_static_symdiff_ratio": max_symdiff_ratio,
+            "splat_radius": int(cfg.get("edge_guard_splat_radius", 1)),
+            "edge_width": edge_width,
+        },
+    }
 
 
 def _rotation_angle_deg(R):
@@ -625,6 +755,19 @@ def refine_mask_with_se3_static_veto(mask, arrays, summary, cfg=None, background
             bg_median <= float(cfg["bg_median_px"])
             and bg_inlier_ratio >= float(cfg["bg_inlier_ratio"])
         )
+        if bg_explains and cfg.get("edge_guard_enabled", True):
+            edge_guard = _counterpart_region_agreement(
+                comp_points3d,
+                comp_points2d,
+                K,
+                bg_model,
+                target_shape,
+                cfg,
+            )
+            record["edge_guard"] = edge_guard
+            if edge_guard.get("status") == "reject_static":
+                bg_explains = False
+                record["background_edge_guard_rejected"] = True
         if bg_explains:
             veto_mask[component] = True
             record["decision"] = "remove_static"
@@ -707,6 +850,9 @@ def refine_mask_with_se3_static_veto(mask, arrays, summary, cfg=None, background
             "bg_median_px": float(cfg["bg_median_px"]),
             "rel_angle_deg": float(cfg["rel_angle_deg"]),
             "rel_trans_m": float(cfg["rel_trans_m"]),
+            "edge_guard_enabled": bool(cfg.get("edge_guard_enabled", True)),
+            "edge_guard_min_static_edge_iou": float(cfg.get("edge_guard_min_static_edge_iou", 0.45)),
+            "edge_guard_max_static_symdiff_ratio": float(cfg.get("edge_guard_max_static_symdiff_ratio", 0.10)),
         },
         "components": inspected,
     }

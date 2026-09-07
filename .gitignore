@@ -1,6 +1,9 @@
 # Sub-Directories
 configs/local
 data/
+# Local dataset paths (the root data entry is a symlink; data1 is a mounted drive)
+/data
+/data1/
 results/
 wandb/
 .vscode

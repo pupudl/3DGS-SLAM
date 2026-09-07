@@ -69,6 +69,7 @@ class LidarMotionProbe:
         self._velo_to_cam = None
         self._gndnet_filter = None
         self._projection_calib = None
+        self._projection_dataset = None
 
     def _save_visualizations(self):
         return bool(self.cfg.get("save_visualizations", False))
@@ -88,6 +89,7 @@ class LidarMotionProbe:
 
             if self._velo_to_cam is None:
                 self._velo_to_cam = load_velo_to_cam(dataset, self.project_root)
+            self._projection_dataset = dataset
 
             prev_lidar_path = lidar_file_for_frame(dataset, prev_frame_id)
             curr_lidar_path = lidar_file_for_frame(dataset, curr_frame_id)
@@ -416,6 +418,35 @@ class LidarMotionProbe:
     def _get_projection_calib(self):
         if self._projection_calib is not None:
             return self._projection_calib
+        dataset = self._projection_dataset
+        dataset_name = getattr(dataset, "name", "").lower() if dataset is not None else ""
+        input_folder = getattr(dataset, "input_folder", "") if dataset is not None else ""
+
+        if dataset_name == "kitti" and input_folder:
+            calib_path = os.path.join(input_folder, "calib.txt")
+            if not os.path.isfile(calib_path):
+                raise FileNotFoundError(f"Missing KITTI calibration: {calib_path}")
+            p2_vals = None
+            with open(calib_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("P2:"):
+                        p2_vals = [float(x) for x in line.split(":", 1)[1].strip().split()]
+                        break
+            if p2_vals is None or len(p2_vals) != 12:
+                raise ValueError(f"Expected 12 P2 values in {calib_path}")
+            p2 = np.asarray(p2_vals, dtype=np.float64).reshape(3, 4)
+            p_rect = np.array(
+                [
+                    [p2[0, 0], 0.0, p2[0, 2], 0.0],
+                    [0.0, p2[1, 1], p2[1, 2], 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                ],
+                dtype=np.float64,
+            )
+            r_rect = np.eye(3, dtype=np.float64)
+            self._projection_calib = (p_rect, r_rect)
+            return self._projection_calib
+
         perspective_path = os.path.join(self.project_root, "data", "kitti360", "calibration", "perspective.txt")
         if not os.path.isfile(perspective_path):
             raise FileNotFoundError(f"Missing KITTI-360 perspective calibration: {perspective_path}")

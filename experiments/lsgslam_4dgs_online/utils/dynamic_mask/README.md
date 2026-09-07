@@ -19,9 +19,10 @@ Flow:
    frame `t - 1`, and `image_residual_nonground_features.npz` for frame `t`.
    Static LiDAR projection masks are also saved for both targets.
 3. `AppearanceSimilarityProbe` is frame-level. It compares each frame's RGB
-   with that frame's mapping render, so the pair `(t - 1, t)` uses the
-   already saved appearance map for `t - 1` and the newly saved appearance map
-   for `t`.
+   with that frame's pre-mapping static-map render, so the pair `(t - 1, t)`
+   uses the already saved appearance map for `t - 1` and the newly saved
+   appearance map for `t`. Dynamic 4DGS render output is not used to compute
+   this appearance evidence.
 4. Optional `FastSAMProbe` runs FastSAM on each target RGB image and saves
    instance candidates as `fastsam_masks.npz`.
 5. `fusion.process_pair_dir()` runs once per target directory and fuses
@@ -70,6 +71,32 @@ Enable it from a config with:
 config["dynamic_mask"]["enabled"] = True
 ```
 
+To keep sequence results small, enable minimal storage:
+
+```python
+config["dynamic_mask"]["minimal_storage"] = True
+```
+
+Minimal storage still writes temporary RigidMask, appearance, FastSAM and LiDAR
+files while a frame is being fused, then removes them after successful fusion.
+Each fused pair keeps only:
+
+```text
+dynamic/dynamic_mask.png
+dynamic/dynamic_score.png
+metadata/dynamic_fusion_summary.json
+metadata/dynamic_component_poses.json  # only when pose init is enabled
+```
+
+Failed or skipped pairs are left untouched so their intermediate files can still
+be inspected.
+
+This cleanup only touches dynamic-mask intermediate directories. It does not
+remove submap `params.npz` files or `PoseGraphResult/csvs/*.csv`, which are the
+assets used by `viz_scripts/sequence_submaps_first_person.py`. Dynamic
+first-person rendering uses the `dyn_*` arrays packed into each saved
+`params.npz`, not the discarded RigidMask/LiDAR/appearance probe files.
+
 Set `config["dynamic_mask"]["require_lidar_residual"] = True` when masks should
 be skipped unless both target frames have valid LiDAR residual maps.
 
@@ -77,13 +104,13 @@ FastSAM is optional and disabled by default. To enable it, place the model
 checkpoint at:
 
 ```text
-/home/qiuyu/data/Projects/LSG-SLAM/checkpoints/FastSAM-x.pt
+checkpoints/FastSAM-x.pt
 ```
 
 Then either install the official FastSAM repo under:
 
 ```text
-/home/qiuyu/data/Projects/LSG-SLAM/third_party/FastSAM
+third_party/FastSAM
 ```
 
 or install an `ultralytics` version that exposes `from ultralytics import

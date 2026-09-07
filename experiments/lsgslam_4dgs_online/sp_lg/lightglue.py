@@ -16,6 +16,22 @@ except ModuleNotFoundError:
 torch.backends.cudnn.deterministic = True
 
 
+def _find_weight_file(filename):
+    sp_lg_dir = Path(__file__).resolve().parents[3] / "sp_lg"
+    candidates = [
+        sp_lg_dir / filename,
+        Path(__file__).resolve().parent / filename,
+        Path.cwd() / "sp_lg" / filename,
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"Could not find {filename}. Tried: "
+        + ", ".join(str(path) for path in candidates)
+    )
+
+
 @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
 def normalize_keypoints(
         kpts: torch.Tensor,
@@ -311,8 +327,8 @@ class LightGlue(nn.Module):
             # state_dict = torch.hub.load_state_dict_from_url(
             #     self.url.format(self.version, pretrained), file_name=fname)
             # self.load_state_dict(state_dict, strict=False)
-            ckpt = 'sp_lg/superpoint_lightglue.pth'
-            checkpoint = torch.load(ckpt)
+            ckpt = _find_weight_file('superpoint_lightglue.pth')
+            checkpoint = torch.load(str(ckpt))
             self.load_state_dict(checkpoint, strict=False)
         elif conf.weights is not None:
             path = Path(__file__).parent

@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import shutil
 import sys
@@ -941,9 +942,9 @@ def rgbd_slam(config: dict, loop):
 
         if config["use_warp_loss"]:
             if depth_original is not None:
-                mask = (depth_original < 0.1) | (depth_original > np.min([dataset.depth_filter_far, 15.0]))
+                mask = (depth_original < 0.1) | (depth_original > np.max([30.0, dataset.depth_filter_far]))
             else:
-                mask = (depth < 0.1) | (depth > np.min([dataset.depth_filter_far, 15.0]))
+                mask = (depth < 0.1) | (depth > np.max([30.0, dataset.depth_filter_far]))
             color_feature = apply_dynamic_mask_to_color(torch.clone(color), dynamic_mask)
             depth_feature = apply_dynamic_mask_to_depth(depth_original, dynamic_mask)
             color_feature[:, mask[0]] = 0
@@ -1055,29 +1056,38 @@ def rgbd_slam(config: dict, loop):
         if time_idx > 0:
             pose_init_method = config.get("pose_init_method", "pnp_icp")
             if pose_init_method == "pnp_fused_icp":
-                init_pose = est_T_curr_last
-                icp_corr_threshold = config['tracking']['icp_corr_threshold']
-                if pnp_num_inliers < 50:
-                    icp_corr_threshold = np.max([3.0, icp_corr_threshold])
+                if not config["use_warp_loss"] or pnp_num_inliers < 10:
+                    print('use motion model prior pose')
+                    params = initialize_camera_pose(
+                        params,
+                        time_idx,
+                        forward_prop=config['tracking']['forward_prop'],
+                        gt_w2c=gt_w2c,
+                    )
+                else:
+                    init_pose = est_T_curr_last
+                    icp_corr_threshold = config['tracking']['icp_corr_threshold']
+                    if pnp_num_inliers < 50:
+                        icp_corr_threshold = np.max([3.0, icp_corr_threshold])
 
-                params, init_pose, fitness, inlier_rmse = fused_icp_init_camera_pose(
-                    params,
-                    time_idx,
-                    curr_data['pc'],
-                    last_data['pc'],
-                    dataset,
-                    curr_data["frame_id"],
-                    last_data["frame_id"],
-                    init_pose,
-                    icp_corr_threshold,
-                    device,
-                    PROJECT_ROOT,
-                    icp,
-                    lidar_max_points=config['tracking'].get('fused_lidar_max_points', 120000),
-                    lidar_min_forward_m=config['tracking'].get('lidar_min_forward_m', 0.0),
-                    lidar_max_forward_m=config['tracking'].get('lidar_max_forward_m', 0.0),
-                )
-                print("fused icp fitness/rmse = ", fitness, inlier_rmse)
+                    params, init_pose, fitness, inlier_rmse = fused_icp_init_camera_pose(
+                        params,
+                        time_idx,
+                        curr_data['pc'],
+                        last_data['pc'],
+                        dataset,
+                        curr_data["frame_id"],
+                        last_data["frame_id"],
+                        init_pose,
+                        icp_corr_threshold,
+                        device,
+                        PROJECT_ROOT,
+                        icp,
+                        lidar_max_points=config['tracking'].get('fused_lidar_max_points', 120000),
+                        lidar_min_forward_m=config['tracking'].get('lidar_min_forward_m', 0.0),
+                        lidar_max_forward_m=config['tracking'].get('lidar_max_forward_m', 0.0),
+                    )
+                    print("fused icp fitness/rmse = ", fitness, inlier_rmse)
             elif pnp_num_inliers > 100 and not isinstance(dataset, KittiDataset):
             # if pnp_num_inliers > 100:
                 print('use pnp prior pose')
@@ -1132,8 +1142,14 @@ def rgbd_slam(config: dict, loop):
             # Tracking Optimization
             iter = 0
             do_continue_slam = False
+            has_valid_matches = (
+                mkpts_cur is not None
+                and mkpts_last is not None
+                and mscores is not None
+                and mkpts_cur.shape[0] > 10
+            )
             num_iters_tracking = config['tracking']['num_iters']
-            if config["use_warp_loss"] and pnp_prior_pose_w2c is None:
+            if config["use_warp_loss"] and has_valid_matches and pnp_prior_pose_w2c is None:
                 num_iters_tracking *= 2
             progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
             while True:
@@ -1144,7 +1160,7 @@ def rgbd_slam(config: dict, loop):
                                                 config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
                                                 plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
                                                 tracking_iteration=iter, grad_mask=grad_mask)
-                if config["use_warp_loss"] and time_idx > 0:
+                if config["use_warp_loss"] and time_idx > 0 and has_valid_matches:
                     warp_loss = get_loss_from_match(
                         time_idx,
                         mkpts_cur,
@@ -1842,44 +1858,43 @@ if __name__ == "__main__":
         os.path.basename(args.experiment), args.experiment
     ).load_module()
 
+    base_config = copy.deepcopy(experiment.config)
+
     # Set Experiment Seed
-    seed_everything(seed=experiment.config['seed'])
+    seed_everything(seed=base_config['seed'])
     
     # Create Results Directory and Copy Config
-    experiment.config["run_name"] = experiment.config["run_name"] + '_loops'
+    base_config["run_name"] = base_config["run_name"] + '_loops'
     results_dir = os.path.join(
-        experiment.config["workdir"], experiment.config["run_name"]
+        base_config["workdir"], base_config["run_name"]
     )
-    if not experiment.config['load_checkpoint']:
+    if not base_config['load_checkpoint']:
         os.makedirs(results_dir, exist_ok=True)
         shutil.copy(args.experiment, os.path.join(results_dir, "config.py"))
     
-    find_loops(experiment.config)
+    find_loops(base_config)
     found_loops = np.load(os.path.join(results_dir, 'found_loops.npy'))
     print(found_loops)
 
     for loop in found_loops:
-        experiment = SourceFileLoader(
-            os.path.basename(args.experiment), args.experiment
-        ).load_module()
+        loop_config = copy.deepcopy(base_config)
 
         # Create Results Directory and Copy Config
-        experiment.config["run_name"] = experiment.config["run_name"] + '_loops'
-        experiment.config["tracking"]['num_iters'] = 300
-        experiment.config["mapping"]['num_iters'] = 100
+        loop_config["tracking"]['num_iters'] = 300
+        loop_config["mapping"]['num_iters'] = 100
 
-        experiment.config["use_warp_loss"] = True
+        loop_config["use_warp_loss"] = True
 
-        start_idx = experiment.config['data']['start']
-        stride = experiment.config['data']['stride']
+        start_idx = loop_config['data']['start']
+        stride = loop_config['data']['stride']
         ref_kf_idx = loop[1]
         query_kf_idx = loop[0]
         start = start_idx + (ref_kf_idx) * stride
         end = start_idx + (query_kf_idx) * stride
 
-        experiment.config['data']['start'] = start
-        experiment.config['data']['end'] = end
-        experiment.config['data']['stride'] = end - start
-        print(experiment.config['data'])
+        loop_config['data']['start'] = start
+        loop_config['data']['end'] = end
+        loop_config['data']['stride'] = end - start
+        print(loop_config['data'])
         
-        rgbd_slam(experiment.config, loop)
+        rgbd_slam(loop_config, loop)

@@ -13,7 +13,7 @@ from third_party.TransVPR.blocks import POOL
 
 DEVICE = 'cuda'
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
 import argparse
 import glob
 import numpy as np
@@ -27,16 +27,60 @@ from matplotlib import pyplot as plt
 import cv2
 
 
-sequences = ['2013_05_28_drive_0002_sync']
-print(sequences)
+project_root = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../"))
+repo_root = os.path.dirname(os.path.dirname(project_root))
 
-project_root = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../")
-data_root = os.path.join(project_root, "data/kitti360")
+
+def _project_path(*parts):
+    for root in (project_root, repo_root):
+        path = os.path.join(root, *parts)
+        if os.path.exists(path):
+            return path
+    return os.path.join(project_root, *parts)
+
+
+igev_kitti_model_path = _project_path("third_party", "IGEV-Stereo", "pretrained_models", "kitti15.pth")
+vpr_model_path = _project_path("third_party", "TransVPR", "TransVPR_MSLS.pth")
+
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--sequence",
+        action="append",
+        dest="sequences",
+        help=(
+            "KITTI-360 sequence to preprocess. Can be passed multiple times. "
+            "Defaults to KITTI360_SEQUENCE/KITTI360_SCENE or 2013_05_28_drive_0000_sync."
+        ),
+    )
+    parser.add_argument(
+        "--data-root",
+        default=os.environ.get("KITTI360_DATA_ROOT", _project_path("data", "kitti360")),
+        help="KITTI-360 root containing calibration, data_2d_raw, and data_poses.",
+    )
+    parser.add_argument("--skip-depth", action="store_true", help="Skip IGEV disparity/depth generation.")
+    parser.add_argument("--skip-poses", action="store_true", help="Skip traj.txt generation.")
+    parser.add_argument("--skip-global-feature", action="store_true", help="Skip TransVPR global feature extraction.")
+    args = parser.parse_args()
+
+    if args.sequences is None:
+        env_sequences = os.environ.get("KITTI360_SEQUENCE") or os.environ.get("KITTI360_SCENE")
+        args.sequences = (
+            [seq.strip() for seq in env_sequences.split(",") if seq.strip()]
+            if env_sequences
+            else ["2013_05_28_drive_0000_sync"]
+        )
+    return args
+
+
+args = parse_cli_args()
+sequences = args.sequences
+data_root = args.data_root
 image_root = os.path.join(data_root, "data_2d_raw")
 pose_root = os.path.join(data_root, "data_poses")
 calib_file = os.path.join(data_root, "calibration/perspective.txt")
-igev_kitti_model_path = os.path.join(project_root, 'third_party/IGEV-Stereo/pretrained_models/kitti15.pth')
-vpr_model_path = os.path.join(project_root, 'third_party/TransVPR/TransVPR_MSLS.pth')
+print(sequences)
 
 
 def parse_perspective_calib(calib_path):
@@ -91,6 +135,30 @@ def write_traj_kitti_format(output_path, frame_ids, poses_dict):
             f.write(line + '\n')
 
 
+def count_files_if_present(folder):
+    if not os.path.isdir(folder):
+        return 0
+    return len(os.listdir(folder))
+
+
+def filter_frames_with_stereo_images(frame_ids, left_images_folder, right_images_folder):
+    retained = []
+    missing_left = 0
+    missing_right = 0
+    for fid in frame_ids:
+        fname = f"{fid:010d}.png"
+        has_left = os.path.exists(os.path.join(left_images_folder, fname))
+        has_right = os.path.exists(os.path.join(right_images_folder, fname))
+        if has_left and has_right:
+            retained.append(fid)
+            continue
+        if not has_left:
+            missing_left += 1
+        if not has_right:
+            missing_right += 1
+    return retained, missing_left, missing_right
+
+
 fx, fy, cx, cy, baseline, width, height = parse_perspective_calib(calib_file)
 print(f"Calibration: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
 print(f"Baseline: {baseline:.6f} m")
@@ -102,9 +170,9 @@ for sequence in sequences:
     print(f"Processing sequence: {sequence}")
     print(f"{'='*60}")
 
-    run_depth_igev = True
-    run_get_gt_pose = True
-    run_global_feature = True
+    run_depth_igev = not args.skip_depth
+    run_get_gt_pose = not args.skip_poses
+    run_global_feature = not args.skip_global_feature
 
     seq_image_dir = os.path.join(image_root, sequence)
     left_images_folder = os.path.join(seq_image_dir, "image_00", "data_rect")
@@ -112,9 +180,17 @@ for sequence in sequences:
 
     cam0_to_world_path = os.path.join(pose_root, sequence, "cam0_to_world.txt")
     poses_dict = parse_cam0_to_world(cam0_to_world_path)
-    valid_frame_ids = sorted(poses_dict.keys())
+    pose_frame_ids = sorted(poses_dict.keys())
+    valid_frame_ids, missing_left, missing_right = filter_frames_with_stereo_images(
+        pose_frame_ids,
+        left_images_folder,
+        right_images_folder,
+    )
     print(f"Total images in image_00: {len(os.listdir(left_images_folder))}")
-    print(f"Frames with valid poses: {len(valid_frame_ids)}")
+    print(f"Frames with valid poses: {len(pose_frame_ids)}")
+    print(f"Frames retained with stereo images: {len(valid_frame_ids)}")
+    if missing_left or missing_right:
+        print(f"Skipped pose frames missing images: left={missing_left}, right={missing_right}")
 
     valid_frame_names = [f"{fid:010d}" for fid in valid_frame_ids]
 
@@ -227,5 +303,5 @@ for sequence in sequences:
             np.save(os.path.join(global_feature_folder, fname), global_feat)
 
     print(f"\nSequence {sequence} done.")
-    print(f"  depth_sceneflow: {len(os.listdir(os.path.join(seq_image_dir, 'depth_sceneflow')))} files")
-    print(f"  global_features: {len(os.listdir(os.path.join(seq_image_dir, 'global_features')))} files")
+    print(f"  depth_sceneflow: {count_files_if_present(os.path.join(seq_image_dir, 'depth_sceneflow'))} files")
+    print(f"  global_features: {count_files_if_present(os.path.join(seq_image_dir, 'global_features'))} files")

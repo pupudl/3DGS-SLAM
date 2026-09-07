@@ -1401,6 +1401,32 @@ def rgbd_slam(config: dict):
             sky_mask=sky_mask,
         )
 
+        dynamic_render_pair = None
+        dynamic_appearance_cfg = config.get("dynamic_mask", {}).get("appearance", {})
+        if (
+            dynamic_mask_manager.enabled
+            and dynamic_appearance_cfg.get("enabled", True)
+            and dynamic_appearance_cfg.get("use_mapping_render", True)
+        ):
+            with torch.no_grad():
+                dynamic_render_pair = {}
+                _, _, _ = get_loss(
+                    params,
+                    curr_data,
+                    variables,
+                    time_idx,
+                    config['mapping']['loss_weights'],
+                    config['mapping']['use_sil_for_loss'],
+                    config['mapping']['sil_thres'],
+                    config['mapping']['use_l1'],
+                    config['mapping']['ignore_outlier_depth_loss'],
+                    mapping=True,
+                    grad_mask=None,
+                    render_pair_out=dynamic_render_pair,
+                )
+                dynamic_render_pair["render_source"] = "pre_mapping_static_map"
+                dynamic_render_pair["static_map_cutoff_time_idx"] = int(time_idx - 1)
+
         if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
             try:
                 # Report Final Tracking Progress
@@ -1628,30 +1654,6 @@ def rgbd_slam(config: dict):
                     ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
                     save_params_ckpt(params, ckpt_output_dir, time_idx)
                     print('Failed to evaluate trajectory.')
-
-        dynamic_render_pair = None
-        dynamic_appearance_cfg = config.get("dynamic_mask", {}).get("appearance", {})
-        if (
-            dynamic_mask_manager.enabled
-            and dynamic_appearance_cfg.get("enabled", True)
-            and dynamic_appearance_cfg.get("use_mapping_render", True)
-        ):
-            with torch.no_grad():
-                dynamic_render_pair = {}
-                _, _, _ = get_loss(
-                    params,
-                    curr_data,
-                    variables,
-                    time_idx,
-                    config['mapping']['loss_weights'],
-                    config['mapping']['use_sil_for_loss'],
-                    config['mapping']['sil_thres'],
-                    config['mapping']['use_l1'],
-                    config['mapping']['ignore_outlier_depth_loss'],
-                    mapping=True,
-                    grad_mask=grad_mask,
-                    render_pair_out=dynamic_render_pair,
-                )
 
         dynamic_mask_manager.finalize_for_frame(
             time_idx=time_idx,

@@ -4,13 +4,42 @@ set -e
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 code_path="$(cd "$script_dir/.." && pwd)"
-config_path="${CONFIG_PATH:-$code_path/configs/kitti360/lsgslam_pnp_fused_icp.py}"
-group_name=$(grep -E "^group_name = " "$config_path" | head -n 1 | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/")
+config_template="${CONFIG_PATH:-$code_path/configs/kitti360/lsgslam_pnp_fused_icp.py}"
+run_config_prefix="$code_path/configs/kitti360/.lsgslam_runtime_$$"
 
-if [ -z "$group_name" ]; then
-    echo "Failed to parse group_name from $config_path"
+cleanup() {
+    rm -f "$run_config_prefix"_*.py
+}
+trap cleanup EXIT
+
+if [ ! -f "$config_template" ]; then
+    echo "Config template not found: $config_template"
     exit 1
 fi
+
+write_config() {
+    local target_config="$1"
+    local active_group_name="$2"
+    local scene_name="$3"
+    local kitti360_yaml="$4"
+    local image_width="$5"
+    local image_height="$6"
+    local start_idx="$7"
+    local end_idx="$8"
+    local stride="$9"
+
+    cp "$config_template" "$target_config"
+    sed -i \
+        -e "s|^group_name = .*|group_name = \"$active_group_name\"|" \
+        -e "s|^scene_name = .*|scene_name = '$scene_name'|" \
+        -e "s|^kitti360_yaml = .*|kitti360_yaml = '$kitti360_yaml'|" \
+        -e "s|^image_width = .*|image_width = $image_width|" \
+        -e "s|^image_height = .*|image_height = $image_height|" \
+        -e "s|^start_idx = .*|start_idx = $start_idx|" \
+        -e "s|^end_idx = .*|end_idx = $end_idx|" \
+        -e "s|^stride = .*|stride = $stride|" \
+        "$target_config"
+}
 
 # scene_name, start_idx, end_idx, stride, image_width, image_height, yaml
 # end_idx 支持:
@@ -32,15 +61,21 @@ do
     image_width=${array[4]}
     image_height=${array[5]}
     kitti360_yaml=${array[6]}
+    drive_id=$(echo "$scene_name" | sed -E "s/.*drive_([0-9]+)_sync.*/\1/")
+    if [ "$drive_id" = "$scene_name" ]; then
+        drive_id="$scene_name"
+    fi
+    active_group_name="${KITTI360_GROUP_NAME:-kitti360-${drive_id}-pnp-fused-icp-all}"
 
     echo "Scene: $scene_name"
     echo "Range: $start to $end, stride=$stride"
     echo "Resolution: ${image_width}x${image_height}"
     echo "YAML: $kitti360_yaml"
+    echo "group_name=$active_group_name"
 
     if [ $end -lt 0 ]; then
         depth_dir="$code_path/data/kitti360/data_2d_raw/$scene_name/depth_sceneflow"
-        total_frames=$(ls "$depth_dir"/*.npy 2>/dev/null | wc -l)
+        total_frames=$(find "$depth_dir" -maxdepth 1 -name "*.npy" | wc -l)
         if [ "$total_frames" -le 0 ]; then
             echo "No depth files found in $depth_dir"
             echo "Please run tools/kitti360_parser/operate_kitti360_data.py first."
@@ -64,60 +99,31 @@ do
         echo "Processing $start_idx to $end_idx"
 
         run_name="${scene_name}_${start_idx}_${end_idx}_${stride}"
-        output_dir="$code_path/results/$group_name/$run_name"
+        output_dir="$code_path/results/$active_group_name/$run_name"
         output_params="$output_dir/params.npz"
         if [ -f "$output_params" ]; then
             echo "Skip completed chunk: $run_name"
             continue
         fi
 
-        n=`grep -n "scene_name = " $config_path | awk -F':' '{print $1}'` 
-        sed -i "$[ n ]c scene_name = '$scene_name'" $config_path
-
-        n=`grep -n "kitti360_yaml = " $config_path | awk -F':' '{print $1}'` 
-        sed -i "$[ n ]c kitti360_yaml = '$kitti360_yaml'" $config_path
-
-        n=`grep -n "image_width = " $config_path | awk -F':' '{print $1}'` 
-        sed -i "$[ n ]c image_width = $image_width" $config_path
-
-        n=`grep -n "image_height = " $config_path | awk -F':' '{print $1}'` 
-        sed -i "$[ n ]c image_height = $image_height" $config_path
-
-        n=`grep -n "start_idx = " $config_path | awk -F':' '{print $1}'` 
-        sed -i "$[ n ]c start_idx = $start_idx" $config_path
-
-        n=`grep -n "end_idx = " $config_path | awk -F':' '{print $1}'` 
-        sed -i "$[ n ]c end_idx = $end_idx" $config_path
-
-        n=`grep -n "stride = " $config_path | awk -F':' '{print $1}'` 
-        sed -i "$[ n ]c stride = $stride" $config_path
+        chunk_config="${run_config_prefix}_${run_name}.py"
+        write_config "$chunk_config" "$active_group_name" "$scene_name" "$kitti360_yaml" \
+            "$image_width" "$image_height" "$start_idx" "$end_idx" "$stride"
 
         cd "$code_path"
-        python3 scripts/splatam.py "$config_path"
+        python3 scripts/splatam.py "$chunk_config"
 
     done
 
-    n=`grep -n "scene_name = " $config_path | awk -F':' '{print $1}'` 
-    sed -i "$[ n ]c scene_name = '$scene_name'" $config_path
+    if [ "${KITTI360_RUN_LOOP_CLOSURE:-1}" = "0" ]; then
+        echo "Skip loop closure for scene $scene_name"
+        continue
+    fi
 
-    n=`grep -n "kitti360_yaml = " $config_path | awk -F':' '{print $1}'` 
-    sed -i "$[ n ]c kitti360_yaml = '$kitti360_yaml'" $config_path
-
-    n=`grep -n "image_width = " $config_path | awk -F':' '{print $1}'` 
-    sed -i "$[ n ]c image_width = $image_width" $config_path
-
-    n=`grep -n "image_height = " $config_path | awk -F':' '{print $1}'` 
-    sed -i "$[ n ]c image_height = $image_height" $config_path
-
-    n=`grep -n "start_idx = " $config_path | awk -F':' '{print $1}'` 
-    sed -i "$[ n ]c start_idx = $start" $config_path
-
-    n=`grep -n "end_idx = " $config_path | awk -F':' '{print $1}'` 
-    sed -i "$[ n ]c end_idx = $end" $config_path
-
-    n=`grep -n "stride = " $config_path | awk -F':' '{print $1}'` 
-    sed -i "$[ n ]c stride = $stride" $config_path
+    loop_config="${run_config_prefix}_${scene_name}_${start}_${end}_${stride}_loop_closure.py"
+    write_config "$loop_config" "$active_group_name" "$scene_name" "$kitti360_yaml" \
+        "$image_width" "$image_height" "$start" "$end" "$stride"
 
     cd "$code_path"
-    python3 scripts/loop_closure.py "$config_path"
+    python3 scripts/loop_closure.py "$loop_config"
 done

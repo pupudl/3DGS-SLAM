@@ -1,4 +1,5 @@
 import argparse
+import csv
 import glob
 import os
 
@@ -105,6 +106,50 @@ def poses_w2c_to_xz(w2cs, limit):
     return points[:, 0], points[:, 2]
 
 
+def poses_w2c_to_xyz(w2cs, limit):
+    points = []
+    for w2c in w2cs[:limit]:
+        c2w = np.linalg.inv(w2c)
+        points.append(c2w[:3, 3])
+    return np.asarray(points, dtype=np.float64)
+
+
+def translation_errors(gt_w2cs, est_w2cs, limit, axes=None):
+    gt_xyz = poses_w2c_to_xyz(gt_w2cs, limit)
+    est_xyz = poses_w2c_to_xyz(est_w2cs, limit)
+    if axes is not None:
+        gt_xyz = gt_xyz[:, axes]
+        est_xyz = est_xyz[:, axes]
+    return np.linalg.norm(gt_xyz - est_xyz, axis=1)
+
+
+def stats_from_errors(errors):
+    return {
+        "rmse": float(np.sqrt(np.mean(errors**2))),
+        "mean": float(np.mean(errors)),
+        "median": float(np.median(errors)),
+        "final": float(errors[-1]),
+    }
+
+
+def translation_error_stats(gt_w2cs, est_w2cs, limit, axes=None):
+    return stats_from_errors(translation_errors(gt_w2cs, est_w2cs, limit, axes=axes))
+
+
+def per_axis_abs_error_stats(gt_w2cs, est_w2cs, limit):
+    gt_xyz = poses_w2c_to_xyz(gt_w2cs, limit)
+    est_xyz = poses_w2c_to_xyz(est_w2cs, limit)
+    abs_errors = np.abs(gt_xyz - est_xyz)
+    return {
+        "x_mean": float(abs_errors[:, 0].mean()),
+        "x_final": float(abs_errors[-1, 0]),
+        "y_mean": float(abs_errors[:, 1].mean()),
+        "y_final": float(abs_errors[-1, 1]),
+        "z_mean": float(abs_errors[:, 2].mean()),
+        "z_final": float(abs_errors[-1, 2]),
+    }
+
+
 def latest_pose_graph_csv(base_folder, scene_name):
     csv_dir = os.path.join(base_folder, "PoseGraphResult", "csvs")
     if not os.path.isdir(csv_dir):
@@ -128,21 +173,143 @@ def load_pose_graph_xz(csv_path, limit):
     return points[:, 0], points[:, 2]
 
 
-def plot_compare(gt_xz, odom_xz, loop_xz, output_path, max_frames):
+def plot_compare(gt_xz, odom_xz, loop_xz, output_path, max_frames, stats_3d=None, stats_xz=None, errors_3d=None, errors_xz=None):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.figure(figsize=(12, 9))
-    plt.plot(gt_xz[0], gt_xz[1], color="blue", label="GT")
-    plt.plot(odom_xz[0], odom_xz[1], color="red", label="Odo")
+    if errors_3d is None or errors_xz is None:
+        fig, ax_traj = plt.subplots(figsize=(12, 9))
+        ax_err = None
+    else:
+        fig, (ax_traj, ax_err) = plt.subplots(1, 2, figsize=(16, 7), gridspec_kw={"width_ratios": [1.15, 1.0]})
+
+    ax_traj.plot(gt_xz[0], gt_xz[1], color="blue", label="GT")
+    ax_traj.plot(odom_xz[0], odom_xz[1], color="red", label="Odo")
     if loop_xz is not None:
-        plt.plot(loop_xz[0], loop_xz[1], color="green", label="Loop")
-    plt.axis("equal")
-    plt.xlabel("x")
-    plt.ylabel("z")
-    plt.title(f"Trajectory Compare (First {max_frames} Frames)")
-    plt.legend(loc="best")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
+        ax_traj.plot(loop_xz[0], loop_xz[1], color="green", label="Loop")
+    ax_traj.axis("equal")
+    ax_traj.set_xlabel("x")
+    ax_traj.set_ylabel("z")
+    title = f"Trajectory Compare (First {max_frames} Frames)"
+    if stats_3d is not None and stats_xz is not None:
+        title += (
+            f"\n3D rmse={stats_3d['rmse']:.4f}, mean={stats_3d['mean']:.4f}, final={stats_3d['final']:.4f}"
+            f" | XZ rmse={stats_xz['rmse']:.4f}, mean={stats_xz['mean']:.4f}, final={stats_xz['final']:.4f}"
+        )
+    ax_traj.set_title(title)
+    ax_traj.legend(loc="best")
+
+    if ax_err is not None:
+        ax_err.plot(errors_3d, color="black", label="3D error")
+        ax_err.plot(errors_xz, color="purple", label="XZ error")
+        ax_err.set_xlabel("frame")
+        ax_err.set_ylabel("translation error (m)")
+        ax_err.set_title("Per-frame Error")
+        ax_err.grid(True, alpha=0.3)
+        ax_err.legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_axis_curves(gt_w2cs, est_w2cs, output_path, limit):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    gt_xyz = poses_w2c_to_xyz(gt_w2cs, limit)
+    est_xyz = poses_w2c_to_xyz(est_w2cs, limit)
+    frame_ids = np.arange(limit)
+    axis_names = ["x", "y", "z"]
+
+    fig, axes = plt.subplots(3, 2, figsize=(15, 10), sharex=True)
+    for axis_idx, axis_name in enumerate(axis_names):
+        axes[axis_idx, 0].plot(frame_ids, gt_xyz[:, axis_idx], color="blue", label="GT")
+        axes[axis_idx, 0].plot(frame_ids, est_xyz[:, axis_idx], color="red", label="Odo")
+        axes[axis_idx, 0].set_ylabel(f"{axis_name} (m)")
+        axes[axis_idx, 0].grid(True, alpha=0.3)
+        axes[axis_idx, 0].legend(loc="best")
+
+        axis_error = est_xyz[:, axis_idx] - gt_xyz[:, axis_idx]
+        axes[axis_idx, 1].plot(frame_ids, axis_error, color="black", label=f"{axis_name} error")
+        axes[axis_idx, 1].axhline(0.0, color="gray", linewidth=1.0, linestyle="--")
+        axes[axis_idx, 1].set_ylabel("error (m)")
+        axes[axis_idx, 1].grid(True, alpha=0.3)
+        axes[axis_idx, 1].legend(loc="best")
+
+    axes[-1, 0].set_xlabel("frame")
+    axes[-1, 1].set_xlabel("frame")
+    fig.suptitle(f"Axis Curves (First {limit} Frames)")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_chunk_comparisons(base_folder, scene_name, output_dir, max_frames):
+    os.makedirs(output_dir, exist_ok=True)
+    stats_rows = []
+    consumed_frames = 0
+
+    for start, end, stride, chunk_dir in find_chunk_dirs(base_folder, scene_name):
+        if consumed_frames >= max_frames:
+            break
+
+        chunk_name = os.path.basename(chunk_dir)
+        est_w2cs, gt_w2cs = load_segment_poses(os.path.join(chunk_dir, "params.npz"))
+        chunk_limit = min(len(est_w2cs), len(gt_w2cs), max_frames - consumed_frames)
+        if chunk_limit <= 0:
+            continue
+
+        gt_xz = poses_w2c_to_xz(gt_w2cs, chunk_limit)
+        odom_xz = poses_w2c_to_xz(est_w2cs, chunk_limit)
+        stats = translation_error_stats(gt_w2cs, est_w2cs, chunk_limit)
+        stats_xz = translation_error_stats(gt_w2cs, est_w2cs, chunk_limit, axes=[0, 2])
+
+        fig_path = os.path.join(output_dir, f"{chunk_name}_traj_compare.png")
+        plt.figure(figsize=(10, 7))
+        plt.plot(gt_xz[0], gt_xz[1], color="blue", label="GT")
+        plt.plot(odom_xz[0], odom_xz[1], color="red", label="Odo")
+        plt.axis("equal")
+        plt.xlabel("x")
+        plt.ylabel("z")
+        plt.title(
+            f"{chunk_name} | 3D mean={stats['mean']:.4f} final={stats['final']:.4f}"
+            f" | XZ mean={stats_xz['mean']:.4f} final={stats_xz['final']:.4f}"
+        )
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.savefig(fig_path, dpi=150)
+        plt.close()
+
+        stats_rows.append(
+            {
+                "chunk": chunk_name,
+                "start": start,
+                "end": end,
+                "stride": stride,
+                "frames": chunk_limit,
+                "rmse": stats["rmse"],
+                "mean": stats["mean"],
+                "median": stats["median"],
+                "final": stats["final"],
+                "xz_rmse": stats_xz["rmse"],
+                "xz_mean": stats_xz["mean"],
+                "xz_median": stats_xz["median"],
+                "xz_final": stats_xz["final"],
+                "figure": fig_path,
+            }
+        )
+        consumed_frames += chunk_limit
+
+    csv_path = os.path.join(output_dir, "chunk_stats.csv")
+    with open(csv_path, "w", newline="") as f:
+        fieldnames = [
+            "chunk", "start", "end", "stride", "frames",
+            "rmse", "mean", "median", "final",
+            "xz_rmse", "xz_mean", "xz_median", "xz_final",
+            "figure",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(stats_rows)
+
+    return stats_rows, csv_path
 
 
 def main():
@@ -180,6 +347,26 @@ def main():
         action="store_true",
         help="Only plot GT and odometry, even if pose graph CSVs exist.",
     )
+    parser.add_argument(
+        "--plot_chunks",
+        action="store_true",
+        help="Also save per-chunk GT/odometry comparisons before trajectory stitching.",
+    )
+    parser.add_argument(
+        "--chunk_output_dir",
+        default=None,
+        help="Output folder for --plot_chunks. Default: <base_folder>/PoseGraphResult/chunk_traj_compare",
+    )
+    parser.add_argument(
+        "--plot_axis_curves",
+        action="store_true",
+        help="Save x/y/z coordinate curves and per-axis signed errors for the stitched odometry.",
+    )
+    parser.add_argument(
+        "--axis_output",
+        default=None,
+        help="Output PNG for --plot_axis_curves. Default: <base_folder>/PoseGraphResult/axis_curves_first<N>.png",
+    )
     args = parser.parse_args()
 
     output = args.output or os.path.join(
@@ -200,11 +387,85 @@ def main():
         if loop_csv is not None:
             loop_xz = load_pose_graph_xz(loop_csv, limit)
 
-    plot_compare(gt_xz, odom_xz, loop_xz, output, limit)
+    stats = translation_error_stats(gt_w2cs, est_w2cs, limit)
+    stats_xz = translation_error_stats(gt_w2cs, est_w2cs, limit, axes=[0, 2])
+    axis_stats = per_axis_abs_error_stats(gt_w2cs, est_w2cs, limit)
+    errors_3d = translation_errors(gt_w2cs, est_w2cs, limit)
+    errors_xz = translation_errors(gt_w2cs, est_w2cs, limit, axes=[0, 2])
+
+    plot_compare(
+        gt_xz,
+        odom_xz,
+        loop_xz,
+        output,
+        limit,
+        stats_3d=stats,
+        stats_xz=stats_xz,
+        errors_3d=errors_3d,
+        errors_xz=errors_xz,
+    )
     print(f"Saved: {output}")
+    print(
+        "Raw odometry ATE (m): "
+        f"rmse={stats['rmse']:.4f}, "
+        f"mean={stats['mean']:.4f}, "
+        f"median={stats['median']:.4f}, "
+        f"final={stats['final']:.4f}"
+    )
+    print(
+        "Raw odometry XZ error (m): "
+        f"rmse={stats_xz['rmse']:.4f}, "
+        f"mean={stats_xz['mean']:.4f}, "
+        f"median={stats_xz['median']:.4f}, "
+        f"final={stats_xz['final']:.4f}"
+    )
+    print(
+        "Raw odometry per-axis abs error (m): "
+        f"x_mean={axis_stats['x_mean']:.4f}, "
+        f"x_final={axis_stats['x_final']:.4f}, "
+        f"y_mean={axis_stats['y_mean']:.4f}, "
+        f"y_final={axis_stats['y_final']:.4f}, "
+        f"z_mean={axis_stats['z_mean']:.4f}, "
+        f"z_final={axis_stats['z_final']:.4f}"
+    )
     if loop_csv is not None:
         print(f"Loop CSV: {loop_csv}")
     print(f"Frames: {limit}")
+
+    if args.plot_axis_curves:
+        axis_output = args.axis_output or os.path.join(
+            args.base_folder,
+            "PoseGraphResult",
+            f"axis_curves_first{limit}.png",
+        )
+        plot_axis_curves(gt_w2cs, est_w2cs, axis_output, limit)
+        print(f"Saved axis curves: {axis_output}")
+
+    if args.plot_chunks:
+        chunk_output_dir = args.chunk_output_dir or os.path.join(
+            args.base_folder,
+            "PoseGraphResult",
+            "chunk_traj_compare",
+        )
+        chunk_stats, chunk_csv = plot_chunk_comparisons(
+            args.base_folder,
+            args.scene_name,
+            chunk_output_dir,
+            limit,
+        )
+        print(f"Saved chunk comparisons: {chunk_output_dir}")
+        print(f"Saved chunk stats: {chunk_csv}")
+        for row in chunk_stats:
+            print(
+                f"Chunk {row['chunk']}: "
+                f"frames={row['frames']}, "
+                f"rmse={row['rmse']:.4f}, "
+                f"mean={row['mean']:.4f}, "
+                f"median={row['median']:.4f}, "
+                f"final={row['final']:.4f}, "
+                f"xz_mean={row['xz_mean']:.4f}, "
+                f"xz_final={row['xz_final']:.4f}"
+            )
 
 
 if __name__ == "__main__":

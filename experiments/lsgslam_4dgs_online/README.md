@@ -6,7 +6,7 @@
 第一次跑前先做 KITTI-360 预处理，生成 `traj.txt`、深度和全局特征：
 
 ```bash
-cd /home/qiuyu/data/Projects/LSG-SLAM
+cd /home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_4dgs_online
 conda activate lsgslam
 
 CUDA_VISIBLE_DEVICES=4 python3 tools/kitti360_parser/operate_kitti360_data.py
@@ -15,7 +15,7 @@ CUDA_VISIBLE_DEVICES=4 python3 tools/kitti360_parser/operate_kitti360_data.py
 跑 `2013_05_28_drive_0000_sync` 全序列分段前端和回环：
 
 ```bash
-cd /home/qiuyu/data/Projects/LSG-SLAM
+cd /home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_4dgs_online
 conda activate lsgslam
 
 CUDA_VISIBLE_DEVICES=4 bash bash_scripts/run_kitti360_sequence.bash
@@ -92,7 +92,7 @@ pose_alignment_utils.py
 跑 LiDAR ICP 里程计：
 
 ```bash
-cd /home/qiuyu/data/Projects/LSG-SLAM
+cd /home/qiuyu/data/Projects/LSG-SLAM/experiments/lsgslam_4dgs_online
 conda activate lsgslam
 
 python3 tools/kitti360_parser/kitti360_lidar_icp_odom.py \

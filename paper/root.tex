@@ -1,0 +1,149 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%2345678901234567890123456789012345678901234567890123456789012345678901234567890
+%        1         2         3         4         5         6         7         8
+
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf}  % Comment this line out if you need a4paper
+
+%\documentclass[a4paper, 10pt, conference]{ieeeconf}      % Use this line for a4 paper
+
+\IEEEoverridecommandlockouts                              % This command is only needed if 
+                                                          % you want to use the \thanks command
+
+\overrideIEEEmargins                                      % Needed to meet printer requirements.
+
+%In case you encounter the following error:
+%Error 1010 The PDF file may be corrupt (unable to open PDF file) OR
+%Error 1000 An error occurred while parsing a contents stream. Unable to analyze the PDF file.
+%This is a known problem with pdfLaTeX conversion filter. The file cannot be opened with acrobat reader
+%Please use one of the alternatives below to circumvent this error by uncommenting one or the other
+%\pdfobjcompresslevel=0
+%\pdfminorversion=4
+
+% See the \addtolength command later in the file to balance the column lengths
+% on the last page of the document
+
+% The following packages can be found on http:\\www.ctan.org
+%\usepackage{graphics} % for pdf, bitmapped graphics files
+%\usepackage{epsfig} % for postscript graphics files
+%\usepackage{mathptmx} % assumes new font selection scheme installed
+%\usepackage{times} % assumes new font selection scheme installed
+%\usepackage{amsmath} % assumes amsmath package installed
+%\usepackage{amssymb}  % assumes amsmath package installed
+\input{config}
+
+\title{\LARGE \bf
+Rigid4DGS-SLAM
+}
+
+
+\author{Anonymous Author%Albert Author$^{1}$ and Bernard D. Researcher$^{2}$% <-this % stops a space
+% \thanks{*This work was not supported by any organization}% <-this % stops a space
+% \thanks{$^{1}$Albert Author is with Faculty of Electrical Engineering, Mathematics and Computer Science,
+%         University of Twente, 7500 AE Enschede, The Netherlands
+%         {\tt\small albert.author@papercept.net}}%
+% \thanks{$^{2}$Bernard D. Researcheris with the Department of Electrical Engineering, Wright State University,
+%         Dayton, OH 45435, USA
+%         {\tt\small b.d.researcher@ieee.org}}%
+}
+
+
+\begin{document}
+
+
+
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{abstract}
+% 伴随3D GS在重建领域以其高保真、高效率的特性而被广泛应用，近年来大量同步定位与建图工作也采用 Gaussian primitives通过稠密的像素域的可微渲染实现定位与映射的联合细化。然而在复杂的户外场景，大量动态物体的出现破环了3D GS与SLAM的静态假设，降低相机定位精度与场景重建质量。我们观察到户外场景中主要动态目标通常具有显著的刚体运动先验，其跨帧变化可以由低自由度的刚体变换进行描述，而无需将所有时空变化建模为无约束的时序Gaussian。我们将这一思想纳入了动静态gaussian decompositon和动态场景可微渲染优化的动态4D gaussian属性中，提出了一种基于刚体约束的动态感知高斯分解的SLAM框架，Rigid4DGS-SLAM。通过前端的动态多动态线索的动静态高斯分解和后端的动态迭代检查，我们的方法实现了户外场景下的高保真动态建模与重建，并在静态区域进行高可靠位姿tracking。充分的实验显示Rigid4DGS-SLAM在户外复杂动态场景中定位精度与重建质量均超过了其他3Dgs的slam方案，也同时达到了与依赖外部3D边界框标注动态分割的离线4DGS重建相当的准确度.
+
+%近年来，3D Gaussian Splatting（3DGS）凭借其高保真重建与高效渲染能力被广泛应用于三维场景表示，并进一步推动了基于 Gaussian primitives 的同步定位与建图研究。这类方法通常借助稠密像素域的可微渲染，对相机位姿与场景表示进行联合优化。然而，在复杂的户外环境中，大量动态物体会破坏 3DGS 与 SLAM 所依赖的静态场景假设，引入不一致的跨帧观测，从而同时降低相机定位精度与场景重建质量。 我们观察到，户外场景中的主要动态目标通常具有显著的刚体运动先验，其跨帧运动可以通过低维刚体变换进行有效描述，而无需将其时空变化建模为完全无约束的时序 Gaussian。基于这一观察，我们将刚体运动约束融入动静态 Gaussian 分解以及动态场景可微渲染中的 4D Gaussian 属性优化，提出 Rigid4DGS-SLAM，一种面向复杂动态户外场景的刚体约束动态感知 Gaussian SLAM 框架。具体而言，我们通过前端融合多种动态线索实现动静态 Gaussian 分解，并利用后端的迭代动态校验持续修正动态状态，从而在静态区域上实现鲁棒的相机位姿跟踪，同时对动态目标进行时空一致的 4D Gaussian 建模与高保真重建。 大量实验表明，Rigid4DGS-SLAM 在复杂动态户外场景中的相机定位精度和场景重建质量均优于现有 3DGS-based SLAM 方法。同时，在无需外部 3D 边界框标注辅助动态分割的情况下，我们的方法在动态场景重建上仍取得了与此类离线 4DGS 重建方法相当的精度。
+Recent advances in 3D Gaussian Splatting (3DGS), with its high-fidelity reconstruction and efficient rendering capabilities, have driven research in Simultaneous Localization And Mapping (SLAM) methods based on Gaussian primitives that leverage dense differentiable rendering to jointly optimize poses and scene representations. However, in outdoor scenes, dynamic objects violate the static assumption underlying both 3DGS and SLAM, introducing inconsistent cross-frame observations that degrade both camera localization accuracy and reconstruction quality.
+We observe that major dynamic objects in outdoor scenes exhibit rigid priors, whose motion can be effectively represented by compact rigid-body transformations rather than unconstrained temporal dynamic Gaussians. Based on this observation, we incorporate rigid-motion constraints into dynamic-static Gaussian decomposition and the optimization of 4D Gaussian attributes under differentiable rendering, and propose Rigid4DGS-SLAM, a rigid-body-constrained, dynamic-aware Gaussian SLAM framework for complex outdoor environments. Specifically, the front end integrates multiple motion cues to decompose static and dynamic Gaussians, while the back end iteratively refines dynamic appearance under rendering. Our method enables robust camera tracking using reliable static regions while simultaneously achieving temporally consistent 4D Gaussian modeling and high-fidelity reconstruction of dynamic objects.
+Extensive experiments demonstrate that Rigid4DGS-SLAM outperforms existing 3DGS-based SLAM methods in localization accuracy and  in complex dynamic outdoor scenes, and achieving comparable reconstruction quality to offline 4DGS reconstruction methods without relying on external 3D bounding-box annotations for dynamic segmentation.
+\end{abstract}
+
+%\begin{IEEEkeywords}
+% Dynamic SLAM, 4D Gaussian Splatting, Rigid Constraint
+%\end{IEEEkeywords}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{INTRODUCTION}
+
+Autonomous robots are required to estimate accurate ego-motion while constructing a reusable scene map for downstream navigation and planning. Classical simultaneous localization and mapping (SLAM) systems achieve impressive localization robustness through sparse feature matching or point cloud registration. However, their map representations are typically sparse or predominantly geometric, limiting to recover fine-grained appearance and support high-quality scene reconstruction.
+Recently, 3D Gaussian Splatting (3DGS) has emerged as an attractive explicit representation for dense SLAM. By representing the scene with differentiable Gaussian primitives and rendering them through efficient rasterization, 3DGS-based SLAM systems can jointly optimize camera poses and photorealistic maps with much faster rendering than implicit neural representations. 
+
+%这一特性对于户外机器人系统尤为具有吸引力，因为这类系统既需要在线运行，又需要高保真度的地图构建。此外，立体摄像头和激光雷达传感器提供了互补的几何线索：立体图像可提供密集的视觉约束，而激光雷达测量在纹理较弱、深度范围较大以及光照变化时仍能保持可靠性。这些优势表明，立体-激光雷达高斯SLAM可作为大规模户外重建的极具前景的框架。
+%This property is particularly appealing for outdoor robotic systems, where both online operation and high-fidelity mapping are desirable. Moreover, stereo cameras and LiDAR sensors provide complementary geometric cues: stereo images offer dense visual constraints, while LiDAR measurements remain reliable under weak texture, large depth range, and illumination changes. These advantages suggest that stereo-LiDAR Gaussian SLAM can serve as a promising framework for large-scale outdoor reconstruction.
+
+Nevertheless, most existing 3DGS-based SLAM methods rely on the static-world assumption, which is violated in real-world outdoor environments containing numerous vehicles, pedestrians, cyclists, and other moving objects. Directly integrating dynamic observations into a static Gaussian map introduces reconstruction artifacts, such as ghosting, duplicated structures, and motion trails. These artifacts not only degrade rendering quality and map fidelity, but also corrupt the photometric and geometric residuals used for pose tracking. 
+As a result, dynamic objects may cause pose refinement to drift, and inaccurate poses further corrupt subsequent Gaussian mapping, forming a detrimental feedback loop between tracking and mapping, ultimately compromising both localization accuracy and reconstruction quality.
+
+%A natural solution is to separate the static background from dynamic foreground objects. However, how to handle the separated dynamic regions remains a key problem. A straightforward strategy is to simply remove dynamic regions from tracking and mapping, treating them as outliers to protect the static map. While effective in reducing dynamic contamination, this strategy discards useful information. In outdoor driving scenes, dynamic objects often occupy large image areas and may occlude nearby static structures. Direct removal therefore weakens the visual and geometric constraints available for pose refinement, especially under weak texture, large viewpoint changes, or limited static overlap. Moreover, removing dynamic regions leaves holes in rendering and novel-view synthesis, preventing the system from reconstructing a complete dynamic scene. Since moving objects such as vehicles and pedestrians are also essential for navigation, collision avoidance, and scene understanding, simply deleting them is insufficient for outdoor applications.
+A natural strategy is to separate the static background from dynamic foreground objects and simply exclude the dynamic regions from tracking and mapping as outliers to preserve the static map.
+While effective in reducing dynamic contamination, this strategy may discard valuable information carried by moving objects such as vehicles and pedestrians, which is important for navigation, collision avoidance, and scene understanding. In outdoor driving scenes, dynamic objects often occupy large image areas and occlude nearby static structures. Direct removal therefore weakens the visual and geometric constraints available for pose refinement, especially under weak texture, large viewpoint changes, or limited static overlap. Moreover, removing dynamic regions leaves holes in rendering and novel-view synthesis, preventing the system from reconstructing a complete dynamic scene. 
+
+Instead, modeling dynamic regions as 4D Gaussian Splatting (4DGS) \cite{4dgs} offers a more principled solution. By modeling a time-varying Gaussian representation , 4DGS can render the dynamic region consistently at different time steps rather than leaving duplicated Gaussians or motion trails. 
+% 但现有的4Dgs方法依赖长时间的离线优化和预训练光流模型的动态检测，其缺乏实时性和对位姿的联合估计。 少量的4Dgs-slam方法运用类RAFT预训练框架作为dense track的前端并聚焦关注室内小尺度的表观差异变化，难以迁移到室外复杂场景。
+However, existing 4DGS methods \cite{motion4d, desire-gs} typically rely on offline optimization and pretrained optical-flow models \cite{raft} for dynamic region detection, preventing real-time reconstruction and lacking joint pose estimation. A limited number of 4DGS-based SLAM methods \cite{4dgs-slam, wildgs-slam, flow4dgs-slam} primarily focus on appearance changes in indoor environments and adopt pretrained networks as dense tracking frontends \cite{dpvo,droid-slam}, making them difficult to satisfy in large-scale outdoor environments characterized by fast ego-motion, large viewpoint changes, severe occlusions, and few static overlap.
+
+In this paper, we propose a dynamic-aware large-scale SLAM framework that reconstructs outdoor scene with 4D Gaussian Splatting. Our framework employs a multi-cue dynamic-region detection that jointly exploits complementary motion, geometric, and appearance evidence to generate frame-wise dynamic segmentation in frontend, which is refined under rigid constraints. And the backend maintains a hybrid Gaussian map consisting of 4D Gaussians for dynamic objects and 3D Gaussians for the static environment. Motivated by \cite{rigidmask,4dgs-slam}, we model each dynamic object as an object-level 4D Gaussian set governed by rigid-body motion. The rigid-based refinement for dynamic detection and regularization of 4D Gaussian attributes explicitly improve dynamic detection and reconstruction quality.
+Explicit dynamic rendering disentangles residuals induced by object motion from those caused by pose or map errors, enabling improved static-dynamic decompose. Improved static-dynamic decompose suppresses dynamic outliers and enhances pose estimation, while more accurate poses further improve both static mapping and dynamic 4DGS optimization. Through this positive feedback loop，our SLAM system lead to increasingly accurate localization and scene representation.
+
+In this work, the main contributions include:
+\begin{itemize}
+\item We propose the first of its kind framework of 4DGS-based SLAM for large-scale environments that fuses stereo and LiDAR measurements for precise pose tracking and high-fidelity dynamic outdoor scene reconstruction.
+\item We introduce an online static-dynamic Gaussian scene representation, where the static background is modeled by 3D Gaussians and dynamic objects are separately represented as object-level 4D Gaussian Splatting models.
+\item We design a multi-cue dynamic frontend that integrates stereo motion, LiDAR residuals, Gaussian rendering inconsistency, and optional instance information to remove dynamic interference from tracking and static mapping.
+\item We establish a mutually reinforcing tracking-mapping mechanism, where motion-consistent 4DGS rendering improves dynamic separation and pose refinement, while refined poses further enhance static mapping and dynamic-object reconstruction.
+\end{itemize}
+
+\section{RELATED WORKS}
+
+\subsection{SLAM with 3D Gaussian Splatting}
+3D Gaussian Splatting (3DGS) \cite{3dgs} has recently become an attractive scene representation for dense SLAM because it provides explicit geometry, differentiable rendering, and real-time rasterization. Building on this representation, GS-SLAM \cite{gsslam} jointly optimizes camera poses and Gaussian attributes from RGB-D observations. SplaTAM \cite{splatam} formulates a splat-track-map pipeline with silhouette-guided map growth, while MonoGS \cite{monogs} improves monocular Gaussian SLAM with efficient pose optimization and regularized Gaussian geometry. Photo-SLAM \cite{photo-slam} further couples a feature-based SLAM frontend with Gaussian mapping to improve tracking robustness.
+
+Most early Gaussian SLAM systems are designed for bounded indoor scenes and rely on a predominantly static-world assumption. Recent methods have extended this direction toward outdoor and large-scale mapping. LSG-SLAM \cite{lsg-slam} introduces stereo Gaussian SLAM with continuous submaps for driving scenes, and Gaussian-LIC \cite{gaussian-lic} tightly fuses LiDAR, inertial, and camera measurements for robust localization and photorealistic mapping. These methods demonstrate the scalability of Gaussian primitives, but they still mainly maintain a static Gaussian map. In dynamic traffic scenes, moving objects may be fused into the background, causing ghosting artifacts and biased tracking residuals. In contrast, our system explicitly separates static and dynamic Gaussian representations for large-scale outdoor SLAM.
+
+\subsection{SLAM with Dynamic Detection}
+Dynamic objects violate the static-scene assumption used by conventional SLAM. Representative systems such as DynaSLAM \cite{dynaslam} and DS-SLAM \cite{ds-slam} combine semantic segmentation with geometric or motion consistency to reject dynamic observations and improve camera tracking. These methods reduce dynamic interference, but they usually treat moving regions as outliers to be suppressed, and thus provide limited reconstruction of dynamic objects themselves.
+
+Recent dynamic Gaussian representations provide a more suitable basis for reconstructing time-varying scenes. 4DGS \cite{4dgs} extends 3DGS with temporal deformation, while Street Gaussians \cite{street-gaussians} and DeSiRe-GS \cite{desire-gs} decompose urban scenes into static environments and dynamic actors. These approaches achieve high-quality dynamic rendering, but they are generally offline reconstruction methods and do not address online SLAM with continuous pose estimation. In SLAM, 4DGS-SLAM \cite{4dgs-slam} and Flow4DGS-SLAM \cite{flow4dgs-slam} introduce 4D Gaussian representations into indoor RGB-D tracking and mapping, showing the feasibility of dynamic Gaussian SLAM in controlled environments. JPG-SLAM \cite{jpg-slam} also combines 3D and 4D Gaussians for static and dynamic regions. Nevertheless, existing dynamic Gaussian SLAM methods are mainly evaluated in indoor or small-scale environments, and often rely on dense learned motion cues. Our framework targets large-scale outdoor scenes by combining stereo motion, LiDAR residuals, Gaussian rendering inconsistency, and instance cues for online dynamic separation, while regularizing each dynamic object with rigid-body 4D Gaussian motion.
+
+\section{PRELIMINARIES}
+
+\subsubsection{3D Gaussian Splatting}
+
+\subsubsection{Dynamic Rigid-body Gaussian (DRG)}
+
+\section{METHODOLOGY}
+\subsection{Overview}
+\subsection{Pose Estimation and Tracking}
+
+\subsection{Static-Dynamic Gaussian Decomposition}
+
+\subsection{Gaussian Mapping}
+
+\section{EXPERIMENTS}
+
+\section{CONCLUSIONS}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

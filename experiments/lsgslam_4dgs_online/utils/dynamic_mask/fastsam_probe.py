@@ -10,6 +10,17 @@ import torch
 
 from .fusion import find_pair_file, pair_output_path
 
+EXPERIMENT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.dirname(os.path.dirname(EXPERIMENT_ROOT))
+
+
+def _project_path(*parts):
+    for root in (EXPERIMENT_ROOT, REPO_ROOT):
+        path = os.path.join(root, *parts)
+        if os.path.exists(path):
+            return path
+    return os.path.join(EXPERIMENT_ROOT, *parts)
+
 
 def _maybe_add_path(path):
     if path and path not in sys.path:
@@ -19,7 +30,7 @@ def _maybe_add_path(path):
 def _ensure_writable_runtime_dirs(cfg):
     cache_root = cfg.get(
         "cache_root",
-        "/home/qiuyu/data/Projects/LSG-SLAM/.cache/fastsam",
+        _project_path(".cache", "fastsam"),
     )
     yolo_config_dir = cfg.get("yolo_config_dir", os.path.join(cache_root, "ultralytics"))
     mpl_config_dir = cfg.get("matplotlib_config_dir", os.path.join(cache_root, "matplotlib"))

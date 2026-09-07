@@ -37,6 +37,7 @@ from utils.slam_helpers import (
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 from utils.pnp_fused_icp_utils import fused_icp_init_camera_pose, get_dataset_frame_id
+from utils.lidar_warp_loss import LidarWarpLoss
 from utils.dynamic_mask import DynamicMaskManager
 from utils.dynamic_gs import (
     apply_dynamic_mask_to_color,
@@ -794,6 +795,23 @@ def compute_grad_mask(original_image, dataset, edge_threshold=1.1):
     return grad_mask
 
 
+def get_tracking_pose_prior_loss(params, time_idx, init_cam_rot, init_cam_tran, pose_prior_cfg):
+    if not pose_prior_cfg.get("enabled", False):
+        return None
+
+    curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx])
+    curr_cam_tran = params['cam_trans'][..., time_idx]
+    init_cam_rot = F.normalize(init_cam_rot)
+
+    quat_dot = torch.sum(curr_cam_rot * init_cam_rot, dim=-1).abs().clamp(max=1.0)
+    rot_loss = torch.mean(1.0 - quat_dot)
+    trans_loss = torch.mean((curr_cam_tran - init_cam_tran) ** 2)
+
+    rot_weight = float(pose_prior_cfg.get("rot_weight", 0.0))
+    trans_weight = float(pose_prior_cfg.get("trans_weight", 0.0))
+    return rot_weight * rot_loss + trans_weight * trans_loss
+
+
 def rgbd_slam(config: dict):
     # Print Config
     print("Loaded Config:")
@@ -811,6 +829,9 @@ def rgbd_slam(config: dict):
     config["dynamic_4dgs"] = merge_dynamic_4dgs_config(config["dynamic_4dgs"])
     if "sky_mask" not in config:
         config["sky_mask"] = {"enabled": False}
+    pose_init_only = config.get("pose_init_only", False)
+    freeze_tracking_pose = config.get("tracking", {}).get("freeze_pose_optimization", False)
+    tracking_pose_prior_cfg = config.get("tracking", {}).get("pose_prior", {})
     print(f"{config}")
 
     # Create Output Directories
@@ -904,6 +925,12 @@ def rgbd_slam(config: dict):
         dataset,
         output_dir,
         PROJECT_ROOT,
+        device,
+    )
+    lidar_warp_tracker = LidarWarpLoss(
+        dataset,
+        PROJECT_ROOT,
+        config.get("tracking", {}).get("lidar_warp", {}),
         device,
     )
 
@@ -1048,9 +1075,11 @@ def rgbd_slam(config: dict):
                 )
                 curr_keyframe = {
                     'id': time_idx,
+                    'frame_id': kf_frame_id,
                     'est_w2c': curr_w2c,
                     'color': color,
                     'depth': depth,
+                    'intrinsics': intrinsics,
                     'sky_mask': sky_mask,
                     'dynamic_mask': dynamic_observation.get('dynamic_mask') if dynamic_observation is not None else None,
                     'dynamic_score': dynamic_observation.get('dynamic_score') if dynamic_observation is not None else None,
@@ -1120,9 +1149,9 @@ def rgbd_slam(config: dict):
 
         if config["use_warp_loss"]:
             if depth_original_for_matching is not None:
-                mask = (depth_original_for_matching < 0.1) | (depth_original_for_matching > np.min([dataset.depth_filter_far, 30.0]))
+                mask = (depth_original_for_matching < 0.1) | (depth_original_for_matching > np.max([30.0, dataset.depth_filter_far]))
             else:
-                mask = (depth < 0.1) | (depth > np.min([dataset.depth_filter_far, 30.0]))
+                mask = (depth < 0.1) | (depth > np.max([30.0, dataset.depth_filter_far]))
             color_feature = torch.clone(color_for_matching)
             color_feature[:, mask[0]] = 0
             # color_height = color_feature.shape[1]
@@ -1331,9 +1360,59 @@ def rgbd_slam(config: dict):
                     print("icp T_error = ", r_err, t_err)
                     # exit()
 
+        if pose_init_only:
+            with torch.no_grad():
+                curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
+                curr_cam_tran = params['cam_trans'][..., time_idx].detach()
+                curr_w2c = torch.eye(4, device=device).float()
+                curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
+                curr_w2c[:3, 3] = curr_cam_tran
+                curr_data = {**curr_data, "est_w2c": curr_w2c.detach()}
+
+            if (
+                ((time_idx == 0) or ((time_idx + 1) % config['keyframe_every'] == 0) or (time_idx == num_frames - 2))
+                and (not torch.isinf(curr_gt_w2c[-1]).any())
+                and (not torch.isnan(curr_gt_w2c[-1]).any())
+            ):
+                keyframe_time_indices.append(time_idx)
+
+            if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
+                ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
+                save_params_ckpt(params, ckpt_output_dir, time_idx)
+                np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{time_idx}.npy"), np.array(keyframe_time_indices))
+
+            if config['use_wandb']:
+                wandb_time_step += 1
+
+            torch.cuda.empty_cache()
+            continue
+
+        lidar_warp_pair = None
+        if time_idx > 0 and lidar_warp_tracker.enabled:
+            lidar_warp_pair = lidar_warp_tracker.prepare_pair(
+                params,
+                time_idx,
+                last_data,
+                curr_data,
+                keyframe_list=keyframe_list,
+            )
+            if lidar_warp_pair is not None:
+                print(
+                    "lidar warp mode = ",
+                    lidar_warp_pair.get("mode", "unknown"),
+                    "correspondences = ",
+                    lidar_warp_pair["num_correspondences"],
+                    "mean init corr = ",
+                    lidar_warp_pair["mean_init_corr_m"],
+                )
+
+        with torch.no_grad():
+            init_cam_rot_for_tracking = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach().clone())
+            init_cam_tran_for_tracking = params['cam_trans'][..., time_idx].detach().clone()
+
         # Tracking
         tracking_start_time = time.time()
-        if time_idx > 0 and not config['tracking']['use_gt_poses']:
+        if time_idx > 0 and (not config['tracking']['use_gt_poses']) and (not freeze_tracking_pose):
             # Reset Optimizer & Learning Rates for tracking
             optimizer = initialize_optimizer(params, config['tracking']['lrs'], tracking=True)
             # pose_rot_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
@@ -1395,6 +1474,41 @@ def rgbd_slam(config: dict):
                     #     loss = warp_loss
                     # else:
                     #     loss = loss * 0.01 + warp_loss
+
+                if lidar_warp_pair is not None:
+                    lidar_refresh_every = lidar_warp_tracker.refresh_every()
+                    if iter > 0 and lidar_refresh_every > 0 and iter % lidar_refresh_every == 0:
+                        refreshed_lidar_warp_pair = lidar_warp_tracker.refresh_correspondences(
+                            params,
+                            time_idx,
+                            lidar_warp_pair,
+                        )
+                        if refreshed_lidar_warp_pair is not None:
+                            lidar_warp_pair = refreshed_lidar_warp_pair
+                    lidar_warp_loss, lidar_warp_losses = lidar_warp_tracker.compute_loss(
+                        params,
+                        time_idx,
+                        lidar_warp_pair,
+                    )
+                    lidar_warp_weight = float(
+                        config["tracking"]["lidar_warp"].get("weight", 1.0)
+                    )
+                    loss = loss + lidar_warp_weight * lidar_warp_loss
+                    losses.update(lidar_warp_losses)
+                    losses["lidar_warp"] = (lidar_warp_weight * lidar_warp_loss).detach()
+                    losses["loss"] = loss
+
+                pose_prior_loss = get_tracking_pose_prior_loss(
+                    params,
+                    time_idx,
+                    init_cam_rot_for_tracking,
+                    init_cam_tran_for_tracking,
+                    tracking_pose_prior_cfg,
+                )
+                if pose_prior_loss is not None:
+                    loss = loss + pose_prior_loss
+                    losses["pose_prior"] = pose_prior_loss.detach()
+                losses["loss"] = loss
 
                 if config['use_wandb']:
                     # Report Loss
@@ -1504,6 +1618,8 @@ def rgbd_slam(config: dict):
                     retain_grad_for_densification=False,
                     ignore_dynamic_mask=True,
                 )
+                dynamic_render_pair["render_source"] = "pre_mapping_static_map"
+                dynamic_render_pair["static_map_cutoff_time_idx"] = int(time_idx - 1)
 
         dynamic_mask_ready_before_mapping = False
         dynamic_mask_manager.finalize_for_frame(
@@ -1926,9 +2042,11 @@ def rgbd_slam(config: dict):
                 # Initialize Keyframe Info
                 curr_keyframe = {
                     'id': time_idx,
+                    'frame_id': frame_id,
                     'est_w2c': curr_w2c,
                     'color': color,
                     'depth': depth,
+                    'intrinsics': intrinsics,
                     'sky_mask': sky_mask,
                     'dynamic_mask': curr_data.get('dynamic_mask'),
                     'dynamic_score': curr_data.get('dynamic_score'),
@@ -1997,16 +2115,17 @@ def rgbd_slam(config: dict):
     final_params = pack_dynamic_params(final_params, dynamic_params)
 
     # Evaluate Final Parameters
-    with torch.no_grad():
-        if config['use_wandb']:
-            eval(dataset, final_params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
-                 wandb_run=wandb_run, wandb_save_qual=config['wandb']['eval_save_qual'],
-                 mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
-                 eval_every=config['eval_every'])
-        else:
-            eval(dataset, final_params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
-                 mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
-                 eval_every=config['eval_every'])
+    if not config.get("skip_final_eval", False):
+        with torch.no_grad():
+            if config['use_wandb']:
+                eval(dataset, final_params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
+                     wandb_run=wandb_run, wandb_save_qual=config['wandb']['eval_save_qual'],
+                     mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
+                     eval_every=config['eval_every'])
+            else:
+                eval(dataset, final_params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
+                     mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
+                     eval_every=config['eval_every'])
 
     # Add Camera Parameters to Save them
     final_params['timestep'] = variables['timestep']

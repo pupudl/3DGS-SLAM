@@ -1340,8 +1340,14 @@ def process_pair_dir(
         else:
             mask = mask_before_se3
 
+    mask = clean_binary_mask(mask > 0.5, min_component_area=80)
+
     score_full = resize_to_image(score, preview_shape)
-    mask_full = resize_to_image(mask, preview_shape)
+    mask_full = cv2.resize(
+        mask.astype(np.float32),
+        (preview_shape[1], preview_shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    )
 
     component_pose_summary = estimate_component_motion_poses(
         mask_full,

@@ -2,7 +2,17 @@ import os
 from os.path import join as p_join
 from datetime import datetime
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EXPERIMENT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(EXPERIMENT_ROOT))
+PROJECT_ROOT = EXPERIMENT_ROOT
+
+
+def _project_path(*parts):
+    for root in (EXPERIMENT_ROOT, REPO_ROOT):
+        path = os.path.join(root, *parts)
+        if os.path.exists(path):
+            return path
+    return os.path.join(EXPERIMENT_ROOT, *parts)
 
 scenes = ["2013_05_28_drive_0000_sync"]
 
@@ -74,13 +84,14 @@ config = dict(
     dynamic_mask=dict(
         enabled=True,
         output_subdir="dynamic_mask",
+        minimal_storage=True,
         fail_on_error=False,
         require_lidar_residual=True,
         rigidmask=dict(
             enabled=True,
-            repo_root=os.path.join(PROJECT_ROOT, "third_party", "rigidmask"),
-            checkpoint_path=os.path.join(PROJECT_ROOT, "third_party", "rigidmask", "weights", "rigidmask-kitti", "weights.pth"),
-            calibration_path=os.path.join(PROJECT_ROOT, "data", "kitti360", "calibration", "perspective.txt"),
+            repo_root=_project_path("third_party", "rigidmask"),
+            checkpoint_path=_project_path("third_party", "rigidmask", "weights", "rigidmask-kitti", "weights.pth"),
+            calibration_path=_project_path("data", "kitti360", "calibration", "perspective.txt"),
             disparity_dir="disparity_sceneflow",
             sensor="stereo",
             use_opencv_essential_mat=True,
@@ -99,9 +110,9 @@ config = dict(
         ),
         lidar_residual=dict(
             enabled=True,
-            gndnet_repo_root=os.path.join(PROJECT_ROOT, "third_party", "GndNet"),
-            gndnet_checkpoint_path=os.path.join(PROJECT_ROOT, "third_party", "GndNet", "trained_models", "checkpoint.pth.tar"),
-            gndnet_config_path=os.path.join(PROJECT_ROOT, "third_party", "GndNet", "config", "config_kittiSem.yaml"),
+            gndnet_repo_root=_project_path("third_party", "GndNet"),
+            gndnet_checkpoint_path=_project_path("third_party", "GndNet", "trained_models", "checkpoint.pth.tar"),
+            gndnet_config_path=_project_path("third_party", "GndNet", "config", "config_kittiSem.yaml"),
             compute_nonground_residual=True,
             save_visualizations=False,
             save_nonground_visualizations=False,
@@ -110,7 +121,7 @@ config = dict(
         ),
         appearance=dict(
             enabled=True,
-            checkpoint_path=os.path.join(PROJECT_ROOT, "checkpoints", "dinov2_reg_small_finetuned.pth"),
+            checkpoint_path=_project_path("checkpoints", "dinov2_reg_small_finetuned.pth"),
             output_subdir="appearance_similarity",
             save_raw_tensors=True,
             save_feature_tensors=False,
@@ -123,8 +134,8 @@ config = dict(
         ),
         fastsam=dict(
             enabled=False,
-            repo_root="/home/qiuyu/data/Projects/LSG-SLAM/third_party/FastSAM",
-            checkpoint_path="/home/qiuyu/data/Projects/LSG-SLAM/checkpoints/FastSAM-x.pt",
+            repo_root=_project_path("third_party", "FastSAM"),
+            checkpoint_path=_project_path("checkpoints", "FastSAM-x.pt"),
             source_image="anchor_rgb.png",
             run_every=1,
             imgsz=1024,
@@ -147,17 +158,20 @@ config = dict(
                 min_reference_points=200,
                 use_nonground_only=True,
                 fallback_to_visible_points=True,
-                bg_inlier_dist_m=0.35,
-                bg_inlier_ratio=0.65,
-                bg_median_dist_m=0.25,
+                bg_inlier_dist_m=0.25,
+                bg_inlier_ratio=0.85,
+                bg_median_dist_m=0.15,
+                bg_p90_dist_m=0.35,
                 object_icp=dict(
                     enabled=True,
                     min_points=30,
-                    max_corr_m=0.75,
-                    min_fitness=0.25,
-                    max_rmse_m=0.40,
-                    rel_angle_deg=2.0,
-                    rel_trans_m=0.25,
+                    max_corr_m=0.50,
+                    min_fitness=0.45,
+                    max_rmse_m=0.25,
+                    median_dist_m=0.20,
+                    rel_angle_deg=1.0,
+                    rel_trans_m=0.10,
+                    bg_vs_obj_median_ratio=0.80,
                 ),
             ),
             se3_static_veto=dict(
@@ -171,6 +185,11 @@ config = dict(
                 rel_trans_m=0.15,
                 prefer_slam_pose=True,
                 fallback_to_background_pnp=True,
+                edge_guard_enabled=True,
+                edge_guard_min_static_edge_iou=0.45,
+                edge_guard_max_static_symdiff_ratio=0.10,
+                edge_guard_splat_radius=1,
+                edge_guard_edge_width=2,
             ),
             component_pose_init=dict(
                 enabled=True,
@@ -191,7 +210,7 @@ config = dict(
         eval_save_qual=True,
     ),
     data=dict(
-        basedir="/home/qiuyu/data/Projects/LSG-SLAM/data/kitti360/data_2d_raw",
+        basedir=_project_path("data", "kitti360", "data_2d_raw"),
         gradslam_data_cfg=kitti360_yaml,
         sequence=scene_name,
         desired_image_height=image_height,

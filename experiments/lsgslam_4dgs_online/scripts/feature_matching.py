@@ -32,11 +32,17 @@ from sp_lg import viz2d
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 
 
+def get_pnp_depth_limits(dataset):
+    near = max(0.1, float(getattr(dataset, "depth_filter_near", 0.1)))
+    far = max(30.0, float(getattr(dataset, "depth_filter_far", 30.0)))
+    return near, far
+
+
 def get_local_features(keyframe_info, sp_extractor, device, depth_filter_far):
     depth_original = torch.from_numpy(keyframe_info['depth_original']).to(device)
     color = torch.from_numpy(keyframe_info['color']).to(device)
     if depth_original is not None:
-        mask = (depth_original < 0.1) | (depth_original > np.min([depth_filter_far, 15.0]))
+        mask = (depth_original < 0.1) | (depth_original > np.max([30.0, depth_filter_far]))
     else:
         print('depth_original is None')
         exit()
@@ -197,11 +203,12 @@ def estimate_pnp_for_loop(mkpts_cur, mkpts_knn, intrinsic, curr_keyframe_info, k
     
     points_in_knn_cam = []
     uv_in_curr_image = []
+    pnp_depth_near, pnp_depth_far = get_pnp_depth_limits(dataset)
     for kpidx in range(kps_knn.shape[0]):
         point_depth = knn_depth[
             int(kps_knn[kpidx, 1]), int(kps_knn[kpidx, 0])
         ]
-        if point_depth < 0.1 or point_depth > np.max([50, dataset.depth_filter_far]):
+        if point_depth < pnp_depth_near or point_depth > pnp_depth_far:
             continue
         point_in_knn_cam = (
             point_depth
@@ -230,7 +237,7 @@ def estimate_pnp_for_loop(mkpts_cur, mkpts_knn, intrinsic, curr_keyframe_info, k
     except:
         return np.eye(4), 0
 
-    if not success:
+    if not success or inliers is None:
         return np.eye(4), 0
 
     print(success)
@@ -293,11 +300,12 @@ def estimate_pnp(mkpts_cur, mkpts_last, curr_data, last_data, dataset):
 
     points_in_last_cam = []
     uv_in_curr_image = []
+    pnp_depth_near, pnp_depth_far = get_pnp_depth_limits(dataset)
     for kpidx in range(kps_last.shape[0]):
         point_depth = last_depth[
             int(kps_last[kpidx, 1]), int(kps_last[kpidx, 0])
         ]
-        if point_depth < 0.1 or point_depth > np.max([50, dataset.depth_filter_far]):
+        if point_depth < pnp_depth_near or point_depth > pnp_depth_far:
             continue
         point_in_last_cam = (
             point_depth
@@ -311,6 +319,8 @@ def estimate_pnp(mkpts_cur, mkpts_last, curr_data, last_data, dataset):
     # print(points_in_last_cam.shape)
     # print(uv_in_curr_image.shape)
     # exit()
+    if points_in_last_cam.shape[0] < 4:
+        return None
     
     try:
         (success, rotation_vector, translation_vector, inliers) = cv2.solvePnPRansac(
@@ -324,6 +334,9 @@ def estimate_pnp(mkpts_cur, mkpts_last, curr_data, last_data, dataset):
             iterationsCount=200,
         )
     except:
+        return None
+
+    if not success or inliers is None:
         return None
 
     print(success)

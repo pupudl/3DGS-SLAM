@@ -1,7 +1,8 @@
 #!/bin/bash
 
-code_path='/home/qiuyu/data/Projects/LSG-SLAM'
-config_path=$code_path'/configs/kitti/lsgslam_01_improved.py'
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+code_path="$(cd "$script_dir/.." && pwd)"
+config_path="$code_path/configs/kitti/lsgslam_01_improved.py"
 
 scene_name='01'
 start=0
@@ -50,8 +51,8 @@ do
     n=`grep -n "stride = " $config_path | awk -F':' '{print $1}'` 
     sed -i "$[ n ]c stride = $stride" $config_path
 
-    cd $code_path
-    python3 scripts/splatam.py $config_path
+    cd "$code_path"
+    python3 scripts/splatam.py "$config_path"
 
 done
 
@@ -77,5 +78,5 @@ sed -i "$[ n ]c end_idx = $end" $config_path
 n=`grep -n "stride = " $config_path | awk -F':' '{print $1}'` 
 sed -i "$[ n ]c stride = $stride" $config_path
 
-cd $code_path
-python3 scripts/loop_closure.py $config_path
+cd "$code_path"
+python3 scripts/loop_closure.py "$config_path"

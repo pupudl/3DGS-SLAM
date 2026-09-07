@@ -6,7 +6,7 @@ scenes = ["2013_05_28_drive_0000_sync"]
 
 primary_device="cuda:0"
 seed = 0
-scene_name = '2013_05_28_drive_0000_sync'
+scene_name = '2013_05_28_drive_0002_sync'
 
 map_every = 1
 keyframe_every = 1
@@ -19,8 +19,8 @@ kitti360_yaml = './configs/kitti360/kitti360.yaml'
 image_width = 1408
 image_height = 376
 
-start_idx = 2300
-end_idx = 2350
+start_idx = 0
+end_idx = 50
 stride = 2
 
 pose_init_method = "pnp_fused_icp"

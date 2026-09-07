@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _parse_perspective_file(calibration_path):
+def _parse_calibration_file(calibration_path):
     values = {}
     with open(calibration_path, "r", encoding="utf-8") as handle:
         for line in handle:
@@ -26,14 +26,24 @@ def _parse_perspective_file(calibration_path):
                 except ValueError:
                     break
             values[key.strip()] = np.asarray(tokens, dtype=np.float64)
-    p_rect_00 = values["P_rect_00"].reshape(3, 4)
-    p_rect_01 = values["P_rect_01"].reshape(3, 4)
-    fx = float(p_rect_00[0, 0])
-    fy = float(p_rect_00[1, 1])
-    cx = float(p_rect_00[0, 2])
-    cy = float(p_rect_00[1, 2])
-    tx0 = float(p_rect_00[0, 3] / p_rect_00[0, 0])
-    tx1 = float(p_rect_01[0, 3] / p_rect_01[0, 0])
+
+    if "P_rect_00" in values and "P_rect_01" in values:
+        p_left = values["P_rect_00"].reshape(3, 4)
+        p_right = values["P_rect_01"].reshape(3, 4)
+    elif "P2" in values and "P3" in values:
+        p_left = values["P2"].reshape(3, 4)
+        p_right = values["P3"].reshape(3, 4)
+    else:
+        raise KeyError(
+            f"Unsupported calibration file for RigidMask frontend: {calibration_path}"
+        )
+
+    fx = float(p_left[0, 0])
+    fy = float(p_left[1, 1])
+    cx = float(p_left[0, 2])
+    cy = float(p_left[1, 2])
+    tx0 = float(p_left[0, 3] / p_left[0, 0])
+    tx1 = float(p_right[0, 3] / p_right[0, 0])
     baseline = abs(tx1 - tx0)
     return {
         "fx": fx,
@@ -319,15 +329,41 @@ def _normalize_depth_mask_apply_stage(depth_mask_cfg):
     return aliases[stage]
 
 
+def _frame_name_variants(frame_id):
+    raw = str(frame_id)
+    variants = [raw]
+    try:
+        frame_int = int(frame_id)
+    except (TypeError, ValueError):
+        frame_int = None
+    if frame_int is not None:
+        variants.extend([f"{frame_int:06d}", f"{frame_int:010d}", str(frame_int)])
+    deduped = []
+    for value in variants:
+        if value not in deduped:
+            deduped.append(value)
+    return deduped
+
+
+def _find_frame_file(directory, frame_id, suffix):
+    for frame_name in _frame_name_variants(frame_id):
+        path = os.path.join(directory, f"{frame_name}{suffix}")
+        if os.path.exists(path):
+            return path
+    return None
+
+
 class RigidMaskFrontendProbe:
     def __init__(self, probe_cfg, data_cfg):
         self.cfg = probe_cfg
         self.data_cfg = data_cfg
         self.sequence = data_cfg["sequence"]
         self.sequence_dir = os.path.join(data_cfg["basedir"], self.sequence)
-        self.image_dir = os.path.join(self.sequence_dir, "image_00", "data_rect")
+        kitti360_image_dir = os.path.join(self.sequence_dir, "image_00", "data_rect")
+        kitti_image_dir = os.path.join(self.sequence_dir, "image_2")
+        self.image_dir = kitti360_image_dir if os.path.isdir(kitti360_image_dir) else kitti_image_dir
         self.disp_dir = os.path.join(self.sequence_dir, probe_cfg.get("disparity_dir", "disparity_sceneflow"))
-        self.calib = _parse_perspective_file(probe_cfg["calibration_path"])
+        self.calib = _parse_calibration_file(probe_cfg["calibration_path"])
         self.run_every = int(probe_cfg.get("run_every", 1))
         self.lazy_load = bool(probe_cfg.get("lazy_load", True))
         self.offload_after_use = bool(probe_cfg.get("offload_after_use", True))
@@ -410,11 +446,11 @@ class RigidMaskFrontendProbe:
         return (time_idx % self.run_every) == 0
 
     def _load_disp_input(self, frame_id):
-        npy_path = os.path.join(self.disp_dir, f"{int(frame_id):010d}.npy")
-        png_path = os.path.join(self.disp_dir, f"{int(frame_id):010d}.png")
-        if os.path.exists(npy_path):
+        npy_path = _find_frame_file(self.disp_dir, frame_id, ".npy")
+        png_path = _find_frame_file(self.disp_dir, frame_id, ".png")
+        if npy_path is not None:
             disp = np.load(npy_path).astype(np.float32)
-        elif os.path.exists(png_path):
+        elif png_path is not None:
             disp = cv2.imread(png_path, cv2.IMREAD_UNCHANGED)
             if disp is None:
                 raise FileNotFoundError(f"Failed to read disparity file: {png_path}")
@@ -631,9 +667,9 @@ class RigidMaskFrontendProbe:
             },
             "image_shape": list(target_rgb_orig.shape[:2]),
             "depth_mask": depth_mask_summary,
-            "lidar_pair_name": f"{int(counterpart_frame_id):010d}_{int(target_frame_id):010d}"
+            "lidar_pair_name": f"{counterpart_frame_id}_{target_frame_id}"
             if target_role == "current"
-            else f"{int(target_frame_id):010d}_{int(counterpart_frame_id):010d}",
+            else f"{target_frame_id}_{counterpart_frame_id}",
             "lidar_projection_filename": "image_residual_nonground_features.npz"
             if target_role == "current"
             else "image_residual_nonground_features_prev.npz",
@@ -806,9 +842,9 @@ class RigidMaskFrontendProbe:
         current_pair_dir = os.path.join(output_root, current_pair_name)
         previous_pair_dir = os.path.join(output_root, previous_pair_name)
 
-        anchor_path = os.path.join(self.image_dir, f"{int(curr_frame_id):010d}.png")
-        reference_path = os.path.join(self.image_dir, f"{int(reference_frame_id):010d}.png")
-        if not os.path.exists(anchor_path) or not os.path.exists(reference_path):
+        anchor_path = _find_frame_file(self.image_dir, curr_frame_id, ".png")
+        reference_path = _find_frame_file(self.image_dir, reference_frame_id, ".png")
+        if anchor_path is None or reference_path is None:
             return {"status": "skipped", "reason": "missing_image", "pair_name": current_pair_name}
 
         anchor_rgb_orig = cv2.imread(anchor_path)[:, :, ::-1]

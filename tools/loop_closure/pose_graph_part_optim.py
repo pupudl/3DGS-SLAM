@@ -7,6 +7,7 @@ import cv2
 import copy
 import time
 import math
+import re
 import matplotlib.pyplot as plt
 import gtsam
 import csv
@@ -515,6 +516,15 @@ def parse_args():
         action="store_true",
         help="Enable Gaussian densification during map refinement.",
     )
+    parser.add_argument(
+        "--pose_graph_start_idx",
+        type=int,
+        default=None,
+        help=(
+            "Skip odometry chunks whose raw/effective start index is smaller than this "
+            "value, and rebase loop-closure indices to the new graph origin."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -533,6 +543,41 @@ def _load_experiment_config(config_path):
     return experiment.config
 
 
+def _resolve_kitti360_basedir(configured_basedir, scene_name, config_path):
+    """Recover dataset paths from configs copied into a result directory.
+
+    Some experiment configs derive their project root from ``__file__``. Once such
+    a config is copied below ``results/``, importing the copy changes that root and
+    can produce a non-existent ``results/data/...`` path.
+    """
+    sequence_name = os.path.basename(scene_name)
+
+    def has_sequence(basedir):
+        return os.path.isfile(os.path.join(basedir, sequence_name, "traj.txt"))
+
+    configured_basedir = os.path.abspath(configured_basedir)
+    if has_sequence(configured_basedir):
+        return configured_basedir
+
+    repository_basedir = os.path.abspath(
+        os.path.join(current_dir, "data", "kitti360", "data_2d_raw")
+    )
+    if has_sequence(repository_basedir):
+        print(
+            "Warning: KITTI-360 path from config does not contain the requested "
+            f"sequence: {configured_basedir}. Using {repository_basedir} instead."
+        )
+        return repository_basedir
+
+    configured_traj = os.path.join(configured_basedir, sequence_name, "traj.txt")
+    repository_traj = os.path.join(repository_basedir, sequence_name, "traj.txt")
+    raise FileNotFoundError(
+        f"Could not find KITTI-360 trajectory for {sequence_name}. Checked "
+        f"{configured_traj} (from {os.path.abspath(config_path)}) and "
+        f"{repository_traj}."
+    )
+
+
 def _load_dataset_settings(args):
     if args.dataset_type == "kitti":
         image_folder_path = os.path.join(args.kitti_base_folder, args.scene_name, "image_2")
@@ -544,7 +589,11 @@ def _load_dataset_settings(args):
     dataset_config = dict(config["data"])
     dataset_config["sequence"] = args.scene_name
 
-    if args.dataset_type == "euroc":
+    if args.dataset_type == "kitti360":
+        dataset_config["basedir"] = _resolve_kitti360_basedir(
+            dataset_config["basedir"], args.scene_name, config_path
+        )
+    elif args.dataset_type == "euroc":
         dataset_config["basedir"] = f"euroc/{args.scene_name}/mav0/cam0"
 
     gradslam_cfg_path = dataset_config["gradslam_data_cfg"]
@@ -633,8 +682,12 @@ if __name__ == "__main__":
         reset_opacities_every=2*structure_refine_total_iters, 
     )
 
+    result_suffix = ""
+    if args.pose_graph_start_idx is not None:
+        result_suffix = f"_start_{args.pose_graph_start_idx}"
+
     # Rendering result saver
-    rendering_save_dir = os.path.join(base_folder, 'RenderingResult')
+    rendering_save_dir = os.path.join(base_folder, 'RenderingResult' + result_suffix)
     save_render_rgb_dir = os.path.join(rendering_save_dir, 'after_opt_render_rgb')
     save_gt_rgb_dir = os.path.join(rendering_save_dir, 'gt_rgb')
     save_tmp_rgb_dir = os.path.join(rendering_save_dir, 'before_opt_render_rgb')
@@ -644,7 +697,7 @@ if __name__ == "__main__":
     os.makedirs(save_tmp_rgb_dir, exist_ok=True)
 
     # Result saver
-    save_dir = os.path.join(base_folder, 'PoseGraphResult')
+    save_dir = os.path.join(base_folder, 'PoseGraphResult' + result_suffix)
     fig_save_dir = os.path.join(save_dir, 'figures')
     csv_save_dir = os.path.join(save_dir, 'csvs')
     os.makedirs(save_dir, exist_ok=True)
@@ -678,8 +731,31 @@ if __name__ == "__main__":
     loop_res_folder = loop_res_folders[0]
 
     odo_res_folders = sorted(odo_res_folders, key=lambda x:int(x.split('_')[-3]))
-    odo_res_folders = odo_res_folders[:]
+    if args.pose_graph_start_idx is not None:
+        odo_res_folders = [
+            folder for folder in odo_res_folders
+            if int(folder.split('_')[-3]) >= args.pose_graph_start_idx
+        ]
+        if len(odo_res_folders) == 0:
+            raise RuntimeError(
+                f"No odometry chunks remain after --pose_graph_start_idx "
+                f"{args.pose_graph_start_idx}."
+            )
     print(odo_res_folders)
+
+    first_graph_start_idx = int(odo_res_folders[0].split('_')[-3])
+    first_graph_stride = int(odo_res_folders[0].split('_')[-1])
+    if first_graph_start_idx % first_graph_stride != 0:
+        raise RuntimeError(
+            f"Cannot rebase loop indices for start {first_graph_start_idx} "
+            f"and stride {first_graph_stride}."
+        )
+    graph_node_offset = first_graph_start_idx // first_graph_stride
+    if args.pose_graph_start_idx is not None:
+        print(
+            f"Pose graph starts from chunk index {first_graph_start_idx}; "
+            f"loop indices are rebased by {graph_node_offset} graph nodes."
+        )
 
     all_odo_est_w2cs = []
     all_odo_gt_w2cs = []
@@ -709,8 +785,8 @@ if __name__ == "__main__":
     found_loops = np.load(found_loops_path)
     loop_infos = {}
     for loop in found_loops:
-        query_kf_idx = loop[0]
-        ref_kf_idx = loop[1]
+        query_kf_idx = int(loop[0])
+        ref_kf_idx = int(loop[1])
 
         loop_inlier_path = os.path.join(base_folder, loop_res_folder, 'eval_{}_{}'.format(query_kf_idx, ref_kf_idx), 'match_res/1_inliers.txt')
         if not os.path.exists(loop_inlier_path):
@@ -721,7 +797,17 @@ if __name__ == "__main__":
         loop_scene_path = os.path.join(base_folder, loop_res_folder, 'eval_{}_{}'.format(query_kf_idx, ref_kf_idx), 'params.npz')
         loop_est_r2qs, loop_gt_r2qs, _ = load_params(loop_scene_path)
 
-        loop_infos[query_kf_idx] = [ref_kf_idx, loop_est_r2qs[1], loop_gt_r2qs[1]]
+        query_node_idx = query_kf_idx - graph_node_offset
+        ref_node_idx = ref_kf_idx - graph_node_offset
+        if (
+            query_node_idx < 0
+            or ref_node_idx < 0
+            or query_node_idx >= num_frames
+            or ref_node_idx >= num_frames
+        ):
+            continue
+
+        loop_infos[query_node_idx] = [ref_node_idx, loop_est_r2qs[1], loop_gt_r2qs[1]]
 
     # Pose Graph Manager (for back-end optimization) initialization
     PGM = PoseGraphManager()

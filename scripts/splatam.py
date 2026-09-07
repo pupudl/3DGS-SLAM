@@ -1,0 +1,2432 @@
+import argparse
+import os
+import shutil
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = _BASE_DIR
+
+sys.path.insert(0, _BASE_DIR)
+
+print("System Paths:")
+for p in sys.path:
+    print(p)
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+from math import exp, sqrt
+from tqdm import tqdm
+import wandb
+import open3d as o3d
+
+from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, ReplicaDataset, ReplicaV2Dataset, AzureKinectDataset,
+                                        ScannetDataset, Ai2thorDataset, Record3DDataset, RealsenseDataset, TUMDataset,
+                                        ScannetPPDataset, NeRFCaptureDataset, KittiDataset, Kitti360Dataset, EurocDataset, GradSLAMDataset)
+from utils.common_utils import seed_everything, save_params_ckpt, save_params
+from utils.eval_helpers import report_loss, report_progress, eval, plot_progress
+from utils.keyframe_selection import (
+    dynamic_keyframe_selection_covisibility,
+    keyframe_selection_covisibility,
+)
+from utils.recon_helpers import setup_camera
+from utils.slam_helpers import (
+    transformed_params2rendervar, transformed_params2depthplussilhouette,
+    transform_to_frame, l1_loss_v1, matrix_to_quaternion, project_points
+)
+from utils.slam_external import (
+    accumulate_mean2d_gradient,
+    calc_ssim,
+    build_rotation,
+    densify,
+    prune_gaussians,
+)
+from utils.pnp_fused_icp_utils import fused_icp_init_camera_pose, get_dataset_frame_id
+from utils.lidar_warp_loss import LidarWarpLoss
+from utils.lidar_warp_diagnostics import LidarWarpDiagnostics, pose_gradient_diagnostics
+from utils.dynamic_mask import DynamicMaskManager
+from utils.dynamic_gs import (
+    apply_dynamic_mask_to_color,
+    apply_dynamic_mask_to_depth,
+    get_dynamic_loss,
+    has_dynamic_gaussians,
+    initialize_dynamic_optimizer,
+    load_dynamic_observation,
+    merge_dynamic_4dgs_config,
+    pack_dynamic_params,
+    resize_bool_mask as resize_dynamic_bool_mask,
+    update_dynamic_params_from_frame,
+)
+from utils.sky_mask import SkyMaskPredictor
+
+from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+
+from sp_lg.lightglue import LightGlue
+from sp_lg.superpoint import SuperPoint
+from sp_lg.disk import DISK
+from sp_lg.utils import load_image, match_pair
+from sp_lg import viz2d
+from feature_matching import *
+
+
+def get_dataset(config_dict, basedir, sequence, **kwargs):
+    if config_dict["dataset_name"].lower() in ["icl"]:
+        return ICLDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["replica"]:
+        return ReplicaDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["replicav2"]:
+        return ReplicaV2Dataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["azure", "azurekinect"]:
+        return AzureKinectDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["scannet"]:
+        return ScannetDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["ai2thor"]:
+        return Ai2thorDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["record3d"]:
+        return Record3DDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["realsense"]:
+        return RealsenseDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["tum"]:
+        return TUMDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["scannetpp"]:
+        return ScannetPPDataset(basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["nerfcapture"]:
+        return NeRFCaptureDataset(basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["kitti"]:
+        return KittiDataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["kitti360"]:
+        return Kitti360Dataset(config_dict, basedir, sequence, **kwargs)
+    elif config_dict["dataset_name"].lower() in ["euroc"]:
+        return EurocDataset(config_dict, basedir, sequence, **kwargs)
+    else:
+        raise ValueError(f"Unknown dataset name {config_dict['dataset_name']}")
+
+
+def resize_bool_mask(mask, target_height, target_width):
+    if mask is None:
+        return None
+    if mask.shape[-2:] == (target_height, target_width):
+        return mask
+    resized = F.interpolate(
+        mask.float().unsqueeze(0),
+        size=(target_height, target_width),
+        mode="nearest",
+    )[0]
+    return resized > 0.5
+
+
+def invert_bool_mask(mask):
+    if mask is None:
+        return None
+    return ~mask
+
+
+def apply_sky_mask_to_color(color, sky_mask):
+    if color is None or sky_mask is None:
+        return color
+    masked = color.clone()
+    masked[:, sky_mask[0]] = 0
+    return masked
+
+
+def apply_sky_mask_to_depth(depth, sky_mask):
+    if depth is None or sky_mask is None:
+        return depth
+    masked = depth.clone()
+    masked[:, sky_mask[0]] = 0
+    return masked
+
+
+def get_pointcloud(color, depth, intrinsics, w2c, transform_pts=True, 
+                   mask=None, compute_mean_sq_dist=False, mean_sq_dist_method="projective"):
+    width, height = color.shape[2], color.shape[1]
+    CX = intrinsics[0][2]
+    CY = intrinsics[1][2]
+    FX = intrinsics[0][0]
+    FY = intrinsics[1][1]
+
+    # Compute indices of pixels
+    x_grid, y_grid = torch.meshgrid(torch.arange(width).cuda().float(), 
+                                    torch.arange(height).cuda().float(),
+                                    indexing='xy')
+    xx = (x_grid - CX)/FX
+    yy = (y_grid - CY)/FY
+    xx = xx.reshape(-1)
+    yy = yy.reshape(-1)
+    depth_z = depth[0].reshape(-1)
+
+    # Initialize point cloud
+    pts_cam = torch.stack((xx * depth_z, yy * depth_z, depth_z), dim=-1)
+    if transform_pts:
+        pix_ones = torch.ones(height * width, 1).cuda().float()
+        pts4 = torch.cat((pts_cam, pix_ones), dim=1)
+        c2w = torch.inverse(w2c)
+        pts = (c2w @ pts4.T).T[:, :3]
+    else:
+        pts = pts_cam
+
+    # Compute mean squared distance for initializing the scale of the Gaussians
+    if compute_mean_sq_dist:
+        if mean_sq_dist_method == "projective":
+            # Projective Geometry (this is fast, farther -> larger radius)
+            scale_gaussian = depth_z / ((FX + FY)/2)
+            mean3_sq_dist = scale_gaussian**2
+        else:
+            raise ValueError(f"Unknown mean_sq_dist_method {mean_sq_dist_method}")
+    
+    # Colorize point cloud
+    cols = torch.permute(color, (1, 2, 0)).reshape(-1, 3) # (C, H, W) -> (H, W, C) -> (H * W, C)
+    point_cld = torch.cat((pts, cols), -1)
+
+    # Select points based on mask
+    if mask is not None:
+        point_cld = point_cld[mask]
+        if compute_mean_sq_dist:
+            mean3_sq_dist = mean3_sq_dist[mask]
+
+    if compute_mean_sq_dist:
+        return point_cld, mean3_sq_dist
+    else:
+        return point_cld
+
+
+def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribution):
+    num_pts = init_pt_cld.shape[0]
+    means3D = init_pt_cld[:, :3] # [num_gaussians, 3]
+    unnorm_rots = np.tile([1, 0, 0, 0], (num_pts, 1)) # [num_gaussians, 4]
+    logit_opacities = torch.zeros((num_pts, 1), dtype=torch.float, device="cuda")
+    if gaussian_distribution == "isotropic":
+        log_scales = torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1))
+    elif gaussian_distribution == "anisotropic":
+        log_scales = torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 3))
+    else:
+        raise ValueError(f"Unknown gaussian_distribution {gaussian_distribution}")
+    params = {
+        'means3D': means3D,
+        'rgb_colors': init_pt_cld[:, 3:6],
+        'unnorm_rotations': unnorm_rots,
+        'logit_opacities': logit_opacities,
+        'log_scales': log_scales,
+    }
+    # Initialize a single gaussian trajectory to model the camera poses relative to the first frame
+    cam_rots = np.tile([1, 0, 0, 0], (1, 1))
+    cam_rots = np.tile(cam_rots[:, :, None], (1, 1, num_frames))
+    params['cam_unnorm_rots'] = cam_rots
+    params['cam_trans'] = np.zeros((1, 3, num_frames))
+
+    for k, v in params.items():
+        # Check if value is already a torch tensor
+        if not isinstance(v, torch.Tensor):
+            params[k] = torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True))
+        else:
+            params[k] = torch.nn.Parameter(v.cuda().float().contiguous().requires_grad_(True))
+
+    variables = {'max_2D_radius': torch.zeros(params['means3D'].shape[0]).cuda().float(),
+                 'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
+                 'denom': torch.zeros(params['means3D'].shape[0]).cuda().float(),
+                 'timestep': torch.zeros(params['means3D'].shape[0]).cuda().float()}
+
+    return params, variables
+
+
+def initialize_optimizer(params, lrs_dict, tracking):
+    lrs = lrs_dict
+    param_groups = [{'params': [v], 'name': k, 'lr': lrs[k]} for k, v in params.items()]
+    if tracking:
+        return torch.optim.Adam(param_groups)
+    else:
+        return torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+
+
+def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio, 
+                              mean_sq_dist_method, densify_dataset=None, gaussian_distribution=None, config=None,
+                              sky_mask_predictor=None):
+    # Get RGB-D Data & Camera Parameters
+    color, depth, intrinsics, pose, depth_original, global_feature = dataset[0]
+
+    # Process RGB-D Data
+    color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
+    depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+    sky_mask = None
+    if sky_mask_predictor is not None:
+        sky_mask = sky_mask_predictor.get_mask(0, color)
+    
+    # Process Camera Parameters
+    intrinsics = intrinsics[:3, :3]
+    w2c = torch.linalg.inv(pose)
+
+    # Setup Camera
+    cam = setup_camera(color.shape[2], color.shape[1], intrinsics.cpu().numpy(), w2c.detach().cpu().numpy(), depth_threshold=config['pixel_gs_depth_threshold'])
+
+    if densify_dataset is not None:
+        # Get Densification RGB-D Data & Camera Parameters
+        color, depth, densify_intrinsics, _ = densify_dataset[0]
+        color = color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
+        depth = depth.permute(2, 0, 1) # (H, W, C) -> (C, H, W)
+        init_sky_mask = resize_bool_mask(sky_mask, color.shape[1], color.shape[2])
+        densify_intrinsics = densify_intrinsics[:3, :3]
+        densify_cam = setup_camera(color.shape[2], color.shape[1], densify_intrinsics.cpu().numpy(), w2c.detach().cpu().numpy(), depth_threshold=config['pixel_gs_depth_threshold'])
+    else:
+        densify_intrinsics = intrinsics
+        init_sky_mask = sky_mask
+
+    # Get Initial Point Cloud (PyTorch CUDA Tensor)
+    mask = (depth > 0) # Mask out invalid depth values
+    if init_sky_mask is not None:
+        mask = mask & invert_bool_mask(init_sky_mask)
+    mask = mask.reshape(-1)
+    init_pt_cld, mean3_sq_dist = get_pointcloud(color, depth, densify_intrinsics, w2c, 
+                                                mask=mask, compute_mean_sq_dist=True, 
+                                                mean_sq_dist_method=mean_sq_dist_method)
+
+    # Initialize Parameters
+    params, variables = initialize_params(
+        init_pt_cld,
+        num_frames,
+        mean3_sq_dist,
+        gaussian_distribution,
+    )
+
+    # Initialize an estimate of scene radius for Gaussian-Splatting Densification
+    scene_depth = apply_sky_mask_to_depth(depth, init_sky_mask)
+    valid_scene_depth = scene_depth[scene_depth > 0]
+    if valid_scene_depth.numel() == 0:
+        valid_scene_depth = depth[depth > 0]
+    variables['scene_radius'] = torch.max(valid_scene_depth)/scene_radius_depth_ratio
+
+    if densify_dataset is not None:
+        return params, variables, intrinsics, w2c, cam, densify_intrinsics, densify_cam
+    else:
+        return params, variables, intrinsics, w2c, cam
+
+
+def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
+             sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
+             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None,
+             grad_mask=None, render_pair_out=None, retain_grad_for_densification=True,
+             ignore_dynamic_mask=False):
+    # Initialize Loss Dictionary
+    losses = {}
+
+    if tracking:
+        # Get current frame Gaussians, where only the camera pose gets gradient
+        transformed_gaussians = transform_to_frame(params, iter_time_idx, 
+                                             gaussians_grad=False,
+                                             camera_grad=True)
+    elif mapping:
+        if do_ba:
+            # Get current frame Gaussians, where both camera pose and Gaussians get gradient
+            transformed_gaussians = transform_to_frame(params, iter_time_idx,
+                                                 gaussians_grad=True,
+                                                 camera_grad=True)
+        else:
+            # Get current frame Gaussians, where only the Gaussians get gradient
+            transformed_gaussians = transform_to_frame(params, iter_time_idx,
+                                                 gaussians_grad=True,
+                                                 camera_grad=False)
+    else:
+        # Get current frame Gaussians, where only the Gaussians get gradient
+        transformed_gaussians = transform_to_frame(params, iter_time_idx,
+                                             gaussians_grad=True,
+                                             camera_grad=False)
+
+    # Initialize Render Variables
+    rendervar = transformed_params2rendervar(params, transformed_gaussians)
+    depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
+                                                                 transformed_gaussians)
+
+    # RGB Rendering
+    if retain_grad_for_densification and rendervar['means2D'].requires_grad:
+        rendervar['means2D'].retain_grad()
+    im, radius, _, _ = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+    if retain_grad_for_densification:
+        variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
+
+    # Depth & Silhouette Rendering
+    depth_sil, _, _, _ = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+    depth = depth_sil[0, :, :].unsqueeze(0)
+    silhouette = depth_sil[1, :, :]
+    presence_sil_mask = (silhouette > sil_thres)
+    depth_sq = depth_sil[2, :, :].unsqueeze(0)
+    uncertainty = depth_sq - depth**2
+    uncertainty = uncertainty.detach()
+
+    # Mask with valid depth values (accounts for outlier depth values)
+    nan_mask = (~torch.isnan(depth)) & (~torch.isnan(uncertainty))
+    if ignore_outlier_depth_loss:
+        depth_error = torch.abs(curr_data['depth'] - depth) * (curr_data['depth'] > 0)
+        mask = (depth_error < 10*depth_error.median())
+        mask = mask & (curr_data['depth'] > 0)
+    else:
+        mask = (curr_data['depth'] > 0)
+    mask = mask & nan_mask
+    # Mask with presence silhouette mask (accounts for empty space)
+    if tracking and use_sil_for_loss:
+        mask = mask & presence_sil_mask
+    sky_mask = curr_data.get("sky_mask")
+    if sky_mask is not None:
+        mask = mask & invert_bool_mask(sky_mask)
+    dynamic_mask = curr_data.get("dynamic_mask")
+    if dynamic_mask is not None and not ignore_dynamic_mask:
+        dynamic_mask = resize_dynamic_bool_mask(dynamic_mask, curr_data['depth'].shape[1], curr_data['depth'].shape[2])
+        mask = mask & invert_bool_mask(dynamic_mask)
+
+    # Depth loss
+    if use_l1:
+        mask = mask.detach()
+        if not bool(mask.any()):
+            losses['depth'] = torch.zeros((), device=depth.device)
+        elif tracking:
+            losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].sum()
+        else:
+            losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].mean()
+    
+    # RGB Loss
+    gt_image = curr_data['im']
+    if sky_mask is not None:
+        color_keep_mask = torch.tile(invert_bool_mask(sky_mask), (3, 1, 1)).detach()
+        gt_image = gt_image * color_keep_mask
+        im = im * color_keep_mask
+    if dynamic_mask is not None and not ignore_dynamic_mask:
+        color_keep_mask = torch.tile(invert_bool_mask(dynamic_mask), (3, 1, 1)).detach()
+        gt_image = gt_image * color_keep_mask
+        im = im * color_keep_mask
+    if grad_mask is not None:
+        gt_image = grad_mask * gt_image
+        im = grad_mask * im
+
+        # print(grad_mask.shape)
+        # print(curr_data['im'].shape)
+        # show_grad_mask = grad_mask.detach().cpu().numpy()[0, :, :]
+        # show_color = gt_image.detach().cpu().numpy().transpose([1, 2, 0])
+        # print(show_grad_mask.shape)
+        # print(show_color.shape)
+        # cv2.imshow('1', show_grad_mask)
+        # cv2.imshow('2', show_color)
+        # cv2.waitKey(0)
+        # exit()
+
+    if render_pair_out is not None:
+        valid_depth_mask = (curr_data["depth"] > 0)
+        if sky_mask is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(sky_mask)
+        if dynamic_mask is not None and not ignore_dynamic_mask:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(dynamic_mask)
+        projected_means2d = project_points(
+            transformed_gaussians["means3D"].detach(),
+            curr_data["intrinsics"].detach(),
+        )
+        seen_mask = (radius > 0).detach()
+        attribution_mask = valid_depth_mask
+        if presence_sil_mask is not None:
+            attribution_mask = attribution_mask & presence_sil_mask.unsqueeze(0)
+        render_pair_out["render_image"] = im.detach().cpu()
+        render_pair_out["gt_image"] = gt_image.detach().cpu()
+        render_pair_out["render_depth"] = depth.detach().cpu()
+        render_pair_out["gt_depth"] = curr_data["depth"].detach().cpu()
+        render_pair_out["presence_sil_mask"] = presence_sil_mask.detach().cpu()
+        render_pair_out["valid_depth_mask"] = valid_depth_mask.detach().cpu()
+        render_pair_out["loss_mask"] = mask.detach().cpu()
+        render_pair_out["gaussian_data"] = {
+            "projected_means2D": projected_means2d.detach().cpu(),
+            "radius": radius.detach().cpu(),
+            "seen": seen_mask.detach().cpu(),
+            "gaussian_ids": torch.arange(
+                params["means3D"].shape[0],
+                device=params["means3D"].device,
+                dtype=torch.long,
+            ).detach().cpu(),
+            "attribution_mask": attribution_mask.detach().cpu(),
+            "image_height": int(curr_data["im"].shape[1]),
+            "image_width": int(curr_data["im"].shape[2]),
+        }
+    
+    color_mask = None
+    if tracking and (use_sil_for_loss or ignore_outlier_depth_loss):
+        color_mask = torch.tile(mask, (3, 1, 1))
+        color_mask = color_mask.detach()
+        losses['im'] = torch.abs(gt_image - im)[color_mask].sum()
+    elif tracking:
+        color_mask = torch.ones_like(gt_image, dtype=torch.bool)
+        losses['im'] = torch.abs(gt_image - im).sum()
+    else:
+        losses['im'] = 0.8 * l1_loss_v1(im, gt_image) + 0.2 * (1.0 - calc_ssim(im, gt_image))
+
+    # Visualize the Diff Images
+    if tracking and visualize_tracking_loss:
+        if color_mask is None:
+            color_mask = torch.ones_like(gt_image, dtype=torch.bool)
+        fig, ax = plt.subplots(2, 4, figsize=(12, 6))
+        weighted_render_im = im * color_mask
+        weighted_im = curr_data['im'] * color_mask
+        weighted_render_depth = depth * mask
+        weighted_depth = curr_data['depth'] * mask
+        diff_rgb = torch.abs(weighted_render_im - weighted_im).mean(dim=0).detach().cpu()
+        diff_depth = torch.abs(weighted_render_depth - weighted_depth).mean(dim=0).detach().cpu()
+        viz_img = torch.clip(weighted_im.permute(1, 2, 0).detach().cpu(), 0, 1)
+        ax[0, 0].imshow(viz_img)
+        ax[0, 0].set_title("Weighted GT RGB")
+        viz_render_img = torch.clip(weighted_render_im.permute(1, 2, 0).detach().cpu(), 0, 1)
+        ax[1, 0].imshow(viz_render_img)
+        ax[1, 0].set_title("Weighted Rendered RGB")
+        ax[0, 1].imshow(weighted_depth[0].detach().cpu(), cmap="jet", vmin=0, vmax=6)
+        ax[0, 1].set_title("Weighted GT Depth")
+        ax[1, 1].imshow(weighted_render_depth[0].detach().cpu(), cmap="jet", vmin=0, vmax=6)
+        ax[1, 1].set_title("Weighted Rendered Depth")
+        ax[0, 2].imshow(diff_rgb, cmap="jet", vmin=0, vmax=0.8)
+        ax[0, 2].set_title(f"Diff RGB, Loss: {torch.round(losses['im'])}")
+        ax[1, 2].imshow(diff_depth, cmap="jet", vmin=0, vmax=0.8)
+        ax[1, 2].set_title(f"Diff Depth, Loss: {torch.round(losses['depth'])}")
+        ax[0, 3].imshow(presence_sil_mask.detach().cpu(), cmap="gray")
+        ax[0, 3].set_title("Silhouette Mask")
+        ax[1, 3].imshow(mask[0].detach().cpu(), cmap="gray")
+        ax[1, 3].set_title("Loss Mask")
+        # Turn off axis
+        for i in range(2):
+            for j in range(4):
+                ax[i, j].axis('off')
+        # Set Title
+        fig.suptitle(f"Tracking Iteration: {tracking_iteration}", fontsize=16)
+        # Figure Tight Layout
+        fig.tight_layout()
+        os.makedirs(plot_dir, exist_ok=True)
+        plt.savefig(os.path.join(plot_dir, f"tmp.png"), bbox_inches='tight')
+        plt.close()
+        plot_img = cv2.imread(os.path.join(plot_dir, f"tmp.png"))
+        cv2.imshow('Diff Images', plot_img)
+        cv2.waitKey(1)
+        ## Save Tracking Loss Viz
+        # save_plot_dir = os.path.join(plot_dir, f"tracking_%04d" % iter_time_idx)
+        # os.makedirs(save_plot_dir, exist_ok=True)
+        # plt.savefig(os.path.join(save_plot_dir, f"%04d.png" % tracking_iteration), bbox_inches='tight')
+        # plt.close()
+
+    weighted_losses = {k: v * loss_weights[k] for k, v in losses.items()}
+    loss = sum(weighted_losses.values())
+
+    seen = radius > 0
+    variables['max_2D_radius'][seen] = torch.max(radius[seen], variables['max_2D_radius'][seen])
+    variables['seen'] = seen
+    weighted_losses['loss'] = loss
+
+    return loss, variables, weighted_losses
+
+
+def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
+    num_pts = new_pt_cld.shape[0]
+    means3D = new_pt_cld[:, :3] # [num_gaussians, 3]
+    unnorm_rots = np.tile([1, 0, 0, 0], (num_pts, 1)) # [num_gaussians, 4]
+    logit_opacities = torch.zeros((num_pts, 1), dtype=torch.float, device="cuda")
+    if gaussian_distribution == "isotropic":
+        log_scales = torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1))
+    elif gaussian_distribution == "anisotropic":
+        log_scales = torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 3))
+    else:
+        raise ValueError(f"Unknown gaussian_distribution {gaussian_distribution}")
+    params = {
+        'means3D': means3D,
+        'rgb_colors': new_pt_cld[:, 3:6],
+        'unnorm_rotations': unnorm_rots,
+        'logit_opacities': logit_opacities,
+        'log_scales': log_scales,
+    }
+    for k, v in params.items():
+        # Check if value is already a torch tensor
+        if not isinstance(v, torch.Tensor):
+            params[k] = torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True))
+        else:
+            params[k] = torch.nn.Parameter(v.cuda().float().contiguous().requires_grad_(True))
+
+    return params
+
+
+def add_new_gaussians(params, variables, curr_data, sil_thres, 
+                      time_idx, mean_sq_dist_method, gaussian_distribution):
+    # Silhouette Rendering
+    transformed_gaussians = transform_to_frame(params, time_idx, gaussians_grad=False, camera_grad=False)
+    depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
+                                                                 transformed_gaussians)
+    depth_sil, _, _, _ = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
+    silhouette = depth_sil[1, :, :]
+    non_presence_sil_mask = (silhouette < sil_thres)
+    # Check for new foreground objects by using GT depth
+    gt_depth = curr_data['depth'][0, :, :]
+    render_depth = depth_sil[0, :, :]
+    depth_error = torch.abs(gt_depth - render_depth) * (gt_depth > 0)
+    non_presence_depth_mask = (render_depth > gt_depth) * (depth_error > 50*depth_error.median())
+    # Determine non-presence mask
+    non_presence_mask = non_presence_sil_mask | non_presence_depth_mask
+    if curr_data.get("sky_mask") is not None:
+        non_presence_mask = non_presence_mask & invert_bool_mask(curr_data["sky_mask"][0])
+    dynamic_mask = curr_data.get("dynamic_mask")
+    if dynamic_mask is not None:
+        dynamic_mask = resize_dynamic_bool_mask(dynamic_mask, curr_data['depth'].shape[1], curr_data['depth'].shape[2])
+        non_presence_mask = non_presence_mask & invert_bool_mask(dynamic_mask[0])
+    # Flatten mask
+    non_presence_mask = non_presence_mask.reshape(-1)
+
+    # Get the new frame Gaussians based on the Silhouette
+    if torch.sum(non_presence_mask) > 0:
+        # Get the new pointcloud in the world frame
+        curr_cam_rot = torch.nn.functional.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
+        curr_cam_tran = params['cam_trans'][..., time_idx].detach()
+        curr_w2c = torch.eye(4).cuda().float()
+        curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
+        curr_w2c[:3, 3] = curr_cam_tran
+        valid_depth_mask = (curr_data['depth'][0, :, :] > 0)
+        if curr_data.get("sky_mask") is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(curr_data["sky_mask"][0])
+        if dynamic_mask is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(dynamic_mask[0])
+        non_presence_mask = non_presence_mask & valid_depth_mask.reshape(-1)
+        new_pt_cld, mean3_sq_dist = get_pointcloud(curr_data['im'], curr_data['depth'], curr_data['intrinsics'], 
+                                    curr_w2c, mask=non_presence_mask, compute_mean_sq_dist=True,
+                                    mean_sq_dist_method=mean_sq_dist_method)
+        new_params = initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution)
+        for k, v in new_params.items():
+            params[k] = torch.nn.Parameter(torch.cat((params[k], v), dim=0).requires_grad_(True))
+        num_pts = params['means3D'].shape[0]
+        variables['means2D_gradient_accum'] = torch.zeros(num_pts, device="cuda").float()
+        variables['denom'] = torch.zeros(num_pts, device="cuda").float()
+        variables['max_2D_radius'] = torch.zeros(num_pts, device="cuda").float()
+        new_timestep = time_idx*torch.ones(new_pt_cld.shape[0],device="cuda").float()
+        variables['timestep'] = torch.cat((variables['timestep'],new_timestep),dim=0)
+
+    return params, variables
+
+
+def icp(target, source, init_pose_T12, corr_threshold=0.5):
+    # target = o3d.geometry.PointCloud()
+    # target.points = o3d.utility.Vector3dVector(submap1_data[::self.skip_points, :3])
+    # target.colors = o3d.utility.Vector3dVector(submap1_data[::self.skip_points, 3:6])
+
+    # source = o3d.geometry.PointCloud()
+    # source.points = o3d.utility.Vector3dVector(submap2_data[::self.skip_points, :3])
+    # source.colors = o3d.utility.Vector3dVector(submap2_data[::self.skip_points, 3:6])
+
+    # print("3-1. Downsample with a voxel size %.2f" % 0.2)
+    source = source.voxel_down_sample(0.1)
+    target = target.voxel_down_sample(0.1)
+
+    num_points = 20  # 邻域球内的最少点数，低于该值的点为噪声点
+    radius = 0.4   # 邻域半径大小
+    # 执行统计滤波，返回滤波后的点云sor_pcd和对应的索引ind
+    source, ind = source.remove_radius_outlier(num_points, radius)
+    print('filter outliers')
+    # source = source.select_by_index(ind,invert = True)
+    # print('filter outliers')
+    target, ind = target.remove_radius_outlier(num_points, radius)
+    print('filter outliers')
+    # target = target.select_by_index(ind,invert = True)
+    # print('filter outliers')
+
+    # print("3-2. Estimate normal.")
+    source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.2 * 2, max_nn=30))
+    target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.2 * 2, max_nn=30))
+
+    # # calculate relative pose from coarse to fine
+
+    # threshold = [5.0, 0.5, 0.1]
+    if corr_threshold > 0.5:
+        threshold = [corr_threshold, 0.5, 0.1]
+    else:
+        threshold = [0.5, 0.1]
+    print(threshold)
+    
+    relative_transpose = init_pose_T12
+
+    for i in range(len(threshold)):
+        max_correspondence_distance = threshold[i]
+
+        relative_rmse = 0.1
+        max_iteration = 100
+        if max_correspondence_distance == 0.1:
+            relative_rmse = 0.001
+            max_iteration = 100
+        # print("Apply point-to-plane ICP")
+        reg_p2l = o3d.pipelines.registration.registration_icp(
+            source, target, max_correspondence_distance, relative_transpose,
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-6,
+                                                                relative_rmse=relative_rmse,
+                                                                max_iteration=max_iteration)
+        )
+
+        relative_transpose = reg_p2l.transformation
+
+    # print('coarse Transformation is:')
+    # print(pose_T12)
+    # print(reg_p2l)
+    print("refine Transformation is:")
+    print(reg_p2l.transformation)
+    print(np.array(reg_p2l.correspondence_set).shape)
+    # print(submap1_data.shape)
+    # print(submap2_data.shape)
+    # draw_registration_result(source, target, init_pose_T12)
+    # draw_registration_result(source, target, reg_p2l.transformation)
+    # exit()
+    return reg_p2l.transformation, reg_p2l.fitness, reg_p2l.inlier_rmse
+
+
+def icp_init_camera_pose(params, curr_time_idx, now_pc, pre_pc, intrinsics, depth_filter_near, depth_filter_far, 
+                         init_pose, corr_threshold, device):
+    with torch.no_grad():
+        # icp
+        pre2now, fitness, inlier_rmse = icp(now_pc, pre_pc, init_pose, corr_threshold)
+        cam_rot = F.normalize(params['cam_unnorm_rots'][..., curr_time_idx-1].detach())
+        cam_tran = params['cam_trans'][..., curr_time_idx-1].detach()
+        w2pre = torch.eye(4).float().to(device=device)
+        w2pre[:3, :3] = build_rotation(cam_rot)
+        w2pre[:3, 3] = cam_tran
+        pre2now_tmp = torch.tensor(pre2now, dtype=torch.float32, device=device)
+        w2now = pre2now_tmp @ w2pre
+        rel_w2c_rot = w2now[:3, :3].unsqueeze(0).detach()
+        rel_w2c_rot_quat = matrix_to_quaternion(rel_w2c_rot)
+        rel_w2c_tran = w2now[:3, 3].detach()
+        # Update the camera parameters
+        params['cam_unnorm_rots'][..., curr_time_idx] = rel_w2c_rot_quat
+        params['cam_trans'][..., curr_time_idx] = rel_w2c_tran
+
+    return params, pre2now
+
+
+def initialize_camera_pose(params, curr_time_idx, forward_prop, gt_w2c):
+    with torch.no_grad():
+        if curr_time_idx > 1 and forward_prop:
+            # Initialize the camera pose for the current frame based on a constant velocity model
+            # Rotation
+            prev_rot1 = F.normalize(params['cam_unnorm_rots'][..., curr_time_idx-1].detach())
+            prev_rot2 = F.normalize(params['cam_unnorm_rots'][..., curr_time_idx-2].detach())
+            new_rot = F.normalize(prev_rot1 + (prev_rot1 - prev_rot2))
+            params['cam_unnorm_rots'][..., curr_time_idx] = new_rot.detach()
+            # Translation
+            prev_tran1 = params['cam_trans'][..., curr_time_idx-1].detach()
+            prev_tran2 = params['cam_trans'][..., curr_time_idx-2].detach()
+            new_tran = prev_tran1 + (prev_tran1 - prev_tran2)
+            params['cam_trans'][..., curr_time_idx] = new_tran.detach()
+        else:
+            # Initialize the camera pose for the current frame
+            params['cam_unnorm_rots'][..., curr_time_idx] = params['cam_unnorm_rots'][..., curr_time_idx-1].detach()
+            params['cam_trans'][..., curr_time_idx] = params['cam_trans'][..., curr_time_idx-1].detach()
+       
+        # # GT pose作为初始值
+        # rel_w2c = gt_w2c
+        # rel_w2c_rot = rel_w2c[:3, :3].unsqueeze(0).detach()
+        # rel_w2c_rot_quat = matrix_to_quaternion(rel_w2c_rot)
+        # rel_w2c_tran = rel_w2c[:3, 3].detach()
+        # # Update the camera parameters
+        # params['cam_unnorm_rots'][..., curr_time_idx] = rel_w2c_rot_quat
+        # params['cam_trans'][..., curr_time_idx] = rel_w2c_tran
+    
+    return params
+
+
+def convert_params_to_store(params):
+    params_to_store = {}
+    for k, v in params.items():
+        if isinstance(v, torch.Tensor):
+            params_to_store[k] = v.detach().clone()
+        else:
+            params_to_store[k] = v
+    return params_to_store
+
+
+def image_gradient(image):
+    # Compute image gradient using Scharr Filter
+    c = image.shape[0]
+    conv_y = torch.tensor(
+        [[3, 0, -3], [10, 0, -10], [3, 0, -3]], dtype=torch.float32, device="cuda"
+    )
+    conv_x = torch.tensor(
+        [[3, 10, 3], [0, 0, 0], [-3, -10, -3]], dtype=torch.float32, device="cuda"
+    )
+    normalizer = 1.0 / torch.abs(conv_y).sum()
+    p_img = torch.nn.functional.pad(image, (1, 1, 1, 1), mode="reflect")[None]
+    img_grad_v = normalizer * torch.nn.functional.conv2d(
+        p_img, conv_x.view(1, 1, 3, 3).repeat(c, 1, 1, 1), groups=c
+    )
+    img_grad_h = normalizer * torch.nn.functional.conv2d(
+        p_img, conv_y.view(1, 1, 3, 3).repeat(c, 1, 1, 1), groups=c
+    )
+    return img_grad_v[0], img_grad_h[0]
+
+
+def image_gradient_mask(image, eps=0.01):
+    # Compute image gradient mask
+    c = image.shape[0]
+    conv_y = torch.ones((1, 1, 3, 3), dtype=torch.float32, device="cuda")
+    conv_x = torch.ones((1, 1, 3, 3), dtype=torch.float32, device="cuda")
+    p_img = torch.nn.functional.pad(image, (1, 1, 1, 1), mode="reflect")[None]
+    p_img = torch.abs(p_img) > eps
+    img_grad_v = torch.nn.functional.conv2d(
+        p_img.float(), conv_x.repeat(c, 1, 1, 1), groups=c
+    )
+    img_grad_h = torch.nn.functional.conv2d(
+        p_img.float(), conv_y.repeat(c, 1, 1, 1), groups=c
+    )
+
+    return img_grad_v[0] == torch.sum(conv_x), img_grad_h[0] == torch.sum(conv_y)
+
+
+def compute_grad_mask(original_image, dataset, edge_threshold=1.1):
+    gray_img = original_image.mean(dim=0, keepdim=True)
+    gray_grad_v, gray_grad_h = image_gradient(gray_img)
+    mask_v, mask_h = image_gradient_mask(gray_img)
+    gray_grad_v = gray_grad_v * mask_v
+    gray_grad_h = gray_grad_h * mask_h
+    img_grad_intensity = torch.sqrt(gray_grad_v**2 + gray_grad_h**2)
+    
+    grad_mask = None
+    if isinstance(dataset, ReplicaDataset) == isinstance(dataset, ReplicaV2Dataset):
+        edge_threshold = 4
+        row, col = 32, 32
+        multiplier = edge_threshold
+        _, h, w = original_image.shape
+        for r in range(row):
+            for c in range(col):
+                block = img_grad_intensity[
+                    :,
+                    r * int(h / row) : (r + 1) * int(h / row),
+                    c * int(w / col) : (c + 1) * int(w / col),
+                ]
+                th_median = block.median()
+                block[block > (th_median * multiplier)] = 1
+                block[block <= (th_median * multiplier)] = 0
+        grad_mask = img_grad_intensity
+    else:
+        median_img_grad_intensity = img_grad_intensity.median()
+        grad_mask = (
+            img_grad_intensity > median_img_grad_intensity * edge_threshold
+        )
+    return grad_mask
+
+
+def get_tracking_pose_prior_loss(params, time_idx, init_cam_rot, init_cam_tran, pose_prior_cfg):
+    if not pose_prior_cfg.get("enabled", False):
+        return None
+
+    curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx])
+    curr_cam_tran = params['cam_trans'][..., time_idx]
+    init_cam_rot = F.normalize(init_cam_rot)
+
+    quat_dot = torch.sum(curr_cam_rot * init_cam_rot, dim=-1).abs().clamp(max=1.0)
+    rot_loss = torch.mean(1.0 - quat_dot)
+    trans_loss = torch.mean((curr_cam_tran - init_cam_tran) ** 2)
+
+    rot_weight = float(pose_prior_cfg.get("rot_weight", 0.0))
+    trans_weight = float(pose_prior_cfg.get("trans_weight", 0.0))
+    return rot_weight * rot_loss + trans_weight * trans_loss
+
+
+def rgbd_slam(config: dict):
+    # Print Config
+    print("Loaded Config:")
+    if "use_depth_loss_thres" not in config['tracking']:
+        config['tracking']['use_depth_loss_thres'] = False
+        config['tracking']['depth_loss_thres'] = 100000
+    if "visualize_tracking_loss" not in config['tracking']:
+        config['tracking']['visualize_tracking_loss'] = False
+    if "gaussian_distribution" not in config:
+        config['gaussian_distribution'] = "isotropic"
+    if "dynamic_mask" not in config:
+        config["dynamic_mask"] = {"enabled": False}
+    if "dynamic_4dgs" not in config:
+        config["dynamic_4dgs"] = {"enabled": False}
+    config["dynamic_4dgs"] = merge_dynamic_4dgs_config(config["dynamic_4dgs"])
+    if "sky_mask" not in config:
+        config["sky_mask"] = {"enabled": False}
+    covisibility_cfg = config["mapping"].setdefault("covisibility", {})
+    covisibility_cfg.setdefault("min_score", 0.10)
+    covisibility_cfg.setdefault("relative_score_ratio", 0.40)
+    covisibility_cfg.setdefault("sample_pixels", 1600)
+    covisibility_cfg.setdefault("depth_abs_tolerance", 0.20)
+    covisibility_cfg.setdefault("depth_rel_tolerance", 0.05)
+    covisibility_cfg.setdefault("edge", 20)
+    covisibility_cfg.setdefault("weight_power", 1.0)
+    covisibility_cfg.setdefault("weight_epsilon", 1e-8)
+    pose_init_only = config.get("pose_init_only", False)
+    freeze_tracking_pose = config.get("tracking", {}).get("freeze_pose_optimization", False)
+    tracking_pose_prior_cfg = config.get("tracking", {}).get("pose_prior", {})
+    print(f"{config}")
+
+    # Create Output Directories
+    output_dir = os.path.join(config["workdir"], config["run_name"])
+    eval_dir = os.path.join(output_dir, "eval")
+    os.makedirs(eval_dir, exist_ok=True)
+    plot_progress_dir = os.path.join(output_dir, "plot_progress")
+    os.makedirs(plot_progress_dir, exist_ok=True)
+    
+    # Init WandB
+    if config['use_wandb']:
+        wandb_time_step = 0
+        wandb_tracking_step = 0
+        wandb_mapping_step = 0
+        wandb_run = wandb.init(project=config['wandb']['project'],
+                               entity=config['wandb']['entity'],
+                               group=config['wandb']['group'],
+                               name=config['wandb']['name'],
+                               config=config)
+
+    # Get Device
+    device = torch.device(config["primary_device"])
+
+    # SuperPoint+LightGlue
+    max_num_keypoints = 1024
+    sp_extractor = SuperPoint(max_num_keypoints=max_num_keypoints).eval().to(device)
+    match_conf = {
+        "width_confidence": 0.99,  # for point pruning
+        "depth_confidence": 0.95,  # for early stopping,
+    }
+    lg_matcher = LightGlue(pretrained="superpoint", **match_conf).eval().to(device)
+
+    # Load Dataset
+    print("Loading Dataset ...")
+    dataset_config = config["data"]
+    if "gradslam_data_cfg" not in dataset_config:
+        gradslam_data_cfg = {}
+        gradslam_data_cfg["dataset_name"] = dataset_config["dataset_name"]
+    else:
+        gradslam_data_cfg = load_dataset_config(dataset_config["gradslam_data_cfg"])
+    if "ignore_bad" not in dataset_config:
+        dataset_config["ignore_bad"] = False
+    if "use_train_split" not in dataset_config:
+        dataset_config["use_train_split"] = True
+    if "densification_image_height" not in dataset_config:
+        dataset_config["densification_image_height"] = dataset_config["desired_image_height"]
+        dataset_config["densification_image_width"] = dataset_config["desired_image_width"]
+        seperate_densification_res = False
+    else:
+        if dataset_config["densification_image_height"] != dataset_config["desired_image_height"] or \
+            dataset_config["densification_image_width"] != dataset_config["desired_image_width"]:
+            seperate_densification_res = True
+        else:
+            seperate_densification_res = False
+    if "tracking_image_height" not in dataset_config:
+        dataset_config["tracking_image_height"] = dataset_config["desired_image_height"]
+        dataset_config["tracking_image_width"] = dataset_config["desired_image_width"]
+        seperate_tracking_res = False
+    else:
+        if dataset_config["tracking_image_height"] != dataset_config["desired_image_height"] or \
+            dataset_config["tracking_image_width"] != dataset_config["desired_image_width"]:
+            seperate_tracking_res = True
+        else:
+            seperate_tracking_res = False
+    # Poses are relative to the first frame
+    dataset = get_dataset(
+        config_dict=gradslam_data_cfg,
+        basedir=dataset_config["basedir"],
+        sequence=os.path.basename(dataset_config["sequence"]),
+        start=dataset_config["start"],
+        end=dataset_config["end"],
+        stride=dataset_config["stride"],
+        desired_height=dataset_config["desired_image_height"],
+        desired_width=dataset_config["desired_image_width"],
+        device=device,
+        relative_pose=True,
+        ignore_bad=dataset_config["ignore_bad"],
+        use_train_split=dataset_config["use_train_split"],
+    )
+
+    sky_mask_predictor = SkyMaskPredictor(
+        config.get("sky_mask", {}),
+        dataset,
+        device,
+        output_dir,
+    )
+
+    dynamic_mask_manager = DynamicMaskManager(
+        config.get("dynamic_mask", {}),
+        dataset_config,
+        dataset,
+        output_dir,
+        PROJECT_ROOT,
+        device,
+    )
+    lidar_warp_tracker = LidarWarpLoss(
+        dataset,
+        PROJECT_ROOT,
+        config.get("tracking", {}).get("lidar_warp", {}),
+        device,
+    )
+    lidar_warp_diagnostics = LidarWarpDiagnostics(
+        eval_dir,
+        config.get("tracking", {}).get("lidar_warp", {}),
+    )
+
+    # print(isinstance(dataset, KittiDataset))
+    # print(isinstance(dataset, EurocDataset))
+    # print(isinstance(dataset, GradSLAMDataset))
+    # print(isinstance(dataset, torch.utils.data.Dataset))
+    # exit()
+    first_color_frame, first_depth_frame, _, _, depth_original_first_frame, _ = dataset[0]
+    first_color_frame = first_color_frame.permute(2, 0, 1) / 255
+    if depth_original_first_frame is not None:
+        depth_for_threshold = depth_original_first_frame.permute(2, 0, 1)
+    else:
+        depth_for_threshold = first_depth_frame.permute(2, 0, 1)
+    first_sky_mask = sky_mask_predictor.get_mask(0, first_color_frame)
+    threshold_depth = apply_sky_mask_to_depth(depth_for_threshold, first_sky_mask)
+    valid_threshold_depth = threshold_depth[threshold_depth > 0]
+    if valid_threshold_depth.numel() == 0:
+        valid_threshold_depth = depth_for_threshold[depth_for_threshold > 0]
+    pixel_gs_depth_threshold = config['pixel_gs_depth_gamma'] * torch.max(valid_threshold_depth).item()
+    config['pixel_gs_depth_threshold'] = pixel_gs_depth_threshold
+
+    num_frames = dataset_config["num_frames"]
+    if num_frames == -1:
+        num_frames = len(dataset)
+
+    # Init seperate dataloader for densification if required
+    if seperate_densification_res:
+        densify_dataset = get_dataset(
+            config_dict=gradslam_data_cfg,
+            basedir=dataset_config["basedir"],
+            sequence=os.path.basename(dataset_config["sequence"]),
+            start=dataset_config["start"],
+            end=dataset_config["end"],
+            stride=dataset_config["stride"],
+            desired_height=dataset_config["densification_image_height"],
+            desired_width=dataset_config["densification_image_width"],
+            device=device,
+            relative_pose=True,
+            ignore_bad=dataset_config["ignore_bad"],
+            use_train_split=dataset_config["use_train_split"],
+        )
+        # Initialize Parameters, Canonical & Densification Camera parameters
+        params, variables, intrinsics, first_frame_w2c, cam, \
+            densify_intrinsics, densify_cam = initialize_first_timestep(dataset, num_frames,
+                                                                        config['scene_radius_depth_ratio'],
+                                                                        config['mean_sq_dist_method'],
+                                                                        densify_dataset=densify_dataset,
+                                                                        gaussian_distribution=config['gaussian_distribution'], config=config,
+                                                                        sky_mask_predictor=sky_mask_predictor)
+    else:
+        # Initialize Parameters & Canoncial Camera parameters
+        params, variables, intrinsics, first_frame_w2c, cam = initialize_first_timestep(dataset, num_frames, 
+                                                                                        config['scene_radius_depth_ratio'],
+                                                                                        config['mean_sq_dist_method'],
+                                                                                        gaussian_distribution=config['gaussian_distribution'], config=config,
+                                                                                        sky_mask_predictor=sky_mask_predictor)
+    
+    # Init seperate dataloader for tracking if required
+    if seperate_tracking_res:
+        tracking_dataset = get_dataset(
+            config_dict=gradslam_data_cfg,
+            basedir=dataset_config["basedir"],
+            sequence=os.path.basename(dataset_config["sequence"]),
+            start=dataset_config["start"],
+            end=dataset_config["end"],
+            stride=dataset_config["stride"],
+            desired_height=dataset_config["tracking_image_height"],
+            desired_width=dataset_config["tracking_image_width"],
+            device=device,
+            relative_pose=True,
+            ignore_bad=dataset_config["ignore_bad"],
+            use_train_split=dataset_config["use_train_split"],
+        )
+        tracking_color, _, tracking_intrinsics, _ = tracking_dataset[0]
+        tracking_color = tracking_color.permute(2, 0, 1) / 255 # (H, W, C) -> (C, H, W)
+        tracking_intrinsics = tracking_intrinsics[:3, :3]
+        tracking_cam = setup_camera(tracking_color.shape[2], tracking_color.shape[1], 
+                                    tracking_intrinsics.cpu().numpy(), first_frame_w2c.detach().cpu().numpy(), depth_threshold=config['pixel_gs_depth_threshold'])
+    
+    dynamic_4dgs_cfg = config.get("dynamic_4dgs", {})
+    dynamic_params = None
+
+    # Initialize list to keep track of Keyframes
+    keyframe_list = []
+    keyframe_time_indices = []
+    
+    # Init Variables to keep track of ground truth poses and runtimes
+    gt_w2c_all_frames = []
+    tracking_iter_time_sum = 0
+    tracking_iter_time_count = 0
+    mapping_iter_time_sum = 0
+    mapping_iter_time_count = 0
+    tracking_frame_time_sum = 0
+    tracking_frame_time_count = 0
+    mapping_frame_time_sum = 0
+    mapping_frame_time_count = 0
+
+    # Load Checkpoint
+    if config['load_checkpoint']:
+        checkpoint_time_idx = config['checkpoint_time_idx']
+        print(f"Loading Checkpoint for Frame {checkpoint_time_idx}")
+        ckpt_path = os.path.join(config['workdir'], config['run_name'], f"params{checkpoint_time_idx}.npz")
+        params = dict(np.load(ckpt_path, allow_pickle=True))
+        params = {k: torch.tensor(params[k]).cuda().float().requires_grad_(True) for k in params.keys()}
+        variables['max_2D_radius'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+        variables['means2D_gradient_accum'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+        variables['denom'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+        variables['timestep'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+        # Load the keyframe time idx list
+        keyframe_time_indices = np.load(os.path.join(config['workdir'], config['run_name'], f"keyframe_time_indices{checkpoint_time_idx}.npy"))
+        keyframe_time_indices = keyframe_time_indices.tolist()
+        # Update the ground truth poses list
+        for time_idx in range(checkpoint_time_idx):
+            # Load RGBD frames incrementally instead of all frames
+            color, depth, _, gt_pose, depth_original, global_feature = dataset[time_idx]
+            # Process poses
+            gt_w2c = torch.linalg.inv(gt_pose)
+            gt_w2c_all_frames.append(gt_w2c)
+            # Initialize Keyframe List
+            if time_idx in keyframe_time_indices:
+                # Get the estimated rotation & translation
+                curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
+                curr_cam_tran = params['cam_trans'][..., time_idx].detach()
+                curr_w2c = torch.eye(4).cuda().float()
+                curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
+                curr_w2c[:3, 3] = curr_cam_tran
+                # Initialize Keyframe Info
+                color = color.permute(2, 0, 1) / 255
+                depth = depth.permute(2, 0, 1)
+                sky_mask = sky_mask_predictor.get_mask(time_idx, color)
+                kf_frame_id = get_dataset_frame_id(dataset, time_idx)
+                kf_reference_frame_id = get_dataset_frame_id(dataset, time_idx - 1) if time_idx > 0 else None
+                dynamic_observation = load_dynamic_observation(
+                    output_dir,
+                    dynamic_4dgs_cfg,
+                    time_idx,
+                    kf_frame_id,
+                    kf_reference_frame_id,
+                    (color.shape[1], color.shape[2]),
+                    device,
+                )
+                curr_keyframe = {
+                    'id': time_idx,
+                    'frame_id': kf_frame_id,
+                    'est_w2c': curr_w2c,
+                    'color': color,
+                    'depth': depth,
+                    'intrinsics': intrinsics,
+                    'sky_mask': sky_mask,
+                    'dynamic_mask': dynamic_observation.get('dynamic_mask') if dynamic_observation is not None else None,
+                    'dynamic_score': dynamic_observation.get('dynamic_score') if dynamic_observation is not None else None,
+                }
+                # Add to keyframe list
+                keyframe_list.append(curr_keyframe)
+    else:
+        checkpoint_time_idx = 0
+
+    # Iterate over Scan
+    for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
+        # Load RGBD frames incrementally instead of all frames
+        color, depth, _, gt_pose, depth_original, global_feature = dataset[time_idx]
+        # Process poses
+        gt_w2c = torch.linalg.inv(gt_pose)
+        # Process RGB-D Data
+        color = color.permute(2, 0, 1) / 255
+        depth = depth.permute(2, 0, 1)
+        depth_original = depth_original.permute(2, 0, 1) if depth_original is not None else None
+        sky_mask = sky_mask_predictor.get_mask(time_idx, color)
+        frame_id = get_dataset_frame_id(dataset, time_idx)
+        reference_frame_id = get_dataset_frame_id(dataset, time_idx - 1) if time_idx > 0 else None
+        dynamic_observation = load_dynamic_observation(
+            output_dir,
+            dynamic_4dgs_cfg,
+            time_idx,
+            frame_id,
+            reference_frame_id,
+            (color.shape[1], color.shape[2]),
+            device,
+        )
+        dynamic_mask = dynamic_observation.get("dynamic_mask") if dynamic_observation is not None else None
+        color_for_matching = apply_sky_mask_to_color(color, sky_mask)
+        depth_original_for_matching = apply_sky_mask_to_depth(depth_original, sky_mask)
+        color_for_matching = apply_dynamic_mask_to_color(color_for_matching, dynamic_mask)
+        depth_original_for_matching = apply_dynamic_mask_to_depth(depth_original_for_matching, dynamic_mask)
+        gt_w2c_all_frames.append(gt_w2c)
+        curr_gt_w2c = gt_w2c_all_frames
+        # Optimize only current time step for tracking
+        iter_time_idx = time_idx
+        curr_frame_data = {
+            'cam': cam,
+            'im': color,
+            'match_im': color_for_matching,
+            'depth': depth,
+            'depth_original': depth_original_for_matching,
+            'id': iter_time_idx,
+            'intrinsics': intrinsics,
+            'w2c': first_frame_w2c,
+            'iter_gt_w2c_list': curr_gt_w2c,
+            'frame_id': frame_id,
+            'depth_threshold': config['pixel_gs_depth_threshold'],
+            'sky_mask': sky_mask,
+        }
+        if dynamic_observation is not None:
+            curr_frame_data.update(dynamic_observation)
+
+        # if time_idx == num_frames - 1:
+        #     config["tracking"]["use_gt_poses"] = False
+        #     # config["tracking"]["use_l1"] = False
+        #     # config["mapping"]["use_l1"] = False
+        #     # config["tracking"]["ignore_outlier_depth_loss"] = False
+        #     # config["mapping"]["ignore_outlier_depth_loss"] = False
+        # else:
+        #     config["tracking"]["use_gt_poses"] = True
+        print("use_gt_poses =", config["tracking"]["use_gt_poses"])
+
+        if config["use_warp_loss"]:
+            if depth_original_for_matching is not None:
+                mask = (depth_original_for_matching < 0.1) | (depth_original_for_matching > np.max([30.0, dataset.depth_filter_far]))
+            else:
+                mask = (depth < 0.1) | (depth > np.max([30.0, dataset.depth_filter_far]))
+            color_feature = torch.clone(color_for_matching)
+            color_feature[:, mask[0]] = 0
+            # color_height = color_feature.shape[1]
+            # color_feature[:, :int(color_height / 2), :] = 0
+            # im_show = color_feature.detach().cpu().numpy().transpose([1, 2, 0])
+            # print(im_show.shape)
+            # cv2.imshow('im_show', im_show)
+            # cv2.waitKey(0)
+            # exit()
+            curr_feats, curr_desc_all = extract_feature(color_feature, depth_original_for_matching, sp_extractor, device)
+        else:
+            curr_feats = None
+            curr_desc_all = None
+        # print(time_idx, image_name)
+
+        if time_idx == 0:
+            last_data = None
+        else:
+            last_data = curr_data
+            # print('init = ', len(last_data['iter_gt_w2c_list']))
+            if config["use_warp_loss"]:
+                match_save_dir = os.path.join(eval_dir, "match_res")
+                os.makedirs(match_save_dir, exist_ok=True)
+                match_save_path = os.path.join(match_save_dir, "{}_matches.png".format(time_idx))
+                mkpts_cur, mkpts_last, mscores = match_feature(
+                    config,
+                    curr_frame_data["match_im"],
+                    curr_feats,
+                    intrinsics,
+                    last_data["match_im"],
+                    last_data["feats"],
+                    lg_matcher,
+                    device,
+                    topk=1024,
+                    save_path=match_save_path,
+                )
+                if mkpts_cur is not None and mkpts_cur.shape[0] > 10:
+                    np.savetxt(os.path.join(match_save_dir, "{}_inliers.txt".format(time_idx)), mkpts_cur.shape)
+                    pnp_result = estimate_pnp(mkpts_cur, mkpts_last, curr_frame_data, last_data, dataset)
+                    if pnp_result is not None:
+                        pnp_prior_pose_w2c, est_T_curr_last, pnp_num_inliers = pnp_result
+                    else:
+                        pnp_num_inliers = 0
+                        pnp_prior_pose_w2c = None
+                        est_T_curr_last = np.eye(4)
+                else:
+                    pnp_num_inliers = 0
+                    pnp_prior_pose_w2c = None
+                    est_T_curr_last = np.eye(4)
+                    mkpts_cur = None
+                    mkpts_last = None
+                    mscores = None
+            else:
+                mkpts_cur = None
+                mkpts_last = None
+                mscores = None
+                pnp_prior_pose_w2c = None
+                pnp_num_inliers = 0
+                est_T_curr_last = np.eye(4)
+
+        # Initialize Mapping Data for selected frame
+        curr_data = {**curr_frame_data, "feats": curr_feats, "descs": curr_desc_all}
+
+        grad_mask = None
+        if config["use_grad_mask"]:
+            print("use_grad mask")
+            grad_mask = compute_grad_mask(curr_data['im'], dataset=dataset, edge_threshold=1.1)
+            if sky_mask is not None:
+                grad_mask = grad_mask & invert_bool_mask(sky_mask)
+            
+            # print(grad_mask.shape)
+            # print(curr_data['im'].shape)
+            # show_grad_mask = grad_mask.detach().cpu().numpy()[0, :, :]
+            # show_color = curr_data['im'].detach().cpu().numpy().transpose([1, 2, 0])
+            # print(show_grad_mask.shape)
+            # print(show_color.shape)
+            # cv2.imshow('1', show_grad_mask)
+            # cv2.imshow('2', show_color)
+            # cv2.waitKey(0)
+            # exit()
+
+        # Initialize Data for Tracking
+        if seperate_tracking_res:
+            tracking_color, tracking_depth, _, _ = tracking_dataset[time_idx]
+            tracking_color = tracking_color.permute(2, 0, 1) / 255
+            tracking_depth = tracking_depth.permute(2, 0, 1)
+            tracking_sky_mask = resize_bool_mask(sky_mask, tracking_color.shape[1], tracking_color.shape[2])
+            tracking_dynamic_mask = resize_dynamic_bool_mask(dynamic_mask, tracking_color.shape[1], tracking_color.shape[2])
+            tracking_curr_data = {'cam': tracking_cam, 'im': tracking_color, 'depth': tracking_depth, 'id': iter_time_idx,
+                                  'intrinsics': tracking_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c,
+                                  "frame_id": frame_id, "depth_threshold": config['pixel_gs_depth_threshold'],
+                                  'sky_mask': tracking_sky_mask, 'dynamic_mask': tracking_dynamic_mask}
+        else:
+            tracking_curr_data = curr_data
+
+        # Optimization Iterations
+        num_iters_mapping = config['mapping']['num_iters']
+
+        color_tmp = color.permute(1, 2, 0) # (C, H, W) -> (H, W, C)
+        if depth_original is not None:
+            depth_tmp = depth_original.permute(1, 2, 0) # (C, H, W) -> (H, W, C)
+        else:
+            depth_tmp = depth.permute(1, 2, 0) # (C, H, W) -> (H, W, C)
+        depth_tmp = depth_tmp.squeeze(-1)
+        x, y = np.meshgrid(
+                range(color_tmp.shape[1]), range(color_tmp.shape[0])
+            )
+        pts = np.vstack(
+            (
+                x.flatten(),
+                y.flatten(),
+                np.ones(color_tmp.shape[0] * color_tmp.shape[1]),
+            )
+        )
+        pts = torch.tensor(pts, dtype=torch.float32, device=device)
+        depth_tmp = depth_tmp.flatten()
+        color_tmp = color_tmp.reshape([-1, 3])
+        valid_depth_mask = (depth_tmp > np.max([0.1, dataset.depth_filter_near])) & (depth_tmp < np.max([30.0, dataset.depth_filter_far]))
+        if sky_mask is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(sky_mask).flatten()
+        if dynamic_mask is not None:
+            valid_depth_mask = valid_depth_mask & invert_bool_mask(dynamic_mask).flatten()
+        valid_depth_indices = torch.where(valid_depth_mask)[0]
+        pts = pts[:, valid_depth_indices]
+        depth_tmp = depth_tmp[valid_depth_indices]
+        color_tmp = color_tmp[valid_depth_indices, :]
+        X = torch.multiply(depth_tmp.flatten(), torch.linalg.inv(intrinsics) @ pts) # (3, n)
+        pc = o3d.geometry.PointCloud()
+        pc.points = o3d.utility.Vector3dVector(X.t().cpu().numpy())
+        pc.colors = o3d.utility.Vector3dVector(color_tmp.cpu().numpy())
+        curr_data = {**curr_data, "pc": pc}
+        
+        if time_idx == 0:
+            init_pose = np.eye(4)
+
+        # Initialize the camera pose for the current frame
+        if time_idx > 0:
+            pose_init_method = config.get("pose_init_method", "pnp_icp")
+            if not config['use_warp_loss'] or pnp_num_inliers < 10:
+                print('use motion model prior pose')
+                params = initialize_camera_pose(params, time_idx, forward_prop=config['tracking']['forward_prop'], gt_w2c=gt_w2c)
+                # est_T_curr_last = init_pose
+            else:
+                # inlier_threshold = 50
+                # if isinstance(dataset, KittiDataset):
+                #     inlier_threshold = 150
+
+                if pose_init_method == "pnp_fused_icp":
+                    init_pose = est_T_curr_last
+                    icp_corr_threshold = config['tracking']['icp_corr_threshold']
+                    if pnp_num_inliers < 50:
+                        icp_corr_threshold = np.max([3.0, icp_corr_threshold])
+                    params, init_pose, fitness, inlier_rmse = fused_icp_init_camera_pose(
+                        params,
+                        time_idx,
+                        curr_data['pc'],
+                        last_data['pc'],
+                        dataset,
+                        curr_data["frame_id"],
+                        last_data["frame_id"],
+                        init_pose,
+                        icp_corr_threshold,
+                        device,
+                        PROJECT_ROOT,
+                        icp,
+                        lidar_max_points=config['tracking'].get('fused_lidar_max_points', 120000),
+                        lidar_min_forward_m=config['tracking'].get('lidar_min_forward_m', 0.0),
+                        lidar_max_forward_m=config['tracking'].get('lidar_max_forward_m', 0.0),
+                    )
+                    print("fused icp fitness/rmse = ", fitness, inlier_rmse)
+                elif (config.get('enable_pnp_init', False) or not isinstance(dataset, KittiDataset)) and pnp_num_inliers > 50:
+                # if pnp_num_inliers > inlier_threshold:
+                    print('use pnp prior pose')
+                    with torch.no_grad():
+                        # use prior pose from pnp
+                        rel_w2c_rot = (
+                            torch.from_numpy(pnp_prior_pose_w2c[:3, :3])
+                            .unsqueeze(0)
+                            .detach()
+                            .to(device)
+                        )
+                        rel_w2c_rot_quat = matrix_to_quaternion(rel_w2c_rot)
+                        rel_w2c_tran = (
+                            torch.from_numpy(pnp_prior_pose_w2c[:3, 3]).detach().to(device)
+                        )
+                        # Update the camera parameters
+                        params["cam_unnorm_rots"][..., time_idx] = rel_w2c_rot_quat
+                        params["cam_trans"][..., time_idx] = rel_w2c_tran
+                else:
+                    init_pose = est_T_curr_last
+                    icp_corr_threshold = config['tracking']['icp_corr_threshold']
+                    if pnp_num_inliers < 50:
+                        icp_corr_threshold = np.max([3.0, icp_corr_threshold])
+                    
+                    params, init_pose = icp_init_camera_pose(params, time_idx, curr_data['pc'], last_data['pc'], intrinsics, dataset.depth_filter_near, 
+                                                                dataset.depth_filter_far, init_pose, icp_corr_threshold, device)
+                    
+                    curr_gt_pose_w2c = torch.clone(curr_data['iter_gt_w2c_list'][-1]).detach().cpu().numpy()
+                    last_gt_pose_w2c = torch.clone(last_data['iter_gt_w2c_list'][-2]).detach().cpu().numpy()
+                    gt_T_curr_last = curr_gt_pose_w2c @ np.linalg.inv(last_gt_pose_w2c)
+
+                    T_error = np.linalg.inv(init_pose) @ gt_T_curr_last
+                    r_err = cv2.Rodrigues(T_error[:3, :3])[0]
+                    r_err = np.linalg.norm(r_err) * 180 / math.pi
+                    t_err = np.linalg.norm(T_error[:3, 3], ord=2)
+                    print("icp T_error = ", r_err, t_err)
+                    # exit()
+
+        if pose_init_only:
+            with torch.no_grad():
+                curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
+                curr_cam_tran = params['cam_trans'][..., time_idx].detach()
+                curr_w2c = torch.eye(4, device=device).float()
+                curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
+                curr_w2c[:3, 3] = curr_cam_tran
+                curr_data = {**curr_data, "est_w2c": curr_w2c.detach()}
+
+            if (
+                ((time_idx == 0) or ((time_idx + 1) % config['keyframe_every'] == 0) or (time_idx == num_frames - 2))
+                and (not torch.isinf(curr_gt_w2c[-1]).any())
+                and (not torch.isnan(curr_gt_w2c[-1]).any())
+            ):
+                keyframe_time_indices.append(time_idx)
+
+            if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
+                ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
+                save_params_ckpt(params, ckpt_output_dir, time_idx)
+                np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{time_idx}.npy"), np.array(keyframe_time_indices))
+
+            if config['use_wandb']:
+                wandb_time_step += 1
+
+            torch.cuda.empty_cache()
+            continue
+
+        lidar_warp_pair = None
+        if time_idx > 0 and lidar_warp_tracker.enabled:
+            lidar_warp_pair = lidar_warp_tracker.prepare_pair(
+                params,
+                time_idx,
+                last_data,
+                curr_data,
+                keyframe_list=keyframe_list,
+            )
+            if lidar_warp_pair is not None:
+                print(
+                    "lidar warp mode = ",
+                    lidar_warp_pair.get("mode", "unknown"),
+                    "correspondences = ",
+                    lidar_warp_pair["num_correspondences"],
+                    "mean init corr = ",
+                    lidar_warp_pair["mean_init_corr_m"],
+                )
+
+        with torch.no_grad():
+            init_cam_rot_for_tracking = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach().clone())
+            init_cam_tran_for_tracking = params['cam_trans'][..., time_idx].detach().clone()
+
+        # Tracking
+        tracking_start_time = time.time()
+        if time_idx > 0 and (not config['tracking']['use_gt_poses']) and (not freeze_tracking_pose):
+            # Reset Optimizer & Learning Rates for tracking
+            optimizer = initialize_optimizer(params, config['tracking']['lrs'], tracking=True)
+            # pose_rot_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
+            #                                                         T_max=config['tracking']['num_iters'],
+            #                                                         eta_min=1e-3)
+            # pose_trans_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
+            #                                                         T_max=config['tracking']['num_iters'],
+            #                                                         eta_min=1e-3)
+            milestones = [int(config['tracking']['num_iters'] * 0.8),
+                          int(config['tracking']['num_iters'] * 0.85),
+                          int(config['tracking']['num_iters'] * 0.9),]
+            pose_rot_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=0.9)
+            pose_trans_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=0.9)
+            # Keep Track of Best Candidate Rotation & Translation
+            candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
+            candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
+            current_min_loss = float(1e20)
+            # Tracking Optimization
+            iter = 0
+            do_continue_slam = False
+            num_iters_tracking = config['tracking']['num_iters']
+            if config["use_warp_loss"] and pnp_prior_pose_w2c is None:
+                num_iters_tracking *= 2
+            progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
+            while True:
+                iter_start_time = time.time()
+                # print('learning rate = ', optimizer.state_dict()['param_groups'][5]['name'], optimizer.state_dict()['param_groups'][5]['lr'])
+                # print('learning rate = ', optimizer.state_dict()['param_groups'][6]['name'], optimizer.state_dict()['param_groups'][6]['lr'])
+                # Loss for current frame
+                loss, variables, losses = get_loss(params, tracking_curr_data, variables, iter_time_idx, config['tracking']['loss_weights'],
+                                                   config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
+                                                   config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
+                                                   plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
+                                                   tracking_iteration=iter, grad_mask=grad_mask)
+                rgbd_loss_raw = loss
+                rgbd_loss_weighted = loss
+                image_warp_loss_raw = None
+                image_warp_loss_weighted = None
+                if config["use_warp_loss"] and time_idx > 0 and mkpts_cur is not None:
+                    image_warp_loss_raw = get_loss_from_match(
+                        time_idx,
+                        mkpts_cur,
+                        mkpts_last,
+                        mscores,
+                        params,
+                        curr_data,
+                        last_data,
+                        iter,
+                        device,
+                        config,
+                    )
+                    weight_warp = float(config["weight_warp"])
+                    # if mkpts_cur.shape[0] < 20:
+                    #     weight_warp *= 0.1
+                    # elif mkpts_cur.shape[0] < 50:
+                    #     weight_warp *= 0.7
+                    image_warp_loss_weighted = image_warp_loss_raw * weight_warp
+                    # loss = 0
+                    # loss = warp_loss
+                    rgbd_loss_weighted = rgbd_loss_raw / weight_warp
+                    loss = rgbd_loss_weighted + image_warp_loss_weighted
+                    # print(loss, warp_loss)
+                    # if iter < num_iters_tracking / 3:
+                    #     loss = warp_loss
+                    # else:
+                    #     loss = loss * 0.01 + warp_loss
+
+                lidar_warp_loss = None
+                lidar_warp_loss_weighted = None
+                lidar_warp_plane = None
+                lidar_warp_p2p = None
+                if lidar_warp_pair is not None:
+                    lidar_refresh_every = lidar_warp_tracker.refresh_every()
+                    if iter > 0 and lidar_refresh_every > 0 and iter % lidar_refresh_every == 0:
+                        refreshed_lidar_warp_pair = lidar_warp_tracker.refresh_correspondences(
+                            params,
+                            time_idx,
+                            lidar_warp_pair,
+                        )
+                        if refreshed_lidar_warp_pair is not None:
+                            lidar_warp_pair = refreshed_lidar_warp_pair
+                    lidar_warp_loss, lidar_warp_losses = lidar_warp_tracker.compute_loss(
+                        params,
+                        time_idx,
+                        lidar_warp_pair,
+                    )
+                    lidar_warp_weight = float(
+                        config["tracking"]["lidar_warp"].get("weight", 1.0)
+                    )
+                    lidar_warp_loss_weighted = lidar_warp_weight * lidar_warp_loss
+                    loss = loss + lidar_warp_loss_weighted
+                    lidar_warp_plane = lidar_warp_losses.get("lidar_warp_plane")
+                    lidar_warp_p2p = lidar_warp_losses.get("lidar_warp_p2p")
+                    losses.update(lidar_warp_losses)
+                    losses["lidar_warp"] = lidar_warp_loss_weighted.detach()
+                    losses["loss"] = loss
+
+                pose_prior_loss = get_tracking_pose_prior_loss(
+                    params,
+                    time_idx,
+                    init_cam_rot_for_tracking,
+                    init_cam_tran_for_tracking,
+                    tracking_pose_prior_cfg,
+                )
+                if pose_prior_loss is not None:
+                    loss = loss + pose_prior_loss
+                    losses["pose_prior"] = pose_prior_loss.detach()
+                losses["loss"] = loss
+
+                gradient_sampled = lidar_warp_diagnostics.should_sample_gradients(
+                    iter,
+                    num_iters_tracking,
+                )
+                gradient_stats = None
+                if gradient_sampled and lidar_warp_loss_weighted is not None:
+                    other_pose_loss = loss - lidar_warp_loss_weighted
+                    gradient_stats = pose_gradient_diagnostics(
+                        lidar_warp_loss_weighted,
+                        other_pose_loss,
+                        params,
+                        time_idx,
+                        config['tracking']['lrs']['cam_unnorm_rots'],
+                        config['tracking']['lrs']['cam_trans'],
+                    )
+                lidar_warp_diagnostics.record(
+                    frame=time_idx,
+                    frame_id=frame_id,
+                    iteration=iter,
+                    gradient_sampled=gradient_sampled,
+                    pair=lidar_warp_pair,
+                    rgbd_loss_raw=rgbd_loss_raw,
+                    rgbd_loss_weighted=rgbd_loss_weighted,
+                    image_warp_loss_raw=image_warp_loss_raw,
+                    image_warp_loss_weighted=image_warp_loss_weighted,
+                    lidar_warp_loss_raw=lidar_warp_loss,
+                    lidar_warp_loss_weighted=lidar_warp_loss_weighted,
+                    lidar_warp_plane=lidar_warp_plane,
+                    lidar_warp_p2p=lidar_warp_p2p,
+                    pose_prior_loss=pose_prior_loss,
+                    total_loss=loss,
+                    gradient_stats=gradient_stats,
+                )
+
+                if config['use_wandb']:
+                    # Report Loss
+                    wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
+                # Backprop
+                loss.backward()
+                # Optimizer Update
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                pose_rot_scheduler.step()
+                pose_trans_scheduler.step()
+                with torch.no_grad():
+                    # Save the best candidate rotation & translation
+                    if loss < current_min_loss:
+                        current_min_loss = loss
+                        candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
+                        candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
+                    # Report Progress
+                    if config['report_iter_progress']:
+                        if config['use_wandb']:
+                            report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True,
+                                            wandb_run=wandb_run, wandb_step=wandb_tracking_step, wandb_save_qual=config['wandb']['save_qual'])
+                        else:
+                            report_progress(params, tracking_curr_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True)
+                    else:
+                        progress_bar.update(1)
+                    # plot_progress(params, curr_data, time_idx, time_idx, sil_thres=config['tracking']['sil_thres'], plot_dir=plot_progress_dir, iter=iter, loss=loss)
+                # Update the runtime numbers
+                iter_end_time = time.time()
+                tracking_iter_time_sum += iter_end_time - iter_start_time
+                tracking_iter_time_count += 1
+                # Check if we should stop tracking
+                iter += 1
+                if iter == num_iters_tracking:
+                    if config['tracking']['use_l1'] and losses['depth'] < config['tracking']['depth_loss_thres'] and config['tracking']['use_depth_loss_thres']:
+                        break
+                    elif config['tracking']['use_depth_loss_thres'] and not do_continue_slam:
+                        do_continue_slam = True
+                        progress_bar = tqdm(range(num_iters_tracking), desc=f"Tracking Time Step: {time_idx}")
+                        num_iters_tracking = 2*num_iters_tracking
+                        if config['use_wandb']:
+                            wandb_run.log({"Tracking/Extra Tracking Iters Frames": time_idx,
+                                        "Tracking/step": wandb_time_step})
+                    else:
+                        break
+
+            progress_bar.close()
+            # Copy over the best candidate rotation & translation
+            with torch.no_grad():
+                # # use gt trans y, gravity direction
+                # rel_w2c = curr_gt_w2c[-1]
+                # rel_w2c_rot = rel_w2c[:3, :3].unsqueeze(0).detach()
+                # rel_w2c_rot_quat = matrix_to_quaternion(rel_w2c_rot)
+                # rel_w2c_tran = rel_w2c[:3, 3].detach()
+                # candidate_cam_unnorm_rot[0, :] = rel_w2c_rot_quat[:]
+                # candidate_cam_tran[0, :] = rel_w2c_tran[:]
+                # # print(candidate_cam_unnorm_rot)
+                # # print(candidate_cam_tran)
+                # # print(rel_w2c_rot_quat)
+                # # print(rel_w2c_tran)
+                # # exit()
+                params['cam_unnorm_rots'][..., time_idx] = candidate_cam_unnorm_rot
+                params['cam_trans'][..., time_idx] = candidate_cam_tran
+        elif time_idx > 0 and config['tracking']['use_gt_poses']:
+            with torch.no_grad():
+                # Get the ground truth pose relative to frame 0
+                rel_w2c = curr_gt_w2c[-1]
+                rel_w2c_rot = rel_w2c[:3, :3].unsqueeze(0).detach()
+                rel_w2c_rot_quat = matrix_to_quaternion(rel_w2c_rot)
+                rel_w2c_tran = rel_w2c[:3, 3].detach()
+                # Update the camera parameters
+                params['cam_unnorm_rots'][..., time_idx] = rel_w2c_rot_quat
+                params['cam_trans'][..., time_idx] = rel_w2c_tran
+        # Update the runtime numbers
+        tracking_end_time = time.time()
+        tracking_frame_time_sum += tracking_end_time - tracking_start_time
+        tracking_frame_time_count += 1
+
+        dynamic_frontend_record = dynamic_mask_manager.run_for_frame(
+            time_idx=time_idx,
+            num_frames=num_frames,
+            params=params,
+            sky_mask=sky_mask,
+        )
+        dynamic_render_pair = None
+        dynamic_appearance_cfg = config.get("dynamic_mask", {}).get("appearance", {})
+        if (
+            dynamic_mask_manager.enabled
+            and dynamic_appearance_cfg.get("enabled", True)
+            and dynamic_appearance_cfg.get("use_mapping_render", True)
+        ):
+            with torch.no_grad():
+                dynamic_render_pair = {}
+                _, _, _ = get_loss(
+                    params,
+                    curr_data,
+                    variables,
+                    time_idx,
+                    config['mapping']['loss_weights'],
+                    config['mapping']['use_sil_for_loss'],
+                    config['mapping']['sil_thres'],
+                    config['mapping']['use_l1'],
+                    config['mapping']['ignore_outlier_depth_loss'],
+                    mapping=True,
+                    grad_mask=None,
+                    render_pair_out=dynamic_render_pair,
+                    retain_grad_for_densification=False,
+                    ignore_dynamic_mask=True,
+                )
+                dynamic_render_pair["render_source"] = "pre_mapping_static_map"
+                dynamic_render_pair["static_map_cutoff_time_idx"] = int(time_idx - 1)
+
+        dynamic_mask_ready_before_mapping = False
+        dynamic_mask_manager.finalize_for_frame(
+            time_idx=time_idx,
+            num_frames=num_frames,
+            params=params,
+            curr_data=curr_data,
+            render_pair=dynamic_render_pair,
+        )
+        frontend_dynamic_observation = load_dynamic_observation(
+            output_dir,
+            dynamic_4dgs_cfg,
+            time_idx,
+            frame_id,
+            reference_frame_id,
+            (color.shape[1], color.shape[2]),
+            device,
+        )
+        if frontend_dynamic_observation is not None:
+            curr_data.update(frontend_dynamic_observation)
+            curr_frame_data.update(frontend_dynamic_observation)
+            dynamic_mask = frontend_dynamic_observation.get("dynamic_mask")
+            dynamic_mask_ready_before_mapping = True
+
+        require_dynamic_mask_for_mapping = (
+            dynamic_mask_manager.enabled
+            and dynamic_4dgs_cfg.get("enabled", False)
+            and dynamic_4dgs_cfg.get("require_appearance_mask", False)
+        )
+        skip_mapping_without_dynamic_mask = (
+            require_dynamic_mask_for_mapping
+            and time_idx > 0
+            and curr_data.get("dynamic_mask") is None
+        )
+        if skip_mapping_without_dynamic_mask:
+            print(
+                f"Skipping static mapping at frame {time_idx}: "
+                "appearance-fused dynamic mask is required but unavailable."
+            )
+
+        if dynamic_4dgs_cfg.get("enabled", False) and curr_data.get("dynamic_mask") is not None:
+            dynamic_params, dynamic_changed = update_dynamic_params_from_frame(
+                dynamic_params,
+                curr_data,
+                params,
+                time_idx,
+                num_frames,
+                config['mean_sq_dist_method'],
+                config['gaussian_distribution'],
+                dynamic_4dgs_cfg,
+            )
+            if dynamic_changed:
+                print(
+                    f"Dynamic 4DGS updated at frame {time_idx}: "
+                    f"{dynamic_params['dyn_means3D_canon'].shape[0]} gaussians, "
+                    f"{dynamic_params['dyn_obj_trans'].shape[0]} objects"
+                )
+
+        if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
+            try:
+                # Report Final Tracking Progress
+                progress_bar = tqdm(range(1), desc=f"Tracking Result Time Step: {time_idx}")
+                with torch.no_grad():
+                    if config['use_wandb']:
+                        report_progress(params, tracking_curr_data, 1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True,
+                                        wandb_run=wandb_run, wandb_step=wandb_time_step, wandb_save_qual=config['wandb']['save_qual'], global_logging=True)
+                    else:
+                        report_progress(params, tracking_curr_data, 1, progress_bar, iter_time_idx, sil_thres=config['tracking']['sil_thres'], tracking=True)
+                progress_bar.close()
+            except:
+                ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
+                save_params_ckpt(params, ckpt_output_dir, time_idx)
+                print('Failed to evaluate trajectory.')
+
+        # Densification & KeyFrame-based Mapping
+        if (not skip_mapping_without_dynamic_mask) and (time_idx == 0 or (time_idx+1) % config['map_every'] == 0):
+            # Densification
+            if config['mapping']['add_new_gaussians'] and time_idx > 0:
+                # Setup Data for Densification
+                if seperate_densification_res:
+                    # Load RGBD frames incrementally instead of all frames
+                    densify_color, densify_depth, _, _ = densify_dataset[time_idx]
+                    densify_color = densify_color.permute(2, 0, 1) / 255
+                    densify_depth = densify_depth.permute(2, 0, 1)
+                    densify_sky_mask = resize_bool_mask(sky_mask, densify_color.shape[1], densify_color.shape[2])
+                    densify_dynamic_mask = resize_dynamic_bool_mask(dynamic_mask, densify_color.shape[1], densify_color.shape[2])
+                    densify_curr_data = {'cam': densify_cam, 'im': densify_color, 'depth': densify_depth, 'id': time_idx, 
+                                 'intrinsics': densify_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c,
+                                 'sky_mask': densify_sky_mask, 'dynamic_mask': densify_dynamic_mask}
+                else:
+                    densify_curr_data = curr_data
+
+                # Add new Gaussians to the scene based on the Silhouette
+                params, variables = add_new_gaussians(params, variables, densify_curr_data, 
+                                                      config['mapping']['sil_thres'], time_idx,
+                                                      config['mean_sq_dist_method'], config['gaussian_distribution'])
+                post_num_pts = params['means3D'].shape[0]
+                if config['use_wandb']:
+                    wandb_run.log({"Mapping/Number of Gaussians": post_num_pts,
+                                   "Mapping/step": wandb_time_step})
+            
+            with torch.no_grad():
+                # Get the current estimated rotation & translation
+                curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
+                curr_cam_tran = params['cam_trans'][..., time_idx].detach()
+                curr_w2c = torch.eye(4).cuda().float()
+                curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
+                curr_w2c[:3, 3] = curr_cam_tran
+                # Select every sufficiently co-visible keyframe. The window is
+                # threshold-based and therefore has no fixed cardinality.
+                keyframe_selection_depth = apply_sky_mask_to_depth(depth, sky_mask)
+                keyframe_selection_depth = apply_dynamic_mask_to_depth(keyframe_selection_depth, dynamic_mask)
+                selected_with_scores = keyframe_selection_covisibility(
+                    keyframe_selection_depth,
+                    curr_w2c,
+                    intrinsics,
+                    keyframe_list,
+                    min_score=covisibility_cfg['min_score'],
+                    relative_score_ratio=covisibility_cfg['relative_score_ratio'],
+                    pixels=covisibility_cfg['sample_pixels'],
+                    depth_abs_tolerance=covisibility_cfg['depth_abs_tolerance'],
+                    depth_rel_tolerance=covisibility_cfg['depth_rel_tolerance'],
+                    edge=covisibility_cfg['edge'],
+                )
+                selected_keyframes = [item['id'] for item in selected_with_scores]
+                covisibility_scores = [item['score'] for item in selected_with_scores]
+                if covisibility_scores:
+                    best_historical_score = max(covisibility_scores)
+                    effective_covisibility_threshold = max(
+                        float(covisibility_cfg['min_score']),
+                        float(covisibility_cfg['relative_score_ratio']) * best_historical_score,
+                    )
+                else:
+                    best_historical_score = 0.0
+                    effective_covisibility_threshold = float(covisibility_cfg['min_score'])
+                selected_time_idx = [keyframe_list[frame_idx]['id'] for frame_idx in selected_keyframes]
+                # The current frame is always part of its own mapping window.
+                selected_time_idx.append(time_idx)
+                selected_keyframes.append(-1)
+                covisibility_scores.append(1.0)
+
+                weight_power = float(covisibility_cfg['weight_power'])
+                if weight_power <= 0:
+                    raise ValueError("mapping.covisibility.weight_power must be positive")
+                weight_epsilon = float(covisibility_cfg['weight_epsilon'])
+                if weight_epsilon < 0:
+                    raise ValueError("mapping.covisibility.weight_epsilon must be non-negative")
+                raw_weights = np.power(
+                    np.asarray(covisibility_scores, dtype=np.float64) + weight_epsilon,
+                    weight_power,
+                )
+                mapping_frame_weights = (raw_weights / raw_weights.sum()).tolist()
+                print(
+                    f"\nMapping Window at Frame {time_idx}: "
+                    f"size={len(selected_keyframes)}, ids={selected_time_idx}, "
+                    f"threshold={effective_covisibility_threshold:.4f} "
+                    f"(absolute={float(covisibility_cfg['min_score']):.4f}, "
+                    f"relative={float(covisibility_cfg['relative_score_ratio']):.2f}"
+                    f"*best={best_historical_score:.4f}), "
+                    f"scores={[round(score, 4) for score in covisibility_scores]}, "
+                    f"weights={[round(weight, 4) for weight in mapping_frame_weights]}"
+                )
+
+            # Reset Optimizer & Learning Rates for Full Map Optimization
+            optimizer = initialize_optimizer(params, config['mapping']['lrs'], tracking=False) 
+
+            # Mapping Global map
+            mapping_start_time = time.time()
+            if num_iters_mapping > 0:
+                progress_bar = tqdm(range(num_iters_mapping), desc=f"Mapping Time Step: {time_idx}")
+            for iter in range(num_iters_mapping):
+                iter_start_time = time.time()
+                optimizer.zero_grad(set_to_none=True)
+                aggregate_losses = {}
+
+                # Full-window joint mapping: every selected keyframe contributes
+                # to every optimizer round. Backward is performed frame by frame
+                # to avoid retaining all renderer graphs at once.
+                for selected_keyframe_idx, frame_weight in zip(
+                    selected_keyframes, mapping_frame_weights
+                ):
+                    if selected_keyframe_idx == -1:
+                        iter_time_idx = time_idx
+                        iter_color = color
+                        iter_depth = depth
+                        iter_intrinsics = intrinsics
+                        iter_sky_mask = sky_mask
+                        iter_dynamic_mask = curr_data.get('dynamic_mask')
+                        iter_dynamic_score = curr_data.get('dynamic_score')
+                    else:
+                        keyframe = keyframe_list[selected_keyframe_idx]
+                        iter_time_idx = keyframe['id']
+                        iter_color = keyframe['color']
+                        iter_depth = keyframe['depth']
+                        iter_intrinsics = keyframe.get('intrinsics', intrinsics)
+                        iter_sky_mask = keyframe.get('sky_mask')
+                        iter_dynamic_mask = keyframe.get('dynamic_mask')
+                        iter_dynamic_score = keyframe.get('dynamic_score')
+                    iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
+                    iter_data = {
+                        'cam': cam,
+                        'im': iter_color,
+                        'depth': iter_depth,
+                        'id': iter_time_idx,
+                        'intrinsics': iter_intrinsics,
+                        'w2c': first_frame_w2c,
+                        'iter_gt_w2c_list': iter_gt_w2c,
+                        'sky_mask': iter_sky_mask,
+                        'dynamic_mask': iter_dynamic_mask,
+                        'dynamic_score': iter_dynamic_score,
+                    }
+                    loss, variables, losses = get_loss(
+                        params,
+                        iter_data,
+                        variables,
+                        iter_time_idx,
+                        config['mapping']['loss_weights'],
+                        config['mapping']['use_sil_for_loss'],
+                        config['mapping']['sil_thres'],
+                        config['mapping']['use_l1'],
+                        config['mapping']['ignore_outlier_depth_loss'],
+                        mapping=True,
+                        grad_mask=grad_mask,
+                    )
+                    (loss * frame_weight).backward()
+                    for loss_name, loss_value in losses.items():
+                        weighted_value = loss_value.detach() * frame_weight
+                        aggregate_losses[loss_name] = (
+                            aggregate_losses.get(loss_name, 0.0) + weighted_value
+                        )
+
+                    # Densification needs visibility and screen-space gradients
+                    # from every frame, not just the final frame in the window.
+                    if (
+                        config['mapping']['use_gaussian_splatting_densification']
+                        and iter <= config['mapping']['densify_dict']['stop_after']
+                    ):
+                        with torch.no_grad():
+                            variables = accumulate_mean2d_gradient(variables)
+
+                if config['use_wandb']:
+                    wandb_mapping_step = report_loss(
+                        aggregate_losses,
+                        wandb_run,
+                        wandb_mapping_step,
+                        mapping=True,
+                    )
+                with torch.no_grad():
+                    # Prune Gaussians
+                    if config['mapping']['prune_gaussians']:
+                        params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'])
+                        if config['use_wandb']:
+                            wandb_run.log({"Mapping/Number of Gaussians - Pruning": params['means3D'].shape[0],
+                                           "Mapping/step": wandb_mapping_step})
+                    # Gaussian-Splatting's Gradient-based Densification
+                    if config['mapping']['use_gaussian_splatting_densification']:
+                        params, variables = densify(
+                            params,
+                            variables,
+                            optimizer,
+                            iter,
+                            config['mapping']['densify_dict'],
+                            accumulate_grad=False,
+                        )
+                        if config['use_wandb']:
+                            wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
+                                           "Mapping/step": wandb_mapping_step})
+                    # Optimizer Update
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    # Report Progress
+                    if config['report_iter_progress']:
+                        if config['use_wandb']:
+                            report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'], 
+                                            wandb_run=wandb_run, wandb_step=wandb_mapping_step, wandb_save_qual=config['wandb']['save_qual'],
+                                            mapping=True, online_time_idx=time_idx)
+                        else:
+                            report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'], 
+                                            mapping=True, online_time_idx=time_idx)
+                    else:
+                        progress_bar.update(1)
+                # Update the runtime numbers
+                iter_end_time = time.time()
+                mapping_iter_time_sum += iter_end_time - iter_start_time
+                mapping_iter_time_count += 1
+            if num_iters_mapping > 0:
+                progress_bar.close()
+
+            if config['opt_local_map'] and len(keyframe_list) > 0:
+                print('opt_local_map')
+                # Mapping Local map
+                local_mapping_lrs = {
+                                    "means3D": 0.0000,
+                                    "rgb_colors": 0.0025,
+                                    "unnorm_rotations": 0.000,
+                                    "logit_opacities": 0.00,
+                                    "log_scales": 0.000,
+                                    "cam_unnorm_rots": 0.0000,
+                                    "cam_trans": 0.0000 
+                                    }
+                optimizer = initialize_optimizer(params, local_mapping_lrs, tracking=False) 
+                num_iters_local_mapping = int(num_iters_mapping / 2)
+                if num_iters_local_mapping > 0:
+                    progress_bar = tqdm(range(num_iters_local_mapping), desc=f"Mapping Time Step: {time_idx}")
+                for iter in range(num_iters_local_mapping):
+                    iter_start_time = time.time()
+                    # Always select last keyframe
+                    iter_time_idx = keyframe_list[-1]['id']
+                    iter_color = keyframe_list[-1]['color']
+                    iter_depth = keyframe_list[-1]['depth']
+                    iter_sky_mask = keyframe_list[-1].get('sky_mask')
+                    iter_dynamic_mask = keyframe_list[-1].get('dynamic_mask')
+                    iter_dynamic_score = keyframe_list[-1].get('dynamic_score')
+                    iter_gt_w2c = gt_w2c_all_frames[:iter_time_idx+1]
+                    iter_data = {'cam': cam, 'im': iter_color, 'depth': iter_depth, 'id': iter_time_idx, 
+                                'intrinsics': intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': iter_gt_w2c,
+                                'sky_mask': iter_sky_mask, 'dynamic_mask': iter_dynamic_mask,
+                                'dynamic_score': iter_dynamic_score}
+                    # Loss for current frame
+                    loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
+                                                    config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
+                                                    config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True, grad_mask=grad_mask)
+                    if config['use_wandb']:
+                        # Report Loss
+                        wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
+                    # Backprop
+                    loss.backward()
+                    with torch.no_grad():
+                        # Prune Gaussians
+                        if config['mapping']['prune_gaussians']:
+                            params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'])
+                            if config['use_wandb']:
+                                wandb_run.log({"Mapping/Number of Gaussians - Pruning": params['means3D'].shape[0],
+                                            "Mapping/step": wandb_mapping_step})
+                        # Gaussian-Splatting's Gradient-based Densification
+                        if config['mapping']['use_gaussian_splatting_densification']:
+                            params, variables = densify(params, variables, optimizer, iter, config['mapping']['densify_dict'])
+                            if config['use_wandb']:
+                                wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
+                                            "Mapping/step": wandb_mapping_step})
+                        # Optimizer Update
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        # Report Progress
+                        if config['report_iter_progress']:
+                            if config['use_wandb']:
+                                report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'], 
+                                                wandb_run=wandb_run, wandb_step=wandb_mapping_step, wandb_save_qual=config['wandb']['save_qual'],
+                                                mapping=True, online_time_idx=time_idx)
+                            else:
+                                report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'], 
+                                                mapping=True, online_time_idx=time_idx)
+                        else:
+                            progress_bar.update(1)
+                    # Update the runtime numbers
+                    iter_end_time = time.time()
+                    mapping_iter_time_sum += iter_end_time - iter_start_time
+                    mapping_iter_time_count += 1
+                if num_iters_local_mapping > 0:
+                    progress_bar.close()
+
+            num_iters_dynamic = int(dynamic_4dgs_cfg.get("num_iters", 0))
+            if (
+                dynamic_4dgs_cfg.get("enabled", False)
+                and has_dynamic_gaussians(dynamic_params)
+                and num_iters_dynamic > 0
+            ):
+                dynamic_window_cfg = dynamic_4dgs_cfg.get("window", {})
+                selected_dynamic_keyframes = dynamic_keyframe_selection_covisibility(
+                    dynamic_params,
+                    time_idx,
+                    keyframe_list,
+                    min_score=float(dynamic_window_cfg.get("min_score", 0.05)),
+                    use_mask_confidence=bool(
+                        dynamic_window_cfg.get("use_mask_confidence", True)
+                    ),
+                )
+
+                dynamic_window_entries = list(selected_dynamic_keyframes)
+                dynamic_visible = dynamic_params.get("dyn_obj_visible")
+                current_has_visible_object = (
+                    dynamic_visible is not None
+                    and time_idx < dynamic_visible.shape[1]
+                    and bool(dynamic_visible[:, time_idx].any())
+                )
+                current_dynamic_mask = curr_data.get('dynamic_mask')
+                if (
+                    current_dynamic_mask is not None
+                    and bool(current_dynamic_mask.any())
+                    and current_has_visible_object
+                ):
+                    dynamic_window_entries.append(
+                        {
+                            'id': -1,
+                            'time_idx': time_idx,
+                            'score': 1.0,
+                            'object_overlap': 1.0,
+                            'mask_confidence': 1.0,
+                        }
+                    )
+
+                dynamic_train_frames = []
+                min_dynamic_loss_pixels = int(dynamic_4dgs_cfg.get("min_loss_pixels", 16))
+                for dynamic_window_entry in dynamic_window_entries:
+                    selected_keyframe_idx = dynamic_window_entry['id']
+                    if selected_keyframe_idx == -1:
+                        dyn_frame = {
+                            'cam': cam,
+                            'im': color,
+                            'depth': depth,
+                            'id': time_idx,
+                            'intrinsics': intrinsics,
+                            'w2c': first_frame_w2c,
+                            'iter_gt_w2c_list': curr_gt_w2c,
+                            'sky_mask': sky_mask,
+                            'dynamic_mask': curr_data.get('dynamic_mask'),
+                            'dynamic_score': curr_data.get('dynamic_score'),
+                        }
+                    else:
+                        dyn_kf = keyframe_list[selected_keyframe_idx]
+                        dyn_frame = {
+                            'cam': cam,
+                            'im': dyn_kf['color'],
+                            'depth': dyn_kf['depth'],
+                            'id': dyn_kf['id'],
+                            'intrinsics': dyn_kf.get('intrinsics', intrinsics),
+                            'w2c': first_frame_w2c,
+                            'iter_gt_w2c_list': gt_w2c_all_frames[:dyn_kf['id']+1],
+                            'sky_mask': dyn_kf.get('sky_mask'),
+                            'dynamic_mask': dyn_kf.get('dynamic_mask'),
+                            'dynamic_score': dyn_kf.get('dynamic_score'),
+                        }
+
+                    dyn_mask = dyn_frame.get('dynamic_mask')
+                    if dyn_mask is None or not bool(dyn_mask.any()):
+                        continue
+                    dyn_mask = resize_dynamic_bool_mask(
+                        dyn_mask,
+                        dyn_frame['depth'].shape[1],
+                        dyn_frame['depth'].shape[2],
+                    )
+                    valid_dynamic_pixels = dyn_mask & (dyn_frame['depth'] > 0)
+                    dyn_sky_mask = resize_bool_mask(
+                        dyn_frame.get('sky_mask'),
+                        dyn_frame['depth'].shape[1],
+                        dyn_frame['depth'].shape[2],
+                    )
+                    if dyn_sky_mask is not None:
+                        valid_dynamic_pixels &= ~dyn_sky_mask
+                    if int(valid_dynamic_pixels.sum().item()) < min_dynamic_loss_pixels:
+                        continue
+                    dyn_frame['dynamic_mask'] = dyn_mask
+                    dyn_frame['sky_mask'] = dyn_sky_mask
+                    dynamic_train_frames.append(
+                        {
+                            'data': dyn_frame,
+                            'score': float(dynamic_window_entry['score']),
+                        }
+                    )
+
+                if dynamic_train_frames:
+                    dynamic_weight_power = float(dynamic_window_cfg.get("weight_power", 1.0))
+                    dynamic_weight_epsilon = float(dynamic_window_cfg.get("weight_epsilon", 1e-8))
+                    if dynamic_weight_power <= 0:
+                        raise ValueError("dynamic_4dgs.window.weight_power must be positive")
+                    if dynamic_weight_epsilon < 0:
+                        raise ValueError("dynamic_4dgs.window.weight_epsilon must be non-negative")
+                    dynamic_scores = np.asarray(
+                        [entry['score'] for entry in dynamic_train_frames],
+                        dtype=np.float64,
+                    )
+                    dynamic_raw_weights = np.power(
+                        dynamic_scores + dynamic_weight_epsilon,
+                        dynamic_weight_power,
+                    )
+                    dynamic_frame_weights = (
+                        dynamic_raw_weights / dynamic_raw_weights.sum()
+                    ).tolist()
+                    dynamic_time_indices = [
+                        entry['data']['id'] for entry in dynamic_train_frames
+                    ]
+                    print(
+                        f"Dynamic 4DGS Window at Frame {time_idx}: "
+                        f"size={len(dynamic_train_frames)}, ids={dynamic_time_indices}, "
+                        f"scores={[round(score, 4) for score in dynamic_scores.tolist()]}, "
+                        f"weights={[round(weight, 4) for weight in dynamic_frame_weights]}"
+                    )
+
+                    dynamic_optimizer = initialize_dynamic_optimizer(dynamic_params, dynamic_4dgs_cfg.get("lrs", {}))
+                    if dynamic_optimizer is not None:
+                        progress_bar = tqdm(range(num_iters_dynamic), desc=f"Dynamic 4DGS Time Step: {time_idx}")
+                        for dyn_iter in range(num_iters_dynamic):
+                            dynamic_optimizer.zero_grad(set_to_none=True)
+                            aggregate_dynamic_losses = {}
+                            num_dynamic_contributors = 0
+                            for dynamic_frame_entry, frame_weight in zip(
+                                dynamic_train_frames, dynamic_frame_weights
+                            ):
+                                dyn_frame = dynamic_frame_entry['data']
+                                dyn_time_idx = dyn_frame['id']
+                                dyn_loss, dyn_losses = get_dynamic_loss(
+                                    dynamic_params,
+                                    params,
+                                    dyn_frame,
+                                    dyn_time_idx,
+                                    dynamic_4dgs_cfg,
+                                )
+                                if dyn_loss is None:
+                                    continue
+                                (dyn_loss * frame_weight).backward()
+                                num_dynamic_contributors += 1
+                                for loss_name, loss_value in dyn_losses.items():
+                                    weighted_value = loss_value.detach() * frame_weight
+                                    aggregate_dynamic_losses[loss_name] = (
+                                        aggregate_dynamic_losses.get(loss_name, 0.0)
+                                        + weighted_value
+                                    )
+
+                            if num_dynamic_contributors > 0:
+                                dynamic_optimizer.step()
+                            dynamic_optimizer.zero_grad(set_to_none=True)
+                            if config['use_wandb'] and aggregate_dynamic_losses:
+                                wandb_dynamic_log = {
+                                    f"Dynamic 4DGS/{k}": v.detach()
+                                    for k, v in aggregate_dynamic_losses.items()
+                                }
+                                wandb_dynamic_log["Dynamic 4DGS/step"] = wandb_mapping_step
+                                wandb_run.log(wandb_dynamic_log)
+                            progress_bar.update(1)
+                        progress_bar.close()
+            
+            # Update the runtime numbers
+            mapping_end_time = time.time()
+            mapping_frame_time_sum += mapping_end_time - mapping_start_time
+            mapping_frame_time_count += 1
+
+            if time_idx == 0 or (time_idx+1) % config['report_global_progress_every'] == 0:
+                try:
+                    # Report Mapping Progress
+                    progress_bar = tqdm(range(1), desc=f"Mapping Result Time Step: {time_idx}")
+                    with torch.no_grad():
+                        if config['use_wandb']:
+                            report_progress(params, curr_data, 1, progress_bar, time_idx, sil_thres=config['mapping']['sil_thres'], 
+                                            wandb_run=wandb_run, wandb_step=wandb_time_step, wandb_save_qual=config['wandb']['save_qual'],
+                                            mapping=True, online_time_idx=time_idx, global_logging=True)
+                        else:
+                            report_progress(params, curr_data, 1, progress_bar, time_idx, sil_thres=config['mapping']['sil_thres'], 
+                                            mapping=True, online_time_idx=time_idx)
+                    progress_bar.close()
+                except:
+                    ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
+                    save_params_ckpt(params, ckpt_output_dir, time_idx)
+                    print('Failed to evaluate trajectory.')
+
+        had_dynamic_mask_before_finalize = curr_data.get("dynamic_mask") is not None
+        if not dynamic_mask_ready_before_mapping:
+            dynamic_mask_manager.finalize_for_frame(
+                time_idx=time_idx,
+                num_frames=num_frames,
+                params=params,
+                curr_data=curr_data,
+                render_pair=dynamic_render_pair,
+            )
+        post_dynamic_observation = load_dynamic_observation(
+            output_dir,
+            dynamic_4dgs_cfg,
+            time_idx,
+            frame_id,
+            reference_frame_id,
+            (color.shape[1], color.shape[2]),
+            device,
+        )
+        if post_dynamic_observation is not None:
+            curr_data.update(post_dynamic_observation)
+            curr_frame_data.update(post_dynamic_observation)
+            dynamic_mask = post_dynamic_observation.get("dynamic_mask")
+            if dynamic_4dgs_cfg.get("enabled", False) and not had_dynamic_mask_before_finalize:
+                dynamic_params, dynamic_changed = update_dynamic_params_from_frame(
+                    dynamic_params,
+                    curr_data,
+                    params,
+                    time_idx,
+                    num_frames,
+                    config['mean_sq_dist_method'],
+                    config['gaussian_distribution'],
+                    dynamic_4dgs_cfg,
+                )
+                if dynamic_changed:
+                    print(
+                        f"Dynamic 4DGS updated after mask finalization at frame {time_idx}: "
+                        f"{dynamic_params['dyn_means3D_canon'].shape[0]} gaussians, "
+                        f"{dynamic_params['dyn_obj_trans'].shape[0]} objects"
+                    )
+        
+        # plot progress
+        # if time_idx >= 0:
+        #     with torch.no_grad():
+        #         plot_progress(params, curr_data, time_idx, time_idx, sil_thres=config['mapping']['sil_thres'], plot_dir=plot_progress_dir, iter=iter)
+
+        # Add frame to keyframe list
+        if (not skip_mapping_without_dynamic_mask) and (((time_idx == 0) or ((time_idx+1) % config['keyframe_every'] == 0) or \
+                    (time_idx == num_frames-2)) and (not torch.isinf(curr_gt_w2c[-1]).any()) and (not torch.isnan(curr_gt_w2c[-1]).any())):
+            with torch.no_grad():
+                # Get the current estimated rotation & translation
+                curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
+                curr_cam_tran = params['cam_trans'][..., time_idx].detach()
+                curr_w2c = torch.eye(4).cuda().float()
+                curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
+                curr_w2c[:3, 3] = curr_cam_tran
+                # Initialize Keyframe Info
+                curr_keyframe = {
+                    'id': time_idx,
+                    'frame_id': frame_id,
+                    'est_w2c': curr_w2c,
+                    'color': color,
+                    'depth': depth,
+                    'intrinsics': intrinsics,
+                    'sky_mask': sky_mask,
+                    'dynamic_mask': curr_data.get('dynamic_mask'),
+                    'dynamic_score': curr_data.get('dynamic_score'),
+                }
+                # Add to keyframe list
+                keyframe_list.append(curr_keyframe)
+                keyframe_time_indices.append(time_idx)
+        
+        # Updata current image pose
+        with torch.no_grad():
+            # Get the current estimated rotation & translation
+            curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
+            curr_cam_tran = params['cam_trans'][..., time_idx].detach()
+            curr_w2c = torch.eye(4).cuda().float()
+            curr_w2c[:3, :3] = build_rotation(curr_cam_rot)
+            curr_w2c[:3, 3] = curr_cam_tran
+            curr_data = {**curr_data, "est_w2c": curr_w2c.detach()}
+            # print('est_w2c', curr_w2c.detach())
+
+            if time_idx > 0:
+                rel_w2curr = curr_data["est_w2c"].to(device)
+                rel_w2last = last_data["est_w2c"].to(device)
+                T_last_cur = rel_w2last.to(device) @ rel_w2curr.inverse()
+
+                rel_w2curr_gt = curr_data["iter_gt_w2c_list"][curr_data["id"]].to(device)
+                rel_w2last_gt = last_data["iter_gt_w2c_list"][last_data["id"]].to(device)
+                T_last_cur_gt = rel_w2last_gt.to(device) @ rel_w2curr_gt.inverse()
+                # print(T_last_cur)
+                # print(T_last_cur_gt)
+
+        # Checkpoint every iteration
+        if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
+            ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
+            save_params_ckpt(params, ckpt_output_dir, time_idx)
+            np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{time_idx}.npy"), np.array(keyframe_time_indices))
+        
+        # Increment WandB Time Step
+        if config['use_wandb']:
+            wandb_time_step += 1
+
+        torch.cuda.empty_cache()
+
+    lidar_warp_diagnostics.finalize()
+
+    # Compute Average Runtimes
+    if tracking_iter_time_count == 0:
+        tracking_iter_time_count = 1
+        tracking_frame_time_count = 1
+    if mapping_iter_time_count == 0:
+        mapping_iter_time_count = 1
+        mapping_frame_time_count = 1
+    tracking_iter_time_avg = tracking_iter_time_sum / tracking_iter_time_count
+    tracking_frame_time_avg = tracking_frame_time_sum / tracking_frame_time_count
+    mapping_iter_time_avg = mapping_iter_time_sum / mapping_iter_time_count
+    mapping_frame_time_avg = mapping_frame_time_sum / mapping_frame_time_count
+    print(f"\nAverage Tracking/Iteration Time: {tracking_iter_time_avg*1000} ms")
+    print(f"Average Tracking/Frame Time: {tracking_frame_time_avg} s")
+    print(f"Average Mapping/Iteration Time: {mapping_iter_time_avg*1000} ms")
+    print(f"Average Mapping/Frame Time: {mapping_frame_time_avg} s")
+    if config['use_wandb']:
+        wandb_run.log({"Final Stats/Average Tracking Iteration Time (ms)": tracking_iter_time_avg*1000,
+                       "Final Stats/Average Tracking Frame Time (s)": tracking_frame_time_avg,
+                       "Final Stats/Average Mapping Iteration Time (ms)": mapping_iter_time_avg*1000,
+                       "Final Stats/Average Mapping Frame Time (s)": mapping_frame_time_avg,
+                       "Final Stats/step": 1})
+    
+    final_params = convert_params_to_store(params)
+    final_params = pack_dynamic_params(final_params, dynamic_params)
+
+    # Evaluate Final Parameters
+    if not config.get("skip_final_eval", False):
+        with torch.no_grad():
+            if config['use_wandb']:
+                eval(dataset, final_params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
+                     wandb_run=wandb_run, wandb_save_qual=config['wandb']['eval_save_qual'],
+                     mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
+                     eval_every=config['eval_every'], sky_mask_provider=sky_mask_predictor)
+            else:
+                eval(dataset, final_params, num_frames, eval_dir, sil_thres=config['mapping']['sil_thres'],
+                     mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
+                     eval_every=config['eval_every'], sky_mask_provider=sky_mask_predictor)
+
+    # Add Camera Parameters to Save them
+    final_params['timestep'] = variables['timestep']
+    final_params['intrinsics'] = intrinsics.detach().cpu().numpy()
+    final_params['w2c'] = first_frame_w2c.detach().cpu().numpy()
+    final_params['org_width'] = dataset_config["desired_image_width"]
+    final_params['org_height'] = dataset_config["desired_image_height"]
+    final_params['gt_w2c_all_frames'] = []
+    for gt_w2c_tensor in gt_w2c_all_frames:
+        final_params['gt_w2c_all_frames'].append(gt_w2c_tensor.detach().cpu().numpy())
+    final_params['gt_w2c_all_frames'] = np.stack(final_params['gt_w2c_all_frames'], axis=0)
+    final_params['keyframe_time_indices'] = np.array(keyframe_time_indices)
+    
+    # Save Parameters
+    save_params(final_params, output_dir)
+
+    # Close WandB Run
+    if config['use_wandb']:
+        wandb.finish()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("experiment", type=str, help="Path to experiment file")
+
+    args = parser.parse_args()
+
+    experiment = SourceFileLoader(
+        os.path.basename(args.experiment), args.experiment
+    ).load_module()
+
+    # Set Experiment Seed
+    seed_everything(seed=experiment.config['seed'])
+    
+    # Create Results Directory and Copy Config
+    results_dir = os.path.join(
+        experiment.config["workdir"], experiment.config["run_name"]
+    )
+    if not experiment.config['load_checkpoint']:
+        os.makedirs(results_dir, exist_ok=True)
+        shutil.copy(args.experiment, os.path.join(results_dir, "config.py"))
+
+    rgbd_slam(experiment.config)

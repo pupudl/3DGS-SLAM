@@ -1,0 +1,188 @@
+{
+  "source": "/tmp/hybrid_motion.py",
+  "temporary_source_sha256": "ffd54b293ff64a0f23fc7f5bccbe2310da44c796d128fb25eb157b914853be90",
+  "restoration_note": "临时源码恢复；补回 motion.hybrid 配置读取及首次 GPU 运行前已有的全量 2D E 尺度拟合修正。未加入后来的背景合并、尺度核心筛选和合并后数量限制。",
+  "expected_first_pair_supports": [
+    62,
+    46,
+    27,
+    30,
+    23,
+    36,
+    15,
+    29
+  ],
+  "replayed_first_pair_supports": [
+    62,
+    46,
+    27,
+    30,
+    23,
+    36,
+    15,
+    29
+  ],
+  "expected_unassigned": 306,
+  "replayed_unassigned": 306,
+  "report": {
+    "method": "hybrid",
+    "anchor_count": 574,
+    "matches_2d_count": 622,
+    "proposal_attempts": {
+      "essential": 257,
+      "pnp": 256,
+      "rigid": 1277
+    },
+    "proposal_count": 721,
+    "selected_proposal_gains": [
+      95.97768804527377,
+      17.83222323734622,
+      10.802664816788567,
+      10.161902463626294,
+      6.465977734669097,
+      5.13935407669777,
+      3.793780374432066,
+      3.60284638721551
+    ],
+    "sources": [
+      "pnp",
+      "pnp",
+      "rigid",
+      "pnp",
+      "pnp",
+      "essential",
+      "pnp",
+      "pnp"
+    ],
+    "supports": [
+      62,
+      46,
+      27,
+      30,
+      23,
+      36,
+      15,
+      29
+    ],
+    "unassigned_count": 306,
+    "reference_index": 0,
+    "reference_scores": [
+      44.24876851448103,
+      36.22403752830799,
+      10.515294754757852,
+      24.36094270884616,
+      11.445050145583954,
+      30.843264456416243,
+      9.84465066884222,
+      13.000723699942329
+    ],
+    "competition": [
+      {
+        "iteration": 0,
+        "core_supports": [
+          50,
+          49,
+          25,
+          38,
+          19,
+          22,
+          15,
+          23
+        ]
+      },
+      {
+        "iteration": 1,
+        "core_supports": [
+          63,
+          51,
+          28,
+          38,
+          21,
+          32,
+          17,
+          27
+        ]
+      },
+      {
+        "iteration": 2,
+        "core_supports": [
+          56,
+          48,
+          27,
+          32,
+          21,
+          35,
+          17,
+          29
+        ]
+      },
+      {
+        "iteration": 3,
+        "core_supports": [
+          57,
+          47,
+          27,
+          29,
+          21,
+          37,
+          16,
+          28
+        ]
+      }
+    ],
+    "cost_definition": "symmetric_observed_reprojection_plus_capped_depth",
+    "min_support": 6
+  },
+  "historical_count_match": true,
+  "restored_module_sha256": "ff88ae1fad2f224dd37e31076845fe728e637705c5217ff574a872e57c685402",
+  "packaging_changes": [
+    "pair_utils.ROOT 与 visualize_motion.ROOT 调整至备份目录的真实项目根目录",
+    "备份脚本默认使用本目录独立配置与输出目录",
+    "使用32色可视化修正，避免早期8候选后结构操作导致颜色越界",
+    "下游运动/归属优化及反馈采用已留存的运行集成代码；未改当前活动代码"
+  ],
+  "source_sha256": {
+    "compare_versions.py": "906a73536ae2e7898fa91071c81f66d08ff8a7cdeb3acaf6ceb63c23009011a9",
+    "hybrid_motion.py": "ff88ae1fad2f224dd37e31076845fe728e637705c5217ff574a872e57c685402",
+    "visualize_feedback_matches.py": "c428ac1ec21d8d52f01ea229aff10824927709bba6985a10dd152c46acb06b64",
+    "pair_utils.py": "b6375b24a73e40678aeee2c097eca13a09dac3f334f3c8eaac24abcb7d573324",
+    "run_four_pairs.py": "46ae18aca19e6cfd4fef4bfa72a435ca319ff1cb533624fef59ef4f5e85c4b8e",
+    "visualize_ownership_stages.py": "af2c54da1af1adb21c6da00dabba0bbd87a98dae80595d849bb33779dfcd77bd",
+    "visualize_feedback_final.py": "5ed4b0392f664fb5745f25ff61bd57b78f881a7fe4c8c0351ac3ab156db7fecf",
+    "masked_feedback.py": "447ae5620f3211d8b5706c0d409846af398d13d425d9d55d465cb4052db4c4fc",
+    "joint_pair.py": "9e6553126f9a3e5e1e5876b92742a7c7222994f9254b3639e5dbfd3cbad368d0",
+    "visualize_sparse_hypotheses.py": "8d93832699fa1d79bfe716a897aafbea4cfea0bd52e6d14ede8a919baaf0ac91",
+    "strict_two_frame.py": "c37f240f70724607b08321d4f95f10c22607d71897ecc715bdcf994ed0d057bc",
+    "visualize_motion.py": "a7cfe24a928af2182db35126015e01145b3ff95e7298e2b33f313110e14d4ef5",
+    "configs/kitti360_full_feedback_four_pairs_hybrid_multibg_early.yaml": "474f578489d70ad5e9fe5dc4b9b75d6618bedbf56c5eca10d4d277292baf6c91"
+  },
+  "expected_historical_proposal_gains": [
+    95.97768804527377,
+    17.83222323734622,
+    10.802664816788567,
+    10.161902463626294,
+    6.465977734669097,
+    5.13935407669777,
+    3.793780374432066,
+    3.60284638721551
+  ],
+  "historical_proposal_gains_match": true,
+  "relocation": {
+    "note": "两帧目录移入 render_guided_multi_frame；仅调整目录层级、运行路径与配置输出路径。source_sha256 保留迁移前打包哈希。",
+    "source_sha256": {
+      "compare_versions.py": "79bdad9924eac72004a0891875ade1dabde67f3ad34730b08ff2817f6a97814d",
+      "hybrid_motion.py": "ff88ae1fad2f224dd37e31076845fe728e637705c5217ff574a872e57c685402",
+      "visualize_feedback_matches.py": "c428ac1ec21d8d52f01ea229aff10824927709bba6985a10dd152c46acb06b64",
+      "pair_utils.py": "46d0abc01b90b4cd5c7cf8d706cfb43d8adcd0c4d3751e5cce8eed664ed96437",
+      "run_four_pairs.py": "46ae18aca19e6cfd4fef4bfa72a435ca319ff1cb533624fef59ef4f5e85c4b8e",
+      "visualize_ownership_stages.py": "af2c54da1af1adb21c6da00dabba0bbd87a98dae80595d849bb33779dfcd77bd",
+      "visualize_feedback_final.py": "5ed4b0392f664fb5745f25ff61bd57b78f881a7fe4c8c0351ac3ab156db7fecf",
+      "masked_feedback.py": "447ae5620f3211d8b5706c0d409846af398d13d425d9d55d465cb4052db4c4fc",
+      "joint_pair.py": "9e6553126f9a3e5e1e5876b92742a7c7222994f9254b3639e5dbfd3cbad368d0",
+      "visualize_sparse_hypotheses.py": "8d93832699fa1d79bfe716a897aafbea4cfea0bd52e6d14ede8a919baaf0ac91",
+      "strict_two_frame.py": "c37f240f70724607b08321d4f95f10c22607d71897ecc715bdcf994ed0d057bc",
+      "visualize_motion.py": "b5e0fe102e84c0e438960e0c2b60f4dbeea76aebe40e11ff3c35b390415332bb",
+      "configs/kitti360_full_feedback_four_pairs_hybrid_multibg_early.yaml": "440aed02d68fb9ec299ea8fb095943147533bb92aebf1aa456d074b373d9e3f4"
+    }
+  }
+}

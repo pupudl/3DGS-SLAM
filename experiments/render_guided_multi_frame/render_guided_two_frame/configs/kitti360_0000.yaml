@@ -1,0 +1,113 @@
+seed: 7
+run_tag: html_pairwise
+dataset:
+  data_root: data/kitti360
+  sequence: 2013_05_28_drive_0000_sync
+frames:
+  first: 2433
+  second: 2435
+depth:
+  source: precomputed_igev
+  subdir: depth_sceneflow
+  min_m: 1.0
+  max_m: 80.0
+  confidence_rgb_sigma: 0.15  # left/right photometric stereo confidence
+features:
+  initial_keypoints: 1024
+  initial_keep_fraction: 0.5
+  supplemental_keypoints: 2048
+  supplemental_threshold: 0.00001
+# Only removes initial matches for controlled evaluation. The algorithm never sees this ROI.
+holdout_roi_second: null
+motion:
+  inlier_threshold_m: 0.5
+  assignment_sigma_m: 0.75
+  min_support: 12
+  max_components: 5  # deliberately over-propose, then validate/prune
+  ransac_iterations: 350
+gaussians:
+  initialization: lsgslam_projective
+  stride: 1
+  max_depth_jump_m: 1.0  # surface_aligned mode only
+  projected_sigma_px: 1.6  # surface_aligned mode only
+ownership:
+  anchor_neighbors: 4
+  anchor_sigma_m: 2.0
+  depth_sigma_m: 1.0
+  color_sigma: 0.4
+  min_anchor_weight: 0.02
+  probability_floor: 0.005
+joint:
+  gaussian_opacity: 0.5  # sigmoid(0), matching lsgslam_windows initialization
+  anchor_sigma_m: 0.5
+  tau_final: 0.4
+  render_depth_gamma: 0.37  # threshold = gamma * max valid first-frame depth
+  graph:
+    neighbors: 4
+    sigma_x_m: 0.8
+    sigma_color: 0.25
+    sigma_depth_m: 0.6
+  loss_weights:
+    anchor: 1.0
+    sparse_ownership: 0.0  # optional coupling; HTML §9 objective uses the six terms below
+    color: 1.0
+    ssim: 0.2
+    depth: 0.05
+    entropy: 0.005
+    graph: 0.05
+optimization:
+  downsample: 2
+  initial_iterations: 8
+  feedback_iterations: 5
+  pose_lr: 0.002
+  ownership_lr: 0.03
+residual:
+  min_silhouette: 0.65
+  color_weight: 0.5
+  depth_weight: 0.5
+  depth_clip_m: 3.0
+discovery:
+  max_cycles: 3
+  max_components_total: 8
+  motion_gradient_weight: 0.0  # computed and saved; §10.3 patch score uses ownership gradient
+  split_min_anchors: 12
+  split_min_geometry_gain: 0.5
+  enable_birth: true
+  enable_split: true
+  enable_merge: true
+  enable_prune: true
+  merge_max_rotation_deg: 2.0
+  merge_max_translation_m: 0.2
+  prune_min_gaussian_mass: 0.005
+  split_min_objective_improvement: 0.005
+  merge_min_objective_improvement: 0.0
+  prune_min_objective_improvement: 0.0
+  split_min_render_improvement: 0.0
+  merge_min_render_improvement: 0.0
+  prune_min_render_improvement: 0.0
+  split_min_coverage_ratio: 0.95
+  merge_min_coverage_ratio: 0.95
+  prune_min_coverage_ratio: 0.95
+  patch_size_px: 96
+  border_margin_px: 48
+  min_observation_fraction: 0.6
+  min_score: 0.12
+  max_regions: 12
+  gradient_weight: 0.25
+  source_margin_px: 64
+  target_margin_px: 32
+  attach_threshold_m: 0.5
+  new_threshold_m: 0.8
+  birth_min_anchors: 12
+  birth_fit_threshold_m: 0.8
+  cluster_radius_px: 96
+  cluster_radius_m: 3.0
+  cluster_motion_radius_m: 1.5
+  max_birth_clusters: 3
+  birth_min_area_px: 1000
+  complexity_penalty: 0.005
+  birth_min_render_improvement: 0.001
+  birth_min_local_improvement: 0.01
+  birth_min_objective_improvement: 0.005
+  birth_min_coverage_ratio: 0.95
+output_dir: experiments/render_guided_multi_frame/render_guided_two_frame/outputs

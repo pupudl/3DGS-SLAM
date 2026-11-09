@@ -1,0 +1,158 @@
+dataset:
+  data_root: data/kitti360
+  sequence: 2013_05_28_drive_0000_sync
+depth:
+  confidence_rgb_sigma: 0.15
+  max_m: 80.0
+  min_m: 1.0
+  source: precomputed_igev
+  subdir: depth_sceneflow
+discovery:
+  feedback_min_render_improvement: 0.0
+  feedback_min_coverage_ratio: 0.98
+  attach_threshold_m: 0.5
+  birth_fit_threshold_m: 0.8
+  birth_min_anchors: 12
+  birth_min_area_px: 1000
+  birth_min_coverage_ratio: 0.95
+  birth_min_local_improvement: 0.01
+  birth_min_objective_improvement: 0.005
+  birth_min_render_improvement: 0.005
+  birth_min_median_stereo_confidence: 0.4
+  cluster_motion_radius_m: 1.5
+  cluster_radius_m: 3.0
+  cluster_radius_px: 96
+  complexity_penalty: 0.005
+  enable_birth: true
+  enable_merge: true
+  enable_prune: true
+  enable_split: true
+  gradient_weight: 0.25
+  gradient_scale_quantile: 0.95
+  max_birth_clusters: 3
+  max_components_total: 8
+  max_cycles: 3
+  merge_max_rotation_deg: 2.0
+  merge_max_translation_m: 0.2
+  merge_min_coverage_ratio: 0.95
+  merge_min_objective_improvement: 0.0
+  merge_min_render_improvement: 0.0
+  new_threshold_m: 0.8
+  prune_min_coverage_ratio: 0.95
+  prune_min_gaussian_mass: 0.15
+  prune_min_objective_improvement: 0.0
+  prune_min_render_improvement: 0.0
+  split_min_anchors: 12
+  split_min_coverage_ratio: 0.95
+  split_min_geometry_gain: 0.5
+  split_min_objective_improvement: 0.005
+  split_min_render_improvement: 0.0
+  feedback_mode: score_mask_repair
+  mask_min_area_px: 16
+  mask_min_stereo_confidence: 0.15
+  mask_min_local_improvement: 0.0
+  mask_max_outside_regression: 0.002
+  mask_min_coverage_ratio: 0.95
+  pending_max_active: 600
+  pending_min_confidence: 0.1
+  repair_min_anchors: 12
+  repair_max_clusters: 6
+  repair_fit_threshold_m: 0.5
+  repair_min_confidence: 0.15
+  repair_components_per_fit: 2
+  repair_max_proposals: 6
+  repair_min_prior: 0.0
+  repair_reference: false
+  repair_min_objective_improvement: 0.005
+  repair_min_render_improvement: 0.0
+  repair_min_coverage_ratio: 0.98
+  pending_min_distance_px: 8.0
+  min_score: 0.12
+  normalize_gradient: true
+  min_observation_fraction: 0.6
+  score_smoothing_sigma_px: 3.0
+  mask_budget_pixels: 110592
+features:
+  initial_keep_fraction: 0.5
+  initial_keypoints: 1024
+  match_depth_min_m: 5.0
+  match_depth_near_reliable_m: 10.0
+  match_depth_far_reliable_m: 45.0
+  match_depth_max_m: 75.0
+  match_depth_edge_weight: 0.05
+  supplemental_keypoints: 2048
+  supplemental_threshold: 1.0e-05
+frames:
+  first: 2433
+  second: 2435
+gaussians:
+  initialization: lsgslam_projective
+  max_depth_jump_m: 1.0
+  projected_sigma_px: 1.6
+  stride: 1
+holdout_roi_second: null
+joint:
+  anchor_gaussians: true
+  anchor_sigma_m: 0.5
+  gaussian_opacity: 0.5
+  graph:
+    neighbors: 4
+    sigma_color: 0.25
+    sigma_depth_m: 0.6
+    sigma_x_m: 0.8
+  loss_weights:
+    anchor: 1.0
+    anchor_reprojection: 0.1
+    color: 1.0
+    depth: 0.05
+    entropy: 0.005
+    graph: 0.05
+    sparse_ownership: 0.1
+    ssim: 0.2
+    triangulated_depth: 0.05
+  render_depth_gamma: 0.37
+  reprojection_sigma_px: 2.0
+  tau_final: 0.4
+  triangulation_depth_sigma_m: 1.0
+  triangulation_max_depth_m: 80.0
+  triangulation_min_parallax_deg: 0.5
+motion:
+  assignment_sigma_m: 0.75
+  inlier_threshold_m: 0.5
+  max_components: 5
+  min_support: 20
+  quality_weighted_rigid_fit: true
+  ransac_seed_size: 3
+  ransac_sample_size: 8
+  ransac_iterations: 1000
+optimization:
+  downsample: 2
+  feedback_iterations: 10
+  initial_iterations: 8
+  ownership_lr: 0.05
+  pose_lr: 0.002
+output_dir: experiments/render_guided_multi_frame/render_guided_two_frame/outputs/full_feedback_four_pairs_ransac8_depth_fit_score_mask
+ownership:
+  anchor_neighbors: 4
+  anchor_sigma_m: 1.5
+  color_sigma: 0.3
+  depth_sigma_m: 0.8
+  min_anchor_weight: 0.05
+  probability_floor: 0.005
+  stereo_weighted_anchors: true
+  reliable_depth_m: 35.0
+  refresh_after_feedback: true
+  refresh_radius_m: 2.0
+  refresh_fraction: 0.75
+  feedback_probability_floor: 0.025
+  birth_radius_m: 2.5
+residual:
+  color_weight: 0.5
+  depth_clip_m: 3.0
+  depth_weight: 0.5
+  min_silhouette: 0.65
+run_tag: full_feedback_score_mask
+seed: 7
+output:
+  compact: true
+  comparison_baseline: experiments/render_guided_multi_frame/render_guided_two_frame/outputs/full_feedback_four_pairs_ransac8_depth_fit_weighted

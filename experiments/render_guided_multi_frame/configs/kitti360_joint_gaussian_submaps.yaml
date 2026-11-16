@@ -1,0 +1,28 @@
+# Fixed image-count submaps. sequence.step samples images; submaps.frames
+# counts those sampled images. Point pressure never closes a submap early.
+base_config: kitti360_joint_gaussian_map_refined.yaml
+
+sequence:
+  output_dir: experiments/render_guided_multi_frame/outputs/kitti360_joint_gaussian_submaps
+
+gaussian_map:
+  submaps:
+    enabled: true
+    frames: 50
+    overlap_frames: 1
+    max_boundary_landmarks: 10000
+  max_active_gaussians: 1000000
+  snapshot_scope: full_visible_map
+  active_selection:
+    enabled: true
+    tile_size_px: 64
+    dynamic_fraction: 0.20
+    track_fraction: 0.15
+    recent_fraction: 0.20
+    fairness_fraction: 0.35
+    frozen_fraction: 0.10
+    refinement_reserve_gaussians: 2048
+  refinement:
+    # The manager raises this if a larger configured frame count needs more.
+    max_total_gaussians: 3000000
+    max_active_gaussians: 1000000

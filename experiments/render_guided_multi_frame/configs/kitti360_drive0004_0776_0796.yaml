@@ -1,0 +1,11 @@
+# Source frame range 776-796; stride 3 selects 7 images, ending at 794.
+base_config: kitti360_sequence.yaml
+
+dataset:
+  sequence: 2013_05_28_drive_0004_sync
+
+sequence:
+  start: 776
+  end: 796
+  step: 3
+  output_dir: experiments/render_guided_multi_frame/outputs/kitti360_drive0004_0776_0796

@@ -1,13 +1,19 @@
 """CPU checks for cross-frame identity and shared supplemental features."""
-import importlib.util
+import sys
 from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
+import importlib.util
 import tempfile
 import unittest
 
 import numpy as np
 
 
-_path = Path(__file__).resolve().parents[1] / "feature_tracks.py"
+_path = Path(__file__).resolve().parents[1] / "tracking/feature_tracks.py"
 _spec = importlib.util.spec_from_file_location("sequence_feature_tracks", _path)
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
@@ -102,6 +108,24 @@ class SharedFeatureTests(unittest.TestCase):
         self.assertEqual(self.extractor.calls, 3)
         self.assertEqual(self.extractor.config["max_num_keypoints"], 1)
         self.assertEqual(self.extractor.config["detection_threshold"], .01)
+
+    def test_non_sky_matching_spends_top_k_after_excluding_sky_in_both_frames(self):
+        allowed = np.ones((32, 32), bool)
+        allowed[5, 5] = False  # Highest detector score lies in the sky.
+        matches = self.store.match_pair(1, 2, self.image, self.image,
+            self.extractor, self.matcher, source_mask=allowed, target_mask=allowed)
+        np.testing.assert_array_equal(matches, [[15, 15, 15, 15]])
+        self.assertEqual(len(self.store.tracks), 1)
+
+    def test_feedback_cannot_use_a_masked_source_or_target_keypoint(self):
+        self.store.features_cfg['initial_keypoints'] = 3
+        source, target = np.ones((32, 32), bool), np.ones((32, 32), bool)
+        source[5, 5], target[15, 15] = False, False
+        matches = self.store.match_mask(1, 2, self.image, self.image,
+            self.extractor, self.matcher, np.ones((32, 32), bool),
+            source_mask=source, target_mask=target)
+        np.testing.assert_array_equal(matches, [[25, 25, 25, 25]])
+        self.assertEqual(len(self.store.tracks), 1)
 
     def test_mask_supplement_tracks_continue_beyond_initial_top_k(self):
         self.store.match_pair(1, 2, self.image, self.image, self.extractor, self.matcher)

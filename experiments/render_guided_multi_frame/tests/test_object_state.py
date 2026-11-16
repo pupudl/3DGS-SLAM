@@ -1,16 +1,22 @@
 """CPU checks for continuing identity and current-observation warm fitting."""
-import importlib.util
+import sys
 from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
+import importlib.util
 import unittest
 
 import numpy as np
 
-_path = Path(__file__).resolve().parents[1] / "object_state.py"
+_path = Path(__file__).resolve().parents[1] / "tracking/object_state.py"
 _spec = importlib.util.spec_from_file_location("sequence_object_state", _path)
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 ObjectRegistry = _module.ObjectRegistry
-from hybrid_motion import _core_labels, motion_probabilities, motion_costs
+from frontend.hybrid_motion import _core_labels, motion_probabilities, motion_costs
 
 
 def pose(x=0., y=0.):

@@ -1,14 +1,19 @@
 """Nearest-effective-splat visibility and native CUDA footprint checks."""
-from pathlib import Path
 import sys
+from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 import unittest
 
 import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from joint_gaussian_visibility import nearest_gaussian_owners, projected_footprints
-from object_gaussian_renderer import GaussianObjectRenderer, prepare_object_gaussians
+from ownership.joint_gaussian_visibility import nearest_gaussian_owners, projected_footprints
+from ownership.object_gaussian_renderer import GaussianObjectRenderer, prepare_object_gaussians
 
 
 class JointVisibilityTests(unittest.TestCase):

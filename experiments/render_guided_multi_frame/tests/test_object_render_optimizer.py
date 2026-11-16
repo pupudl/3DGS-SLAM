@@ -4,10 +4,15 @@ These tests deliberately disable centre costs and ownership regularization.
 They therefore fail if object updates do not receive actual RGB/depth raster
 gradients. CPU-only environments skip them; no mock renderer is substituted.
 """
+import sys
+from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 from copy import deepcopy
 import importlib.util
-from pathlib import Path
-import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -17,9 +22,7 @@ import torch
 
 
 HERE = Path(__file__).resolve().parents[1]
-if str(HERE) not in sys.path:
-    sys.path.insert(0, str(HERE))
-_spec = importlib.util.spec_from_file_location("render_test_object_window", HERE / "object_window.py")
+_spec = importlib.util.spec_from_file_location("render_test_object_window", HERE / "ownership/object_window.py")
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 ObjectWindow = _module.ObjectWindow
@@ -27,7 +30,7 @@ ObjectWindow = _module.ObjectWindow
 
 class ObjectRenderWeightTests(unittest.TestCase):
     def test_bidirectional_views_give_every_frame_the_same_total_weight(self):
-        from object_render_optimizer import build_render_views
+        from ownership.object_render_optimizer import build_render_views
         models = np.repeat(np.eye(4)[None], 2, axis=0)
         observations = dict(source=np.zeros((2, 2, 3), np.uint8),
                             target=np.zeros((2, 2, 3), np.uint8),
@@ -62,7 +65,7 @@ class ObjectRenderOptimizerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from diff_gaussian_rasterization import GaussianRasterizer
-        from object_render_optimizer import render_gaussian_view, optimize_render_window
+        from ownership.object_render_optimizer import render_gaussian_view, optimize_render_window
         from utils.recon_helpers import setup_camera
         cls.raster_class = GaussianRasterizer
         cls.render_view = staticmethod(render_gaussian_view)
@@ -168,6 +171,31 @@ class ObjectRenderOptimizerTests(unittest.TestCase):
         for key, original in original_geometry.items():
             np.testing.assert_array_equal(scene[key], original)
 
+    def test_real_raster_solver_runs_on_full_batch_windows_and_final_partial_window(self):
+        cfg = self.configuration(window_frames=7, iterations=20)
+        cfg['object_window']['window_step'] = 5
+        cfg['sequence'] = dict(streaming=True, frames=list(range(14)))
+        window = ObjectWindow(cfg)
+        scene = self.scene()
+        observation = self.observation(scene, 0)
+        q = np.tile([.1, .9], (len(scene['xyz']), 1))
+        solves, previous = [], None
+        for first in range(13):
+            state = self.update(window, first, scene, observation, q)
+            schedule = state['report']['window_schedule']
+            if schedule['render_optimization_performed']:
+                report = self.render_report(state)
+                solves.append((first, state['report']['window_frames'], len(report['views'])))
+                self.assertEqual(report['iterations_completed'], 20)
+                self.assertGreater(report['render_passes'], 0)
+                self.assertGreater(report['nonzero_gradient_steps'], 0)
+            elif previous is not None:
+                np.testing.assert_allclose(state['object_probabilities'], previous, atol=1e-15)
+            previous = state['object_probabilities'].copy()
+        self.assertEqual(solves, [(5, list(range(7)), 11), (10, list(range(5, 12)), 11),
+                                  (12, list(range(10, 14)), 5)])
+        self.assertTrue((state['object_probabilities'][:, 0] > .7).all())
+
     def test_depth_color_pass_alone_supplies_object_logit_gradients(self):
         scene = self.scene(depth_only=True)
         window = ObjectWindow(self.configuration(depth_only=True))
@@ -240,6 +268,48 @@ class ObjectRenderOptimizerTests(unittest.TestCase):
         right = self.optimize_window(reversed_window, cfg['object_window'])
         np.testing.assert_allclose(left['probabilities'], right['probabilities'], atol=5e-4, rtol=5e-4)
         self.assertTrue(np.all(np.asarray(left['probabilities'])[:, 1] > .7))
+
+    def test_reused_anisotropic_geometry_preserves_real_raster_ownership_gradients(self):
+        from ownership.object_render_optimizer import prepare_render_geometry
+        scene = self.scene()
+        tensor = lambda value: torch.as_tensor(value, dtype=torch.float32, device='cuda')
+        xyz, colors, scales, models = [tensor(scene[key]) for key in
+                                      ('xyz', 'color', 'scale', 'H_object')]
+        models[1, :3, :3] = tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+        basis = tensor([[1., .2, .1], [0., 1., .3], [0., 0., 1.]])
+        covariance = (basis @ basis.T)[None].repeat(len(xyz), 1, 1)*.01
+        prepared = prepare_render_geometry(torch, xyz, scales, models, covariance)
+
+        def gradient(cache):
+            logits = torch.nn.Parameter(tensor(np.tile([-.3, .7], (len(xyz), 1))))
+            values = []
+            for kind in ('rgb', 'depth'):
+                view = self.render_view(torch, self.raster, xyz, colors, scales,
+                    torch.softmax(logits, dim=1), models, covariance=covariance,
+                    pass_kind=kind, prepared_geometry=cache)
+                loss = (view['rgb'].square().mean() if kind == 'rgb' else
+                        (view['depth']*view['alpha']).square().mean())
+                loss.backward()
+                values.append(float(loss.detach()))
+            return values, logits.grad.detach().cpu().numpy()
+
+        expected_values, expected_gradient = gradient(None)
+        for _ in range(2):
+            actual_values, actual_gradient = gradient(prepared)
+            np.testing.assert_allclose(actual_values, expected_values, rtol=1e-6, atol=1e-7)
+            np.testing.assert_allclose(actual_gradient, expected_gradient, rtol=2e-5, atol=1e-6)
+
+    def test_worse_final_objective_restores_warm_start(self):
+        cfg = self.configuration(iterations=1)
+        cfg['object_window']['render'].update(prior_weight=1e6, accept_only_improving=True)
+        scene = self.scene()
+        initial = np.full((len(scene['xyz']), 2), .5)
+        state = self.update(ObjectWindow(cfg), 0, scene, self.observation(scene, 0), initial)
+        report = self.render_report(state)
+        self.assertFalse(report['update_accepted'])
+        self.assertGreater(report['candidate_final_losses']['total'], report['initial_losses']['total'])
+        np.testing.assert_allclose(state['object_probabilities'], initial, atol=1e-6)
+        self.assertAlmostEqual(report['final_losses']['total'], report['initial_losses']['total'], places=6)
 
 
 if __name__ == '__main__':

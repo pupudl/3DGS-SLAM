@@ -1,0 +1,114 @@
+\section{Experiments}
+
+\subsection{Experimental Setup}
+
+We evaluate MRigid4DGS on KITTI and KITTI-360. For localization, we report the root mean square error of the absolute trajectory error (ATE RMSE). For mapping, we report PSNR, SSIM, and LPIPS.
+
+\noindent\textbf{Implementation Details.}
+We conduct our experiments on a machine equipped with NVIDIA GeForce RTX 3090 GPUs. We use RGB images, precomputed IGEV depth, stereo confidence, and precomputed sky masks as input. Feature correspondences are obtained using pyramidal Lucas--Kanade (LK) optical flow and validated with SuperPoint descriptor similarity. We use the same main configuration for KITTI and KITTI-360, sampling every second frame and optimizing Gaussian-to-object assignments over a sliding window of seven sampled frames with a step size of five. The render-guided assignment optimization uses 30 iterations with a learning rate of 0.08; its RGB and depth loss weights are set to 1.0 and 0.2, respectively. The rendering losses are evaluated at half resolution.
+
+\noindent\textbf{Baseline Methods.}
+For camera tracking, we compare with LOAM, ORB-SLAM3, MonoGS, SplaTAM, LSG-SLAM, 4DGS-SLAM, and Flow4DGS-SLAM. For scene reconstruction, we compare the rendering quality of MonoGS, SplaTAM, LSG-SLAM, 4DGS-SLAM, and Flow4DGS-SLAM.
+
+\noindent\textbf{Metrics.}
+For camera tracking, we report the root mean square error of the absolute trajectory error (ATE RMSE) in meters; lower values indicate more accurate trajectories. For scene reconstruction, we evaluate rendering quality using peak signal-to-noise ratio (PSNR), structural similarity index (SSIM), and learned perceptual image patch similarity (LPIPS). Higher PSNR and SSIM and lower LPIPS indicate better rendering quality.
+
+\subsection{Quantitative Results}
+
+\begin{table*}[t]
+\caption{Camera tracking results on KITTI. ATE RMSE [m] is reported, and lower is better.}
+\label{tab:kitti_localization}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccccccccc}
+\toprule
+Method & 00 & 02 & 03 & 04 & 05 & 06 & 07 & 08 & 09 & 10 & Avg. \\
+\midrule
+LOAM & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+ORB-SLAM3 & 6.03 & 14.76 & 1.02 & 1.57 & 4.04 & 11.16 & 2.19 & 38.85 & 8.39 & 6.63 & -- \\
+MonoGS & -- & -- & 57.87 & -- & 51.77 & 92.81 & 51.23 & -- & 81.23 & 61.96 & -- \\
+SplaTAM & -- & -- & 10.20 & -- & 37.13 & 53.78 & 32.82 & -- & 70.23 & 33.96 & -- \\
+LSG-SLAM & 3.15 & 49.99 & 11.86 & 34.90 & 4.00 & 4.49 & 2.29 & 42.90 & 10.61 & 10.44 & -- \\
+\textbf{Ours} & 7.97 & 55.47 & 6.86 & 19.89 & 2.37 & 1.96 & 1.48 & 30.51 & 4.51 & 8.52 & -- \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table*}[t]
+\caption{Rendering results on KITTI. PSNR and SSIM are higher better; LPIPS is lower better.}
+\label{tab:kitti_mapping}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llccccccccccc}
+\toprule
+Method & Metric & 00 & 02 & 03 & 04 & 05 & 06 & 07 & 08 & 09 & 10 & Avg. \\
+\midrule
+MonoGS & PSNR$\uparrow$ & -- & -- & 10.40 & -- & 12.20 & 11.15 & 10.94 & -- & 12.65 & 12.71 & -- \\
+ & SSIM$\uparrow$ & -- & -- & 0.25 & -- & 0.37 & 0.28 & 0.38 & -- & 0.42 & 0.38 & -- \\
+ & LPIPS$\downarrow$ & -- & -- & 0.71 & -- & 0.65 & 0.76 & 0.67 & -- & 0.71 & 0.68 & -- \\
+\midrule
+SplaTAM & PSNR$\uparrow$ & -- & -- & 14.26 & -- & 14.78 & 16.40 & 16.05 & -- & 15.91 & 14.18 & -- \\
+ & SSIM$\uparrow$ & -- & -- & 0.47 & -- & 0.48 & 0.55 & 0.63 & -- & 0.54 & 0.45 & -- \\
+ & LPIPS$\downarrow$ & -- & -- & 0.56 & -- & 0.53 & 0.46 & 0.43 & -- & 0.52 & 0.56 & -- \\
+\midrule
+LSG-SLAM & PSNR$\uparrow$ & 27.09 & 26.64 & 26.92 & 26.28 & 26.90 & 27.79 & 25.98 & 26.17 & 26.81 & 26.82 & -- \\
+ & SSIM$\uparrow$ & 0.97 & 0.97 & 0.97 & 0.96 & 0.97 & 0.97 & 0.96 & 0.96 & 0.97 & 0.97 & -- \\
+ & LPIPS$\downarrow$ & 0.07 & 0.07 & 0.06 & 0.07 & 0.07 & 0.06 & 0.07 & 0.08 & 0.07 & 0.07 & -- \\
+\midrule
+\textbf{Ours} & PSNR$\uparrow$ & -- & -- & 23.74 & 26.68 & 27.84 & 28.80 & 26.73 & -- & -- & -- & -- \\
+ & SSIM$\uparrow$ & -- & -- & 0.92 & 0.96 & 0.98 & 0.98 & 0.97 & -- & -- & -- & -- \\
+ & LPIPS$\downarrow$ & -- & -- & 0.115 & 0.065 & 0.052 & 0.041 & 0.059 & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table*}[t]
+\caption{Camera tracking results on KITTI-360. ATE RMSE [m] is reported, and lower is better.}
+\label{tab:kitti360_localization}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{8pt}
+\begin{tabular}{lccccc}
+\toprule
+Method & 0000 & 0002 & 0004 & 0005 & Avg. \\
+\midrule
+LOAM & -- & -- & -- & -- & -- \\
+ORB-SLAM3 & -- & -- & -- & -- & -- \\
+MonoGS & -- & 43.91 & 79.70 & 31.11 & -- \\
+SplaTAM & -- & 56.19 & 67.55 & 23.96 & -- \\
+LSG-SLAM & 79.01 & -- & -- & -- & -- \\
+\textbf{Ours} & 29.33 & 116.73 & -- & 33.63 & -- \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table*}[t]
+\caption{Rendering results on KITTI-360. PSNR and SSIM are higher better; LPIPS is lower better.}
+\label{tab:kitti360_mapping}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{8pt}
+\begin{tabular}{llccccc}
+\toprule
+Method & Metric & 0000 & 0002 & 0004 & 0005 & Avg. \\
+\midrule
+MonoGS & PSNR$\uparrow$ & -- & 11.23 & 12.10 & 11.00 & -- \\
+ & SSIM$\uparrow$ & -- & 0.32 & 0.38 & 0.33 & -- \\
+ & LPIPS$\downarrow$ & -- & 0.73 & 0.69 & 0.70 & -- \\
+\midrule
+SplaTAM & PSNR$\uparrow$ & -- & 12.53 & 12.39 & 12.24 & -- \\
+ & SSIM$\uparrow$ & -- & 0.29 & 0.34 & 0.31 & -- \\
+ & LPIPS$\downarrow$ & -- & 0.60 & 0.57 & 0.61 & -- \\
+\midrule
+LSG-SLAM & PSNR$\uparrow$ & 27.97 & -- & -- & -- & -- \\
+ & SSIM$\uparrow$ & 0.97 & -- & -- & -- & -- \\
+ & LPIPS$\downarrow$ & 0.053 & -- & -- & -- & -- \\
+\midrule
+\textbf{Ours} & PSNR$\uparrow$ & 28.222 & -- & -- & 27.65 & -- \\
+ & SSIM$\uparrow$ & 0.97 & -- & -- & 0.97 & -- \\
+ & LPIPS$\downarrow$ & 0.050 & -- & -- & 0.062 & -- \\
+\bottomrule
+\end{tabular}
+\end{table*}

@@ -1,0 +1,30 @@
+motion:
+  assignment_sigma_m: 0.75
+  inlier_threshold_m: 0.5
+  max_components: 5
+  min_support: 20
+  quality_weighted_rigid_fit: true
+  ransac_seed_size: 3
+  ransac_sample_size: 8
+  ransac_iterations: 1000
+  initialization_method: hybrid
+  hybrid:
+    min_support: 6
+    max_components: 8
+    reprojection_threshold_px: 3.0
+    depth_sigma_m: 0.15
+    depth_sigma_relative: 0.015
+    depth_weight: 0.05
+    depth_cost_cap: 4.0
+    outlier_cost: 1.0
+    temperature: 0.25
+    core_margin: 0.1
+    local_seeds: 64
+    neighborhood_sizes:
+    - 6
+    - 12
+    - 24
+    - 48
+    global_rigid_proposals: 256
+    competition_iterations: 4
+    model_penalty: 2.0

@@ -1,7 +1,13 @@
 """CPU regression tests for shared, revisable Gaussian object attributes."""
+import sys
+from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 import importlib.util
 import json
-from pathlib import Path
 import tempfile
 import types
 import unittest
@@ -10,7 +16,7 @@ from unittest.mock import patch
 import numpy as np
 
 
-_path = Path(__file__).resolve().parents[1] / "object_window.py"
+_path = Path(__file__).resolve().parents[1] / "ownership/object_window.py"
 _spec = importlib.util.spec_from_file_location("sequence_object_window", _path)
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
@@ -215,7 +221,7 @@ class ObjectWindowTests(unittest.TestCase):
                             source_confidence=np.ones((4, 4)), target_confidence=np.ones((4, 4)))
         captured = []
 
-        def solve(current, cfg):
+        def solve(current, cfg, *, priors):
             captured.append((current._render_initial_probabilities.copy(), current._prior(0)))
             return dict(probabilities=np.array([[.1, .9]] if len(captured) == 1 else [[.9, .1]]),
                         render_support=np.ones((1, 2), bool), report={"render_passes": 2})
@@ -223,7 +229,7 @@ class ObjectWindowTests(unittest.TestCase):
         solver = types.SimpleNamespace(optimize_render_window=solve)
         motion = np.array([[.2, .3, .5]])
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
-                "sys.modules", {"object_render_optimizer": solver}):
+                "sys.modules", {"ownership.object_render_optimizer": solver}):
             first_dir = Path(temporary) / "first"
             result = self.update(window, 0, [np.nan, np.nan], q=[[.975, .025]],
                                  payload=payload, render_observations=observations,

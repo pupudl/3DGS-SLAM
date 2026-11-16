@@ -1,0 +1,245 @@
+{
+  "timestamp": "2026-11-16T12:44:13.122145+08:00",
+  "scope": "Superseded result archives and diagnostic replay outputs only. Latest results, original stride-two baseline, long-sequence run, source/config/tests, diagnostic reports and figures retained.",
+  "deleted": [
+    {
+      "path": "outputs/stride2_final_20261116",
+      "allocated_bytes": 5379985408,
+      "file_count": 1747,
+      "status": "deleted"
+    },
+    {
+      "path": "outputs/stride2_corrected_20261116",
+      "allocated_bytes": 2777677824,
+      "file_count": 866,
+      "status": "deleted"
+    },
+    {
+      "path": "outputs/stride2_motion_fix_20261116",
+      "allocated_bytes": 5364441088,
+      "file_count": 1788,
+      "status": "deleted"
+    },
+    {
+      "path": "outputs/stride2_refined_20261115",
+      "allocated_bytes": 4973776896,
+      "file_count": 1732,
+      "status": "deleted"
+    },
+    {
+      "path": "outputs/short_sequences_stride3_20261115_1534",
+      "allocated_bytes": 1571061760,
+      "file_count": 645,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/code_review_20261114/drive0000_reviewed",
+      "allocated_bytes": 686604288,
+      "file_count": 254,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/code_review_20261114/drive0000_final",
+      "allocated_bytes": 648794112,
+      "file_count": 216,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/code_review_20261114/drive0002_reviewed",
+      "allocated_bytes": 450998272,
+      "file_count": 188,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/code_review_20261114/drive0002_after",
+      "allocated_bytes": 418549760,
+      "file_count": 164,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/code_review_20261114/drive0002_final",
+      "allocated_bytes": 411369472,
+      "file_count": 165,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/code_review_20261114/drive0004_reviewed",
+      "allocated_bytes": 393158656,
+      "file_count": 187,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/code_review_20261114/drive0004_final",
+      "allocated_bytes": 377143296,
+      "file_count": 165,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/backend_audit_20261115/frozen_solver_no_spatial",
+      "allocated_bytes": 655663104,
+      "file_count": 211,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/backend_audit_20261115/frozen_solver_no_connectivity",
+      "allocated_bytes": 621871104,
+      "file_count": 211,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/backend_audit_20261115/frozen_frontend_before",
+      "allocated_bytes": 446603264,
+      "file_count": 160,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/backend_audit_20261115/frozen_solver_full",
+      "allocated_bytes": 408068096,
+      "file_count": 159,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/backend_audit_20261115/frozen_frontend_final",
+      "allocated_bytes": 408248320,
+      "file_count": 159,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/backend_audit_20261115/frozen_frontend_after",
+      "allocated_bytes": 408297472,
+      "file_count": 160,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/cyclist_repro_20261115/core_fix_run1",
+      "allocated_bytes": 704798720,
+      "file_count": 254,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/cyclist_repro_20261115/core_fix_run2",
+      "allocated_bytes": 699265024,
+      "file_count": 254,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/two_failed_sequences_20261115/drive0002_no_core",
+      "allocated_bytes": 440066048,
+      "file_count": 105,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/two_failed_sequences_20261115/drive0004_no_core",
+      "allocated_bytes": 371056640,
+      "file_count": 105,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/two_failed_sequences_20261115/drive0002_full",
+      "allocated_bytes": 292909056,
+      "file_count": 105,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/two_failed_sequences_20261115/drive0004_full",
+      "allocated_bytes": 249692160,
+      "file_count": 105,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_final_20261116/gray_measurement_init",
+      "allocated_bytes": 238489600,
+      "file_count": 88,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_final_20261116/gray_surface_before",
+      "allocated_bytes": 214900736,
+      "file_count": 87,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_final_20261116/gray_surface_after",
+      "allocated_bytes": 212746240,
+      "file_count": 85,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_corrected_20261116/gray_condition_supported",
+      "allocated_bytes": 248262656,
+      "file_count": 95,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_corrected_20261116/gray_own_model_surface",
+      "allocated_bytes": 238972928,
+      "file_count": 89,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_completion_20261115/gray_solver_with_core_groups",
+      "allocated_bytes": 208830464,
+      "file_count": 86,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_completion_20261115/gray_solver_with_links",
+      "allocated_bytes": 181035008,
+      "file_count": 80,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_completion_20261115/gray_solver_without_links",
+      "allocated_bytes": 179638272,
+      "file_count": 80,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_motion_fix_20261116/gray_linked_winner_init",
+      "allocated_bytes": 197758976,
+      "file_count": 93,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_motion_fix_20261116/gray_supported_winner_init",
+      "allocated_bytes": 186048512,
+      "file_count": 93,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/stride2_motion_fix_20261116/gray_condition_own_surface",
+      "allocated_bytes": 186191872,
+      "file_count": 93,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/flow_tracking_20261115/frontend_benchmark_stride2_20261115_1741",
+      "allocated_bytes": 291954688,
+      "file_count": 265,
+      "status": "deleted"
+    },
+    {
+      "path": "diagnostics/flow_tracking_20261115/frontend_benchmark_20261115_1733",
+      "allocated_bytes": 193486848,
+      "file_count": 192,
+      "status": "deleted"
+    }
+  ],
+  "protected": [
+    "outputs/stride2_certified_init_20261116",
+    "outputs/short_sequences_stride2_20261115",
+    "outputs/kitti360_2433_2633_submaps50_20261112_130211",
+    "diagnostics/missed_dynamic_objects_20261114",
+    "diagnostics/stride2_certified_init_20261116",
+    "tests",
+    "configs"
+  ],
+  "key_png_sha256": {
+    "outputs/stride2_certified_init_20261116/lightglue/drive0000_2439_2466_s2/objects/object27/frame_0000002463.png": "2b7d4d5f3dc414673134ce942193a2e0480a8e0d8ac0365b027771a3cda4d232",
+    "outputs/stride2_certified_init_20261116/lightglue/drive0002_4914_4934_s2/objects/object12/frame_0000004922.png": "5d50e4926813e76b85b5b5001a918c1b344e709f7193c7f6c9df46319ccd524b",
+    "outputs/stride2_certified_init_20261116/lightglue/drive0004_0776_0796_s2/objects/object3/frame_0000000784.png": "a40ffa806d88a4b25c6a7f81f2aef59e571ded9be3b194a80f8e55ca57c41c1d"
+  },
+  "freed_allocated_bytes": 31938416640,
+  "key_png_unchanged": true,
+  "completed": true
+}

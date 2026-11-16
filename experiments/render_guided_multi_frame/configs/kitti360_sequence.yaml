@@ -1,0 +1,105 @@
+# Unified sequence entry point. Select input at runtime with
+# --sequence <name> --start <first> --end <inclusive-last> [--stride 2].
+# Algorithm settings stay here; per-run config.yaml records the effective input.
+base_config: two_frame.yaml
+
+features:
+  match_depth_min_m: 1.0
+  match_depth_max_m: 60.0
+
+sequence:
+  streaming: true
+  step: 2
+  stage_overviews: false
+  visualize_objects: true
+  visualize_localization: true
+
+tracking:
+  matcher: lightglue
+  cache_frames: 2
+  catalog_keypoints: 4096
+  join_radius_px: 1.5
+  prior_weight: 0.25
+  motion_identity:
+    enabled: true
+    split_background_on_independent_core: true
+    geometric_identity_ledger: true
+
+joint:
+  motion_pose_guard:
+    enabled: true
+    min_support_fraction: 0.8
+    max_clipped_cost_increase: 0.1
+
+motion:
+  hybrid:
+    residual_discovery:
+      enabled: true
+      local_seeds: 16
+      max_new_components: 2
+      extra_component_budget: 2
+
+object_lifecycle:
+  enabled: true
+  missing_grace_frames: 2
+  min_observed_gaussians: 1
+  history_limit: 32
+  event_limit: 256
+
+object_render:
+  silhouette_threshold: 0.05
+  visibility_alpha_threshold: 0.05
+  visibility_candidate_pixel_budget: 1000000
+
+object_window:
+  enabled: true
+  prune_empty_objects: true
+  archive_compression: 1
+  window_frames: 7
+  window_step: 5
+  temperature: 0.25
+  prior_weight: 0.05
+  prior_floor: 0.001
+  max_cost: 3.0
+  max_fit_cost: 1.0
+  min_probability: 0.6
+  min_margin: 0.1
+  height:
+    enabled: true
+    weight: 0.15
+    above_camera_m: 0.5
+    hard_upper_bound: true
+    ground_min_m: -0.2
+    soft_margin_m: 0.3
+    feature_min_reliability: 0.5
+  connectivity:
+    enabled: true
+    bridge_require_cost_compatibility: false
+    bridge_require_background_observation: false
+    seed_normalization: objects
+    initialization_conditioning: certified_core_winner
+    no_core_to_background: true
+    final_hard_assignment: true
+    core_evidence_links:
+      enabled: true
+      max_pixel_distance: 64.0
+      bbox_padding_px: 4.0
+      max_path_length_m: 4.0
+      min_independent_tracks: 3
+    weight: 0.08
+    seed_weight: 0.03
+    update_interval: 5
+  render:
+    enabled: true
+    initialization: measurement
+    accept_only_improving: true
+    iterations: 30
+    learning_rate: 0.08
+    downsample: 2
+    rgb_weight: 1.0
+    depth_weight: 0.2
+    coverage_weight: 0.1
+    centre_weight: 0.05
+    prior_weight: 0.005
+    entropy_weight: 0.0
+    min_branch_probability: 0.01

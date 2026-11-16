@@ -1,9 +1,14 @@
 """CPU integration checks between pair outputs and the object-window backend."""
+import sys
+from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 from copy import deepcopy
 import importlib.util
 import json
-from pathlib import Path
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch

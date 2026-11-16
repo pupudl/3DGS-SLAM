@@ -1,8 +1,13 @@
 """CPU checks for independent replay ablations and honest motion provenance."""
+import sys
+from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 import importlib.util
 import json
-from pathlib import Path
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,8 +17,7 @@ import yaml
 
 
 HERE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(HERE))
-SPEC = importlib.util.spec_from_file_location('spatial_replay_options', HERE / 'replay_object_window.py')
+SPEC = importlib.util.spec_from_file_location('spatial_replay_options', HERE / 'tools/replay_object_window.py')
 replay = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(replay)
 
@@ -49,6 +53,13 @@ class ReplaySpatialOptionTests(unittest.TestCase):
         self.assertFalse(result['replay']['feature_height_model_refit_applied'])
         self.assertIn('saved object motions', result['replay']['feature_height_model_fitting_note'])
         self.assertEqual((self.source / 'config.yaml').read_bytes(), original)
+
+    def test_legacy_replay_rejects_streaming_lifecycles_before_writing_output(self):
+        self.cfg['sequence'] = dict(streaming=True)
+        (self.source / 'config.yaml').write_text(yaml.safe_dump(self.cfg))
+        with self.assertRaisesRegex(ValueError, 'streaming object lifecycles'):
+            self.run_replay('streaming')
+        self.assertFalse((self.root / 'streaming').exists())
 
     def test_spatial_ablations_are_independent_and_preserve_explicit_config(self):
         for name, flags, expected in (

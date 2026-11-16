@@ -1,13 +1,19 @@
 """CPU checks for tilted-camera ground and bounded soft height constraints."""
+import sys
+from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 import importlib.util
 import json
-from pathlib import Path
 import unittest
 
 import numpy as np
 
 
-MODULE = Path(__file__).resolve().parents[1] / 'object_height_constraints.py'
+MODULE = Path(__file__).resolve().parents[1] / 'ownership/object_height_constraints.py'
 SPEC = importlib.util.spec_from_file_location('object_height_constraints', MODULE)
 height_module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(height_module)
@@ -126,6 +132,23 @@ class ObjectHeightConstraintsTests(unittest.TestCase):
         self.assertTrue(result['valid'], result)
         self.assertEqual(result['sampled_points'], 1000)
         np.testing.assert_allclose(result['normal'], expected, atol=.015)
+
+    def test_hard_camera_ceiling_has_no_margin_or_depth_confidence_exemption(self):
+        plane = dict(valid=True, normal=[0., -1., 0.], offset=1.5, camera_height=1.5,
+                     confidence=.1)
+        xyz = np.array([[0., -.5, 5.], [0., -.5001, 5.], [0., -1., 100.],
+                        [0., .2, 5.], [np.nan, -1., 5.], [0., -1., -1.]])
+        options = dict(above_camera_m=.5, soft_margin_m=.3)
+        np.testing.assert_array_equal(height_module.above_height_limit(xyz, plane, options),
+                                      [False, True, True, False, False, False])
+        np.testing.assert_array_equal(height_module.above_height_limit(
+            xyz, {**plane, 'valid': False}, options), False)
+
+    def test_hard_ceiling_follows_ground_normal_in_a_pitched_camera(self):
+        plane = dict(valid=True, normal=[0., -.8, -.6], offset=1.5, camera_height=1.5)
+        xyz = np.array([[0., -7., 10.], [0., -8.2, 10.]])
+        np.testing.assert_array_equal(height_module.above_height_limit(xyz, plane, dict(above_camera_m=.5)),
+                                      [False, True])
 
 
 if __name__ == '__main__':

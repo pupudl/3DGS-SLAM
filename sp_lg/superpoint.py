@@ -106,11 +106,16 @@ class SuperPoint(nn.Module):
         'max_num_keypoints': -1,
         'detection_threshold': 0.00005,
         'remove_borders': 4,
+        # Legacy callers consume a full-resolution descriptor image. Tracking
+        # can retain only the compact map and sample its subpixel endpoints.
+        'dense_descriptor_mode': 'full',
     }
 
     def __init__(self, **conf):
         super().__init__()
         self.config = {**self.default_config, **conf}
+        if self.config['dense_descriptor_mode'] not in ('full', 'coarse', 'none'):
+            raise ValueError('dense_descriptor_mode must be full, coarse, or none')
 
         self.relu = nn.ReLU(inplace=True)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
@@ -145,6 +150,22 @@ class SuperPoint(nn.Module):
             raise ValueError('\"max_num_keypoints\" must be positive or \"-1\"')
 
         print('Loaded SuperPoint model')
+
+    @staticmethod
+    def sample_descriptors_at(keypoints, coarse):
+        """Sample BxNx2 image (x, y) coordinates into BxNxD descriptors.
+
+        ``coarse`` is the normalized BxDxHxW map returned in ``coarse``
+        mode. Coordinates use the same stride-8 convention as detected
+        keypoints, including subpixel locations supplied by optical flow.
+        """
+        if keypoints.ndim != 3 or keypoints.shape[-1] != 2:
+            raise ValueError('keypoints must have shape BxNx2')
+        if coarse.ndim != 4 or keypoints.shape[0] != coarse.shape[0]:
+            raise ValueError('coarse must have shape BxDxHxW with matching batch')
+        if keypoints.shape[1] == 0:
+            return coarse.new_empty((coarse.shape[0], 0, coarse.shape[1]))
+        return sample_descriptors(keypoints.to(coarse), coarse, 8).transpose(1, 2)
 
     def forward(self, data: dict):
         """ Compute keypoints, scores, descriptors for image """
@@ -197,13 +218,6 @@ class SuperPoint(nn.Module):
         # Convert (h, w) to (x, y)
         keypoints = [torch.flip(k, [1]).float() for k in keypoints]
 
-        # # all keypoints
-        all_kp_y_range = torch.arange(0, image.shape[2])
-        all_kp_x_range = torch.arange(0, image.shape[3])
-        all_kp_grid_y, all_kp_grid_x = torch.meshgrid(all_kp_y_range, all_kp_x_range)
-        all_kps = torch.concat([all_kp_grid_y.reshape([-1, 1]), all_kp_grid_x.reshape([-1, 1])], dim=1).to('cuda:0')
-        all_kps = [all_kps]
-
         # Compute the dense descriptors
         cDa = self.relu(self.convDa(x))
         descriptors = self.convDb(cDa)
@@ -214,15 +228,30 @@ class SuperPoint(nn.Module):
         descriptors = [sample_descriptors(k[None], d[None], 8)[0]
                        for k, d in zip(keypoints, descriptors_normalized)]
 
-        descriptors_all = [sample_descriptors(k[None], d[None], 8)[0]
-                           for k, d in zip(all_kps, descriptors_normalized)]
-        descriptors_all = descriptors_all[0].reshape([-1, image.shape[2], image.shape[3]])
-        descriptors_all = descriptors_all.unsqueeze(0).permute([0, 2, 3, 1]).detach()
-        # print(descriptors_all.shape)
-
         feature_dict = {
             'keypoints': torch.stack(keypoints, 0),
             'keypoint_scores': torch.stack(scores, 0),
             'descriptors': torch.stack(descriptors, 0).transpose(-1, -2)
         }
+        mode = self.config['dense_descriptor_mode']
+        if mode == 'coarse':
+            return feature_dict, descriptors_normalized.detach()
+        if mode == 'none':
+            return feature_dict, None
+        if mode != 'full':
+            raise ValueError('dense_descriptor_mode must be full, coarse, or none')
+
+        # Preserve the legacy full-image coordinate layout for existing
+        # consumers. Coarse/none avoid allocating this HxWxD representation.
+        all_kp_y_range = torch.arange(0, image.shape[2], device=image.device)
+        all_kp_x_range = torch.arange(0, image.shape[3], device=image.device)
+        all_kp_grid_y, all_kp_grid_x = torch.meshgrid(
+            all_kp_y_range, all_kp_x_range, indexing='ij')
+        all_kps = torch.concat([
+            all_kp_grid_y.reshape([-1, 1]),
+            all_kp_grid_x.reshape([-1, 1])], dim=1)
+        descriptors_all = sample_descriptors(
+            all_kps[None], descriptors_normalized[:1], 8)[0]
+        descriptors_all = descriptors_all.reshape([-1, image.shape[2], image.shape[3]])
+        descriptors_all = descriptors_all.unsqueeze(0).permute([0, 2, 3, 1]).detach()
         return feature_dict, descriptors_all

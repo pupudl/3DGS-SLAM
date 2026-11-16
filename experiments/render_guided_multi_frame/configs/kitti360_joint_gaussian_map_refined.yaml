@@ -1,0 +1,61 @@
+# Finer sampling and full-resolution fitting; retains the original config for
+# reproducible comparisons. Adaptive topology requires measured render gradients.
+base_config: kitti360_joint_gaussian_map.yaml
+
+sequence:
+  output_dir: experiments/render_guided_multi_frame/outputs/kitti360_2433_2463_joint_map_refined
+
+tracking:
+  motion_identity:
+    enabled: true
+    min_support: 6
+    min_identity_support: 3
+    max_candidate_cost: 1.0
+    min_incompatible_cost: 4.0
+    min_cost_gain: 3.0
+    min_cost_ratio: 3.0
+    min_incompatible_fraction: 0.7
+
+gaussian_map:
+  observation_stride: 2
+  initial_scale_multiplier: 1.5
+  association_distance: 0.12
+  voxel_size: 0.10
+  max_samples_per_frame: 60000
+  max_new_gaussians_per_frame: 30000
+  ownership_correction:
+    enabled: true
+    min_probability: 0.85
+    min_margin: 0.2
+    dominant_fraction: 0.9
+    confirmation_updates: 2
+    max_observation_links: 300000
+  optimization:
+    collect_refinement_stats: true
+    rgb_weight: 0.85
+    ssim_weight: 0.15
+    stages:
+      - downsample: 2
+        iterations: 20
+      - downsample: 1
+        iterations: 15
+  refinement:
+    enabled: true
+    warmup_pairs: 2
+    interval: 1
+    refine_iterations: 8
+    gradient_threshold: 0.000001
+    split_radius_px: 6.0
+    min_observation_count: 3
+    min_visible_steps: 4
+    prune_min_observation_count: 4
+    prune_opacity_threshold: 0.02
+    min_points_per_object: 8
+    max_growth_fraction: 0.05
+    max_new_per_update: 1024
+    max_splits_per_update: 256
+    max_clones_per_update: 128
+    max_prunes_per_update: 512
+    max_children_per_object: 256
+    max_active_gaussians: 100000
+    max_total_gaussians: 750000

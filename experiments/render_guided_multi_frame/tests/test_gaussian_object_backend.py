@@ -1,6 +1,12 @@
 """CPU coverage of measured evidence and cross-frame Gaussian identities."""
-import importlib.util
+import sys
 from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
+import importlib.util
 import tempfile
 import types
 import unittest
@@ -10,7 +16,7 @@ import cv2
 import numpy as np
 
 
-MODULE = Path(__file__).resolve().parents[1] / 'gaussian_object_backend.py'
+MODULE = Path(__file__).resolve().parents[1] / 'ownership/gaussian_object_backend.py'
 SPEC = importlib.util.spec_from_file_location('gaussian_object_backend', MODULE)
 backend_module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(backend_module)
@@ -262,7 +268,7 @@ class GaussianObjectBackendTests(unittest.TestCase):
         height.estimate_ground_plane = Mock(return_value=dict(
             valid=False, confidence=0., reason='insufficient_ground_support'))
         height.height_penalty = Mock(side_effect=AssertionError('Invalid planes must not be used'))
-        with patch.dict('sys.modules', {'object_height_constraints': height}):
+        with patch.dict('sys.modules', {'ownership.object_height_constraints': height}):
             gate, report = backend._feature_height_gate(
                 gmap, dict(x0=gmap['xyz'][:6]), image, self.confidence)
         self.assertIsNone(gate)
@@ -272,7 +278,7 @@ class GaussianObjectBackendTests(unittest.TestCase):
         height.height_penalty.assert_not_called()
 
     def test_measured_height_band_excludes_high_features_only_for_nonzero_objects(self):
-        import object_height_constraints as height
+        import ownership.object_height_constraints as height
         cfg = {**self.cfg, 'object_window': {**self.cfg['object_window'], 'height': dict(
             enabled=True, above_camera_m=2., ground_min_m=-.2,
             soft_margin_m=.3, feature_min_reliability=.5)}}
@@ -301,6 +307,21 @@ class GaussianObjectBackendTests(unittest.TestCase):
         for key, value in originals.items():
             np.testing.assert_array_equal(anchors[key], value)
         np.testing.assert_array_equal(state['q'], q_before)
+
+    def test_hard_height_feature_gate_has_zero_upper_margin_even_with_low_reliability(self):
+        import ownership.object_height_constraints as height
+        cfg = {**self.cfg, 'object_window': {**self.cfg['object_window'], 'height': dict(
+            enabled=True, above_camera_m=.5, hard_upper_bound=True, soft_margin_m=.3)}}
+        backend = backend_module.SequenceObjectBackend(cfg)
+        gmap, image = self.frame(0)
+        xyz = np.array([[0., -.5, 5.], [0., -.51, 5.], [0., -1., 100.]])
+        measured = dict(valid=True, normal=[0., -1., 0.], offset=1.5, camera_height=1.5,
+                        confidence=.1, fit_rmse_m=0.)
+        with patch.object(height, 'estimate_ground_plane', return_value=measured):
+            gate, report = backend._feature_height_gate(gmap, dict(x0=xyz), image, self.confidence)
+        np.testing.assert_array_equal(gate['allowed'], [True, False, False])
+        np.testing.assert_array_equal(gate['weights'][1:], 0.)
+        self.assertEqual(report['upper_exclusion_margin_m'], 0.)
 
     def test_local_candidate_height_refit_uses_only_eligible_core_and_leaves_background_untouched(self):
         for foreground_count in (3, 4):

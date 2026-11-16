@@ -1,7 +1,13 @@
 """CPU integration checks for final-object RGB renders and matching masks."""
+import sys
+from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 import importlib.util
 import json
-from pathlib import Path
 import tempfile
 import unittest
 
@@ -9,11 +15,11 @@ import cv2
 import numpy as np
 
 
-MODULE = Path(__file__).resolve().parents[1] / 'visualize_objects.py'
+MODULE = Path(__file__).resolve().parents[1] / 'tools/visualization/visualize_objects.py'
 SPEC = importlib.util.spec_from_file_location('visualize_objects', MODULE)
 visuals = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(visuals)
-from object_gaussian_renderer import prepare_object_gaussians
+from ownership.object_gaussian_renderer import prepare_object_gaussians
 
 
 class RecordingRenderer:
@@ -122,7 +128,7 @@ class ObjectVisualizationTests(unittest.TestCase):
 
     def test_exactly_two_rows_and_all_frame_columns_without_wrapping(self):
         manifest, _ = self.render(max_columns=1)
-        self.assertEqual([item['object_id'] for item in manifest['objects']], [0, 7, 11])
+        self.assertEqual([item['object_id'] for item in manifest['objects']], [0, 7])
         for item in manifest['objects']:
             self.assertEqual(item['frames'], [1, 2, 3])
             self.assertEqual(item['panel_count'], 6)
@@ -132,7 +138,7 @@ class ObjectVisualizationTests(unittest.TestCase):
             image = cv2.imread(str(self.root / 'objects' / item['overview']))
             self.assertEqual(image.shape,
                              (layout['header_height']+2*layout['tile_height'], 3*self.width, 3))
-        self.assertEqual(len(list((self.root / 'objects').rglob('*.png'))), 3)
+        self.assertEqual(len(list((self.root / 'objects').rglob('*.png'))), 2)
         self.assertFalse(list((self.root / 'objects').glob('object_*')))
 
     def test_black_gaussian_rgb_keeps_colored_silhouette_overlay_on_original(self):
@@ -173,15 +179,16 @@ class ObjectVisualizationTests(unittest.TestCase):
             expected = self.xyz[[selected]] @ H[:3, :3].T + H[:3, 3]
             np.testing.assert_allclose(calls[-1]['xyz'], expected, atol=1e-7)
 
-    def test_absent_object_keeps_empty_rgb_and_original_mask_for_every_frame(self):
+    def test_absent_object_is_removed_from_index_and_stale_generated_files(self):
+        folder = self.root / 'objects/object11'
+        folder.mkdir(parents=True)
+        (folder / 'overview.png').write_bytes(b'old empty panel')
+        (folder / 'summary.json').write_text('{}')
         manifest, _ = self.render()
-        item = next(item for item in manifest['objects'] if item['object_id'] == 11)
-        self.assertEqual(item['frames'], [1, 2, 3])
-        self.assertTrue(all(row['selected_gaussians'] == 0 for row in item['frame_details']))
-        image = cv2.imread(str(self.root / 'objects' / item['overview']))
-        for column in range(3):
-            np.testing.assert_array_equal(self.contents(image, item['layout'], 0, column), 0)
-            np.testing.assert_array_equal(self.contents(image, item['layout'], 1, column), 101+column)
+        self.assertNotIn(11, [item['object_id'] for item in manifest['objects']])
+        self.assertFalse(folder.exists())
+        manifest, _ = self.render(object_id=11)
+        self.assertEqual([item['object_id'] for item in manifest['objects']], [0, 7])
 
     def test_disappearing_object_retains_incoming_view_then_empty_last_column(self):
         path = self.root / self.pairs[1]['result_path'] / 'object_state.npz'
@@ -230,11 +237,11 @@ class ObjectVisualizationTests(unittest.TestCase):
     def test_single_object_refresh_preserves_other_index_entries(self):
         self.render()
         manifest, renderer = self.render(object_id=7)
-        self.assertEqual([item['object_id'] for item in manifest['objects']], [0, 7, 11])
+        self.assertEqual([item['object_id'] for item in manifest['objects']], [0, 7])
         self.assertEqual({call['object_id'] for call in renderer.calls}, {7})
         for scene in renderer.scene_calls:
             self.assertEqual({oid for source in scene for oid in source['object_ids']}, {0, 7, 11})
-        self.assertEqual(len(list((self.root / 'objects').rglob('*.png'))), 3)
+        self.assertEqual(len(list((self.root / 'objects').rglob('*.png'))), 2)
 
     def test_visibility_owner_maps_and_reports_are_written_for_every_frame(self):
         manifest, _ = self.render()

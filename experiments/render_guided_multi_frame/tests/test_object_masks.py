@@ -1,8 +1,13 @@
 """CPU checks for opaque global-object coverage and visibility semantics."""
+import sys
 from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 import base64
 import json
-import sys
 import tempfile
 import unittest
 
@@ -10,9 +15,8 @@ import cv2
 import numpy as np
 
 HERE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(HERE))
-from object_masks import all_objects, isolate_object, object_color, ownership_maps
-from visualize_object_coverage import encode_label_map, visualize
+from ownership.object_masks import all_objects, isolate_object, object_color, ownership_maps
+from tools.visualization.visualize_object_coverage import encode_label_map, visualize
 
 
 class ObjectCoverageTests(unittest.TestCase):

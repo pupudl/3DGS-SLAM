@@ -1,6 +1,12 @@
 """Exercise the actual pose/ownership optimizer on CPU without rasterization."""
-import importlib.util
+import sys
 from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
+import importlib.util
 import types
 import unittest
 from unittest.mock import patch
@@ -19,7 +25,7 @@ def load_pairwise_model():
     helpers = types.ModuleType("utils.recon_helpers")
     helpers.setup_camera = None
     path = (Path(__file__).resolve().parents[1] /
-            "render_guided_two_frame" / "joint_pair.py")
+            "frontend/joint_pair.py")
     spec = importlib.util.spec_from_file_location("frozen_ownership_joint_pair", path)
     module = importlib.util.module_from_spec(spec)
     # These dependencies are used only by the CUDA renderer, not optimize().
@@ -37,10 +43,10 @@ def load_warm_ownership():
     for name in ("add_unique", "discover", "errors", "unexplained_clusters"):
         setattr(pair_utils, name, None)
     path = (Path(__file__).resolve().parents[1] /
-            "render_guided_two_frame" / "masked_feedback.py")
+            "frontend/masked_feedback.py")
     spec = importlib.util.spec_from_file_location("frozen_ownership_feedback", path)
     module = importlib.util.module_from_spec(spec)
-    with patch.dict("sys.modules", {"pair_utils": pair_utils}):
+    with patch.dict("sys.modules", {"frontend.pair_utils": pair_utils}):
         spec.loader.exec_module(module)
     return module.warm_ownership
 

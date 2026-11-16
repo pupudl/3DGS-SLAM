@@ -1,14 +1,20 @@
 """CPU artifact audits distinguish real feature refits from replay and no-ops."""
+import sys
+from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 import importlib.util
 import json
-from pathlib import Path
 import tempfile
 import unittest
 
 import numpy as np
 
 
-MODULE = Path(__file__).resolve().parents[1] / 'verify_full_spatial_run.py'
+MODULE = Path(__file__).resolve().parents[1] / 'tools/validation/verify_full_spatial_run.py'
 SPEC = importlib.util.spec_from_file_location('verify_full_spatial_run', MODULE)
 audit = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(audit)

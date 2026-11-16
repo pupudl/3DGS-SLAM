@@ -1,0 +1,123 @@
+{
+  "algorithm_functions_unchanged": 281,
+  "expected_path_only_changes": [
+    {
+      "file": "frontend/strict_two_frame.py",
+      "function": "main"
+    },
+    {
+      "file": "ownership/object_render_optimizer.py",
+      "function": "optimize_render_window"
+    },
+    {
+      "file": "ownership/object_gaussian_renderer.py",
+      "function": "GaussianObjectRenderer._load_cuda"
+    }
+  ],
+  "resolved_configs_equivalent": [
+    "kitti360_joint_gaussian_map_refined.yaml",
+    "kitti360_long_sequence.yaml",
+    "kitti360_joint_gaussian_submaps.yaml",
+    "kitti360_joint_gaussian_map.yaml",
+    "kitti360_short_sequence.yaml"
+  ],
+  "expected_path_only_changes_verified": true,
+  "regression": {
+    "tests": 373,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "device": "RTX 3090 CUDA",
+    "wall_seconds": 50.01
+  },
+  "cli_entrypoints": [
+    {
+      "path": "run_sequence.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "frontend/strict_two_frame.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/replay_object_window.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/export_gaussian_submaps.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/visualization/visualize_object_coverage.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/visualization/visualize_feedback_matches.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/visualization/visualize_gaussian_map.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/visualization/visualize_objects.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/visualization/visualize_ownership_stages.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/visualization/visualize_feedback_final.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/visualization/visualize_sparse_hypotheses.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/visualization/visualize_motion.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/validation/verify_full_spatial_run.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/validation/verify_gaussian_map_run.py",
+      "passed": true,
+      "error": ""
+    },
+    {
+      "path": "tools/validation/verify_streaming_run.py",
+      "passed": true,
+      "error": ""
+    }
+  ],
+  "cleanup": {
+    "moved_python": 41,
+    "deleted_python": 30,
+    "deleted_yaml": 30,
+    "root_python_files": [
+      "run_sequence.py"
+    ],
+    "deleted_shell_wrappers": 1
+  },
+  "syntax_checked_python_files": 84,
+  "documentation_links_checked": 19,
+  "module_entrypoint_checked": true,
+  "saved_real_pair_visualizations_checked": true
+}

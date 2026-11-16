@@ -1,14 +1,20 @@
 """CPU coverage of accepted-only selection and CUDA render preparation."""
+import sys
+from pathlib import Path
+
+_EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_EXPERIMENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENT_ROOT))
+
 import importlib.util
 import json
-from pathlib import Path
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 
 
-MODULE = Path(__file__).resolve().parents[1] / 'object_gaussian_renderer.py'
+MODULE = Path(__file__).resolve().parents[1] / 'ownership/object_gaussian_renderer.py'
 SPEC = importlib.util.spec_from_file_location('object_gaussian_renderer', MODULE)
 renderer_module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(renderer_module)
